@@ -1,7 +1,7 @@
 --[=[
-LAST STOP OBSERVER V1.2 SAFE
+LAST STOP OBSERVER V1.3 SAFE
 Target: Project Real
-Purpose: Low-interference, passive client-side diagnostics for Last Stop.
+Purpose: Focused, low-interference, passive diagnostics for Last Stop scan/combat/token behavior.
 
 SAFETY / SCOPE
 - Installs NO hookmetamethod, hookfunction, __namecall, or __newindex hooks.
@@ -45,6 +45,10 @@ local State = {
     Entities = {},
     SeenTools = {},
     SeenControllers = {},
+    SeenWeaponValues = {},
+    KillStackCounts = {},
+    TokenRewardStates = {},
+    ScanState = {},
     SeenPrompts = {},
     SeenObjects = {},
     SeenValues = {},
@@ -62,6 +66,10 @@ local State = {
         Kills = 0,
         ToolActivations = 0,
         Errors = 0,
+        Aliens = 0,
+        Zombies = 0,
+        TokenRewards = 0,
+        ScanEvents = 0,
     },
     LastMovement = nil,
     LastCamera = nil,
@@ -73,8 +81,8 @@ ENV.__LAST_STOP_OBSERVER_V1 = State
 
 local MAX_EVENTS = 5000
 local UI_ROW_COUNT = 13
-local REMOTE_DEDUPE_WINDOW = 0.10
-local MOVEMENT_SAMPLE_INTERVAL = 0.35
+local MOVEMENT_SAMPLE_INTERVAL = 0.45
+local CONTROLLER_SAMPLE_INTERVAL = 0.60
 
 local function safeString(value)
     local ok, result = pcall(function()
@@ -150,7 +158,9 @@ local function serializeValue(value, depth)
         return string.format("Vector2(%.2f, %.2f)", value.X, value.Y)
     elseif valueType == "CFrame" then
         local position = value.Position
-        return string.format("CFrame(%.2f, %.2f, %.2f)", position.X, position.Y, position.Z)
+        local look = value.LookVector
+        return string.format("CFrame(Pos=%.2f, %.2f, %.2f; Look=%.2f, %.2f, %.2f)",
+            position.X, position.Y, position.Z, look.X, look.Y, look.Z)
     elseif valueType == "EnumItem" then
         return safeString(value)
     elseif type(value) == "string" then
@@ -207,6 +217,8 @@ local function push(category, message, details)
         State.Counters.Kills = State.Counters.Kills + 1
     elseif category == "WEAPON" and string.find(safeString(message), "Tool Activated", 1, true) then
         State.Counters.ToolActivations = State.Counters.ToolActivations + 1
+    elseif category == "SCAN" then
+        State.Counters.ScanEvents = State.Counters.ScanEvents + 1
     elseif category == "ERROR" then
         State.Counters.Errors = State.Counters.Errors + 1
     end
@@ -308,55 +320,154 @@ local function isPlayerCharacter(model)
     return ok and result
 end
 
+local function classifyEntityModel(model)
+    local kind = "UNKNOWN"
+    local variant = "unknown"
+    local descendants = {}
+    pcall(function() descendants = model:GetDescendants() end)
+    for _, descendant in ipairs(descendants) do
+        local name = lower(descendant.Name)
+        local alienType = string.match(name, "^(alientype[123])$")
+        if alienType then
+            return "ALIEN", string.upper(string.sub(alienType, 1, 1)) .. string.sub(alienType, 2)
+        end
+        if containsAny(name, {"zombietype", "zombie", "undead", "infected", "walker"}) then
+            kind = "ZOMBIE"
+            variant = safeString(descendant.Name)
+        elseif kind == "UNKNOWN" and containsAny(name, {"alientexture", "alienarmoverlay"}) then
+            kind = "ALIEN"
+            variant = "Alien marker"
+        end
+    end
+    if kind == "UNKNOWN" then
+        local fallback = classifyName(safeString(model.Name))
+        if fallback == "ALIEN" or fallback == "ZOMBIE" or fallback == "SPECIAL NPC" then
+            kind = fallback
+            variant = "name marker"
+        end
+    end
+    return kind, variant
+end
+
+local function updateEntityClassification(record, marker)
+    if not record or not record.Model then return end
+    local kind, variant
+    if marker then
+        local markerName = lower(marker.Name)
+        local alienType = string.match(markerName, "^(alientype[123])$")
+        if alienType then
+            kind = "ALIEN"
+            variant = string.upper(string.sub(alienType, 1, 1)) .. string.sub(alienType, 2)
+        elseif containsAny(markerName, {"zombietype", "zombie", "undead", "infected", "walker"}) then
+            kind = "ZOMBIE"
+            variant = safeString(marker.Name)
+        elseif containsAny(markerName, {"alientexture", "alienarmoverlay"}) and record.Kind ~= "ALIEN" and record.Kind ~= "ZOMBIE" then
+            kind = "ALIEN"
+            variant = "Alien marker"
+        end
+    else
+        kind, variant = classifyEntityModel(record.Model)
+    end
+    if not kind or kind == "UNKNOWN" then return end
+    local changed = record.Kind ~= kind or (kind == "ALIEN" and variant ~= "unknown" and record.Variant ~= variant)
+    if not changed then return end
+    local oldKind = record.Kind
+    record.Kind = kind
+    record.Variant = variant or record.Variant or "unknown"
+    if oldKind ~= kind then
+        if oldKind == "ALIEN" then State.Counters.Aliens = math.max(0, State.Counters.Aliens - 1) end
+        if oldKind == "ZOMBIE" then State.Counters.Zombies = math.max(0, State.Counters.Zombies - 1) end
+        if kind == "ALIEN" then State.Counters.Aliens = State.Counters.Aliens + 1 end
+        if kind == "ZOMBIE" then State.Counters.Zombies = State.Counters.Zombies + 1 end
+    end
+    push("NPC", "Entity classified: " .. kind,
+        "Variant=" .. safeString(record.Variant) .. " | Model=" .. safeFullName(record.Model)
+        .. " | Position=" .. (getPosition(record.Root) and serializeValue(getPosition(record.Root)) or "unknown"))
+end
+
+local function watchEntityHealthAttributes(owner, record)
+    if not isInstance(owner) or not record then return end
+    local attributes = {}
+    pcall(function() attributes = owner:GetAttributes() end)
+    for attributeName, attributeValue in pairs(attributes) do
+        if containsAny(attributeName, {"health", "currenthp", "hitpoints", "hp"}) then
+            record.AttributeHealth = record.AttributeHealth or {}
+            local attributeKey = safeFullName(owner) .. "|" .. safeString(attributeName)
+            record.AttributeHealth[attributeKey] = tonumber(attributeValue)
+            push("NPC", "Entity health attribute found: " .. safeString(attributeName),
+                "Value=" .. serializeValue(attributeValue) .. " | Owner=" .. safeFullName(owner))
+            local ok, signal = pcall(function() return owner:GetAttributeChangedSignal(attributeName) end)
+            if ok and signal then
+                local connection = signal:Connect(function()
+                    local newValue
+                    pcall(function() newValue = owner:GetAttribute(attributeName) end)
+                    local newNumber = tonumber(newValue)
+                    local oldNumber = record.AttributeHealth[attributeKey]
+                    if newNumber and oldNumber and newNumber ~= oldNumber then
+                        local delta = newNumber - oldNumber
+                        push(delta < 0 and "DAMAGE" or "HEAL", "Entity health attribute changed: " .. safeString(attributeName),
+                            string.format("%.2f -> %.2f | Delta=%+.2f | Owner=%s", oldNumber, newNumber, delta, safeFullName(owner)))
+                        if newNumber <= 0 and not record.Dead then
+                            record.Dead = true
+                            push("KILL", "Entity health attribute reached zero: " .. record.Name,
+                                "Kind=" .. safeString(record.Kind) .. " | Owner=" .. safeFullName(owner))
+                        end
+                    end
+                    record.AttributeHealth[attributeKey] = newNumber
+                end)
+                table.insert(record.Connections, connection)
+                table.insert(State.Connections, connection)
+            end
+        end
+    end
+end
+
+local watchValueObject
+local watchMovementController
+
 local function trackModel(model)
-    if not State.Alive or not isInstance(model) then
-        return
-    end
-    local ok, isModel = pcall(function()
-        return model:IsA("Model")
-    end)
-    if not ok or not isModel then
-        return
-    end
-    if model == (LocalPlayer and LocalPlayer.Character) or isPlayerCharacter(model) then
-        return
-    end
-    if State.Entities[model] then
-        return
-    end
+    if not State.Alive or not isInstance(model) then return end
+    local ok, isModel = pcall(function() return model:IsA("Model") end)
+    if not ok or not isModel then return end
+    if model == (LocalPlayer and LocalPlayer.Character) or isPlayerCharacter(model) then return end
+    if State.Entities[model] then return end
 
     local entityContainer = Workspace:FindFirstChild("ENTITY_CONTAINER")
     local isGameEntity = entityContainer ~= nil and model.Parent == entityContainer
     local humanoid = findHumanoid(model)
-    -- Last Stop's ENTITY_CONTAINER models can expose alien body parts without a Humanoid.
-    if not humanoid and not isGameEntity then
-        return
+    if not humanoid and not isGameEntity then return end
+    if not isGameEntity and humanoid then
+        local healthOk, health = pcall(function() return humanoid.Health end)
+        if healthOk and (health == math.huge or health ~= health) then return end
     end
 
     local root = findModelRoot(model)
-    if not root then
-        return
-    end
+    if not root then return end
     local name = safeString(model.Name)
-    local category = classifyName(name .. " " .. safeFullName(model))
+    local kind, variant = classifyEntityModel(model)
     local initialHealth = humanoid and humanoid.Health or nil
     local record = {
         Model = model,
         Humanoid = humanoid,
         Root = root,
         Name = name,
-        Category = category,
+        Kind = kind or "UNKNOWN",
+        Variant = variant or "unknown",
+        IsGameEntity = isGameEntity,
         LastHealth = initialHealth,
         Dead = initialHealth ~= nil and initialHealth <= 0 or false,
         Connections = {},
+        AttributeHealth = {},
     }
     State.Entities[model] = record
     State.Counters.NPCs = State.Counters.NPCs + 1
+    if record.Kind == "ALIEN" then State.Counters.Aliens = State.Counters.Aliens + 1 end
+    if record.Kind == "ZOMBIE" then State.Counters.Zombies = State.Counters.Zombies + 1 end
 
     local rootPosition = getPosition(root)
     local healthText = humanoid and (safeString(humanoid.Health) .. "/" .. safeString(humanoid.MaxHealth)) or "custom/unknown"
-    push("NPC", "Detected " .. category .. ": " .. name,
-        "Health=" .. healthText
+    push("NPC", "Detected " .. safeString(record.Kind) .. ": " .. name,
+        "Variant=" .. safeString(record.Variant) .. " | Health=" .. healthText
         .. " | Position=" .. (rootPosition and serializeValue(rootPosition) or "unknown")
         .. " | Model=" .. safeFullName(model)
         .. " | Root=" .. safeFullName(root)
@@ -374,27 +485,39 @@ local function trackModel(model)
             if math.abs(delta) >= 0.01 then
                 local changeType = delta < 0 and "DAMAGE" or "HEAL"
                 push(changeType, record.Name .. " health " .. string.format("%.1f -> %.1f", oldHealth, newHealth),
-                    "Delta=" .. string.format("%+.1f", delta) .. " | Class=" .. record.Category)
+                    "Delta=" .. string.format("%+.1f", delta) .. " | Kind=" .. record.Kind .. " | Variant=" .. record.Variant)
             end
             if newHealth <= 0 and not record.Dead then
                 record.Dead = true
-                push("KILL", "NPC reached zero health: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
+                push("KILL", "NPC reached zero health: " .. record.Name, "Kind=" .. record.Kind .. " | Variant=" .. record.Variant .. " | " .. safeFullName(model))
             end
         end)
-        if healthConnection then
-            table.insert(record.Connections, healthConnection)
-        end
-
+        if healthConnection then table.insert(record.Connections, healthConnection) end
         local diedConnection = connectSignal(humanoid.Died, function()
             if not record.Dead then
                 record.Dead = true
-                push("KILL", "NPC Died event: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
+                push("KILL", "NPC Died event: " .. record.Name, "Kind=" .. record.Kind .. " | Variant=" .. record.Variant .. " | " .. safeFullName(model))
             end
         end)
-        if diedConnection then
-            table.insert(record.Connections, diedConnection)
-        end
+        if diedConnection then table.insert(record.Connections, diedConnection) end
     end
+
+    watchEntityHealthAttributes(model, record)
+    watchEntityHealthAttributes(root, record)
+    local initialEntityDescendants = {}
+    pcall(function() initialEntityDescendants = model:GetDescendants() end)
+    for _, descendant in ipairs(initialEntityDescendants) do
+        watchEntityHealthAttributes(descendant, record)
+    end
+    local modelDescendantConnection = model.DescendantAdded:Connect(function(descendant)
+        if not State.Alive then return end
+        updateEntityClassification(record, descendant)
+        watchValueObject(descendant)
+        watchEntityHealthAttributes(descendant, record)
+        watchMovementController(descendant)
+    end)
+    table.insert(record.Connections, modelDescendantConnection)
+    table.insert(State.Connections, modelDescendantConnection)
 end
 
 local function removeModel(model)
@@ -429,10 +552,17 @@ local function logPrompt(prompt, eventName)
     end)
     local path = safeFullName(prompt)
     local isTokenRelated = containsAny(path .. " " .. actionText .. " " .. objectText, {"alien", "token"})
+    local promptPosition = getPosition(prompt)
+    local playerRoot = LocalPlayer and LocalPlayer.Character and findModelRoot(LocalPlayer.Character)
+    local playerDistance = "unknown"
+    if promptPosition and playerRoot then
+        pcall(function() playerDistance = string.format("%.1f", (playerRoot.Position - promptPosition).Magnitude) end)
+    end
     push(isTokenRelated and "TOKEN" or "PROMPT", eventName .. ": " .. (objectText ~= "" and objectText or prompt.Name),
         "Action=" .. safeString(actionText) .. " | Hold=" .. safeString(holdDuration)
         .. " | MaxDistance=" .. safeString(distance) .. " | Enabled=" .. safeString(enabled)
-        .. " | Path=" .. path)
+        .. " | Position=" .. (promptPosition and serializeValue(promptPosition) or "unknown")
+        .. " | PlayerDistance=" .. playerDistance .. " | Path=" .. path)
 end
 
 local function trackPrompt(prompt)
@@ -450,26 +580,36 @@ local function trackPrompt(prompt)
 end
 
 local function trackInterestingObject(instance)
-    if not isInstance(instance) or State.SeenObjects[instance] then
-        return
-    end
-    local name = ""
-    local className = ""
-    pcall(function()
-        name = instance.Name
-        className = instance.ClassName
-    end)
+    if not isInstance(instance) or State.SeenObjects[instance] then return end
+    local name, className = "", ""
+    pcall(function() name = instance.Name; className = instance.ClassName end)
     local path = safeFullName(instance)
-    if not containsAny(name .. " " .. path, {"alien", "token", "pickup", "drop", "collect", "loot"}) then
+    local lowerNamePath = lower(name .. " " .. path)
+    if containsAny(lowerNamePath, {"lootspawnareas", "rewarddroparea", "droparea", "alientexture", "alienarmoverlay", "alientype"}) then
         return
     end
+    local entityContainer = Workspace:FindFirstChild("ENTITY_CONTAINER")
+    if entityContainer then
+        local insideEntity = false
+        pcall(function() insideEntity = instance:IsDescendantOf(entityContainer) end)
+        if insideEntity then return end
+    end
+    local itemContainer = Workspace:FindFirstChild("ITEM_CONTAINER")
+    local insideItems = false
+    if itemContainer then pcall(function() insideItems = instance:IsDescendantOf(itemContainer) end) end
+    local tokenRelated = containsAny(lowerNamePath, {"alien token", "collectalientoken", "tokenpickup", "token drop"})
+    local genericLoot = containsAny(lowerNamePath, {"pickup", "collect", "loot", "drop"})
+    if not tokenRelated and not genericLoot and not insideItems then return end
+    if insideItems and instance.Parent ~= itemContainer and not tokenRelated and not genericLoot then return end
+    if className == "Decal" or className == "Texture" or className == "ParticleEmitter" or className == "Attachment" then return end
     State.SeenObjects[instance] = true
     local position = getPosition(instance)
-    push("LOOT", "Object detected: " .. name,
+    local category = tokenRelated and "TOKEN" or "LOOT"
+    push(category, (tokenRelated and "Token object detected: " or "Loot object detected: ") .. name,
         "Class=" .. className .. " | Position=" .. (position and serializeValue(position) or "unknown") .. " | Path=" .. path)
 end
 
-local function watchValueObject(valueObject)
+watchValueObject = function(valueObject)
     if not isInstance(valueObject) or State.SeenValues[valueObject] then
         return
     end
@@ -530,50 +670,161 @@ local function watchValueObject(valueObject)
     end)
 end
 
+local function cleanRichText(text)
+    local cleaned = safeString(text):gsub("<.->", "")
+    cleaned = cleaned:gsub("%s+", " ")
+    return cleaned
+end
+
+local function parseScanStatus(text)
+    local parsed = {}
+    local lowered = lower(text)
+    if string.find(lowered, "scan alien:%s*on") then parsed.Enabled = true end
+    if string.find(lowered, "scan alien:%s*off") then parsed.Enabled = false end
+    local lap = string.match(text, "Scan lap%s+(%d+)")
+    local z = string.match(text, "Z%s*=%s*([%-]?%d+%.?%d*)")
+    local mustKill = string.match(text, "Alien Must Kill:%s*(%d+)")
+    local coin = string.match(text, "coin:%s*(%d+)")
+    local stopAt = string.match(text, "stop@([%d%.]+)")
+    local hp = string.match(text, "HP:%s*([%d%.]+)")
+    if lap then parsed.Lap = tonumber(lap) end
+    if z then parsed.Z = tonumber(z) end
+    if mustKill then parsed.MustKill = tonumber(mustKill) end
+    if coin then parsed.Coin = tonumber(coin) end
+    if stopAt then parsed.StopAt = tonumber(stopAt) end
+    if hp then parsed.HP = tonumber(hp) end
+    if string.find(lowered, "fly", 1, true) then parsed.Fly = true end
+    return parsed
+end
+
+local function parseTokenReward(text)
+    local plain = cleanRichText(text)
+    local amount = string.match(plain, "^%s*%+%s*(%d+)%s+Alien Token")
+    return amount and tonumber(amount) or nil
+end
+
 local function watchTextObject(textObject)
-    if not isInstance(textObject) or State.SeenTexts[textObject] then
-        return
-    end
+    if not isInstance(textObject) or State.SeenTexts[textObject] then return end
     local ok, isText = pcall(function()
         return textObject:IsA("TextLabel") or textObject:IsA("TextButton") or textObject:IsA("TextBox")
     end)
-    if not ok or not isText then
-        return
-    end
-    local name = ""
-    local textValue = ""
-    pcall(function()
-        name = textObject.Name
-        textValue = textObject.Text
-    end)
+    if not ok or not isText then return end
+    local name, textValue = "", ""
+    pcall(function() name = textObject.Name; textValue = textObject.Text end)
     local path = safeFullName(textObject)
     local combined = name .. " " .. textValue .. " " .. path
-    local tokenRelated = containsAny(combined, {"alien", "token"})
+    local isScanUI = containsAny(path, {"alienmenu"})
+    local isKillUI = containsAny(path, {"killed:"})
+    local isTokenRelated = containsAny(combined, {"alien", "token"})
     local gameStateRelated = containsAny(combined, {"wave", "round", "boss", "bus", "quest", "mission", "extracted", "game over", "victory", "defeat", "ufo"})
-    local hudRelated = containsAny(path, {"hud", "currency", "counter", "topbar", "status"})
-    if not tokenRelated and not gameStateRelated and not hudRelated then
-        return
-    end
+    local hudRelated = containsAny(path, {"currency", "counter", "health", "ammo", "wave", "round", "quest", "mission", "notification", "bus", "status"})
+    if not isScanUI and not isKillUI and not isTokenRelated and not gameStateRelated and not hudRelated then return end
+
     State.SeenTexts[textObject] = true
     local previous = textValue
-    push(tokenRelated and "TOKEN" or "GUI", "UI text tracked: " .. name,
-        "Text=" .. string.sub(textValue, 1, 160) .. " | Path=" .. path)
-    local changedSignalOk, changedSignal = pcall(function()
-        return textObject:GetPropertyChangedSignal("Text")
-    end)
+    local initialReward = parseTokenReward(textValue)
+    if isScanUI then
+        local parsed = parseScanStatus(textValue)
+        local changes = {}
+        for key, value in pairs(parsed) do
+            if State.ScanState[key] ~= value then
+                State.ScanState[key] = value
+                table.insert(changes, key .. "=" .. safeString(value))
+            end
+        end
+        push("SCAN", "Alien scan UI tracked: " .. name,
+            "Text=" .. string.sub(cleanRichText(textValue), 1, 180) .. " | Parsed=" .. (#changes > 0 and table.concat(changes, ", ") or "no parsed state change") .. " | Path=" .. path)
+    elseif isKillUI then
+        push("GUI", "Kill notification label tracked", "Text=" .. string.sub(cleanRichText(textValue), 1, 120) .. " | Path=" .. path)
+    elseif initialReward then
+        State.TokenRewardStates[textObject] = initialReward
+        State.Counters.TokenRewards = State.Counters.TokenRewards + initialReward
+        push("TOKEN", "Alien Token reward notification", "Amount=" .. safeString(initialReward) .. " | Path=" .. path)
+    else
+        push(isTokenRelated and "TOKEN" or "GUI", "UI text tracked: " .. name,
+            "Text=" .. string.sub(cleanRichText(textValue), 1, 160) .. " | Path=" .. path)
+    end
+
+    if name == "Count" and isKillUI then
+        local initialCount = tonumber(string.match(textValue, "%((%d+)x%)"))
+        if initialCount then
+            State.KillStackCounts[textObject] = initialCount
+            if initialCount > 0 then
+                State.Counters.Kills = State.Counters.Kills + initialCount - 1
+                push("KILL", "Kill notification count initialized", "Count=" .. initialCount .. " | Path=" .. path)
+            end
+        end
+    end
+
+    local changedSignalOk, changedSignal = pcall(function() return textObject:GetPropertyChangedSignal("Text") end)
     if changedSignalOk and changedSignal then
         connectSignal(changedSignal, function()
             local current = ""
-            pcall(function()
-                current = textObject.Text
-            end)
-            if current ~= previous then
-                push(tokenRelated and "TOKEN" or "GUI", "UI text changed: " .. name,
-                    "Old=" .. string.sub(previous, 1, 120) .. " | New=" .. string.sub(current, 1, 120) .. " | Path=" .. path)
-                previous = current
+            pcall(function() current = textObject.Text end)
+            if current == previous then return end
+            local old = previous
+            previous = current
+
+            if isScanUI then
+                local parsed = parseScanStatus(current)
+                local changes = {}
+                for key, value in pairs(parsed) do
+                    if State.ScanState[key] ~= value then
+                        State.ScanState[key] = value
+                        table.insert(changes, key .. "=" .. safeString(value))
+                    end
+                end
+                if #changes > 0 then
+                    push("SCAN", "Alien scan state changed: " .. name,
+                        "Changes=" .. table.concat(changes, ", ") .. " | Text=" .. string.sub(cleanRichText(current), 1, 180) .. " | Path=" .. path)
+                end
+            elseif isKillUI then
+                local count = tonumber(string.match(current, "%((%d+)x%)"))
+                if name == "Count" and count then
+                    local oldCount = State.KillStackCounts[textObject] or 0
+                    local delta = count - oldCount
+                    if delta > 0 then
+                        State.Counters.Kills = State.Counters.Kills + delta - 1
+                        push("KILL", "Kill notification count increased", "Old=" .. oldCount .. " | New=" .. count .. " | Delta=" .. delta .. " | Path=" .. path)
+                    end
+                    State.KillStackCounts[textObject] = count
+                else
+                    push("GUI", "Kill notification label changed", "Old=" .. string.sub(cleanRichText(old), 1, 100) .. " | New=" .. string.sub(cleanRichText(current), 1, 100) .. " | Path=" .. path)
+                end
+            else
+                local newReward = parseTokenReward(current)
+                local oldReward = parseTokenReward(old)
+                if newReward and (not oldReward or newReward > oldReward) then
+                    State.TokenRewardStates[textObject] = newReward
+                    State.Counters.TokenRewards = State.Counters.TokenRewards + newReward
+                    push("TOKEN", "Alien Token reward notification", "Amount=" .. safeString(newReward) .. " | PreviousText=" .. string.sub(cleanRichText(old), 1, 80) .. " | Path=" .. path)
+                elseif not (oldReward and newReward and newReward < oldReward) then
+                    push(isTokenRelated and "TOKEN" or "GUI", "UI text changed: " .. name,
+                        "Old=" .. string.sub(cleanRichText(old), 1, 120) .. " | New=" .. string.sub(cleanRichText(current), 1, 120) .. " | Path=" .. path)
+                end
             end
         end)
     end
+end
+
+local function watchWeaponValue(valueObject, tool)
+    if not isInstance(valueObject) or State.SeenWeaponValues[valueObject] then return end
+    local ok, isValue = pcall(function() return valueObject:IsA("ValueBase") end)
+    if not ok or not isValue then return end
+    local name = safeString(valueObject.Name)
+    if not containsAny(name, {"ammo", "clip", "mag", "bullet", "reload", "charge", "durability", "uses"}) then return end
+    State.SeenWeaponValues[valueObject] = true
+    local previous
+    pcall(function() previous = valueObject.Value end)
+    push("WEAPON", "Weapon state value found: " .. name,
+        "Value=" .. serializeValue(previous) .. " | Tool=" .. safeString(tool.Name) .. " | Path=" .. safeFullName(valueObject))
+    connectSignal(valueObject.Changed, function(newValue)
+        if newValue ~= previous then
+            push("WEAPON", "Weapon state changed: " .. name,
+                "Old=" .. serializeValue(previous) .. " | New=" .. serializeValue(newValue) .. " | Tool=" .. safeString(tool.Name))
+            previous = newValue
+        end
+    end)
 end
 
 local function watchTool(tool)
@@ -605,7 +856,12 @@ local function watchTool(tool)
     end)
     for _, child in ipairs(descendants) do
         watchValueObject(child)
+        watchWeaponValue(child, tool)
     end
+    connectSignal(tool.DescendantAdded, function(descendant)
+        watchWeaponValue(descendant, tool)
+        watchValueObject(descendant)
+    end)
 end
 
 local function trackRemoteContainer(container)
@@ -628,27 +884,19 @@ local function trackRemoteContainer(container)
     push("SYSTEM", "Remote inventory scanned: " .. safeFullName(container), "Count=" .. safeString(count))
 end
 
-local function getNearestTrackedNPC(origin)
+local function getNearestTrackedNPC(origin, wantedKind)
     local nearest = nil
     local nearestDistance = math.huge
     for model, record in pairs(State.Entities) do
-        if record and not record.Dead and model and model.Parent then
+        if record and not record.Dead and model and model.Parent and (not wantedKind or record.Kind == wantedKind) then
             local root = record.Root or findModelRoot(model)
             if root then
-                local ok, position = pcall(function()
-                    return root.Position
-                end)
+                local ok, position = pcall(function() return root.Position end)
                 if ok and position then
                     local distance = (position - origin).Magnitude
                     if distance < nearestDistance then
                         nearestDistance = distance
-                        nearest = {
-                            Model = model,
-                            Record = record,
-                            Root = root,
-                            Position = position,
-                            Distance = distance,
-                        }
+                        nearest = {Model = model, Record = record, Root = root, Position = position, Distance = distance}
                     end
                 end
             end
@@ -678,25 +926,88 @@ local MOVEMENT_CONTROLLER_PROPERTIES = {
     "VectorVelocity", "LineVelocity", "Force", "RelativeTo", "Mode", "TargetPosition",
 }
 
-local function watchMovementController(instance)
-    if not isInstance(instance) or State.SeenControllers[instance] then
-        return
+local function controllerOwner(instance)
+    local character = LocalPlayer and LocalPlayer.Character
+    if character then
+        local ok, inside = pcall(function() return instance:IsDescendantOf(character) end)
+        if ok and inside then return "PLAYER" end
     end
-    local className = ""
-    pcall(function() className = instance.ClassName end)
-    if not MOVEMENT_CONTROLLER_CLASSES[className] then
-        return
+    local entityContainer = Workspace:FindFirstChild("ENTITY_CONTAINER")
+    if entityContainer then
+        local ok, inside = pcall(function() return instance:IsDescendantOf(entityContainer) end)
+        if ok and inside then
+            local cursor = instance.Parent
+            while cursor and cursor ~= entityContainer do
+                local record = State.Entities[cursor]
+                if record then return record.Kind .. ":" .. record.Name end
+                cursor = cursor.Parent
+            end
+            return "ENTITY"
+        end
     end
-    State.SeenControllers[instance] = true
-    local details = {"Parent=" .. safeFullName(instance.Parent)}
+    return "WORLD"
+end
+
+local function readControllerSnapshot(instance)
+    local snapshot = {}
+    for _, propertyName in ipairs({"Enabled", "Position", "Velocity", "CFrame", "TargetPosition", "VectorVelocity", "LineVelocity"}) do
+        local ok, value = pcall(function() return instance[propertyName] end)
+        if ok and value ~= nil then snapshot[propertyName] = value end
+    end
+    return snapshot
+end
+
+watchMovementController = function(instance)
+    if not isInstance(instance) or State.SeenControllers[instance] then return end
+    local className, name = "", ""
+    pcall(function() className = instance.ClassName; name = instance.Name end)
+    if not MOVEMENT_CONTROLLER_CLASSES[className] then return end
+    local owner = controllerOwner(instance)
+    if owner == "WORLD" then return end
+    local enabled = nil
+    pcall(function() enabled = instance.Enabled end)
+    if owner ~= "PLAYER" and enabled == false and (className == "AlignOrientation" or className == "AlignPosition") then return end
+    if owner ~= "PLAYER" and containsAny(name, {"swimalign"}) then return end
+
+    local snapshot = readControllerSnapshot(instance)
+    State.SeenControllers[instance] = {Class = className, Name = name, Owner = owner, Last = snapshot}
+    local details = {"Owner=" .. owner, "Name=" .. name, "Parent=" .. safeFullName(instance.Parent)}
     for _, propertyName in ipairs(MOVEMENT_CONTROLLER_PROPERTIES) do
         local ok, value = pcall(function() return instance[propertyName] end)
-        if ok and value ~= nil then
-            table.insert(details, propertyName .. "=" .. serializeValue(value))
-        end
+        if ok and value ~= nil then table.insert(details, propertyName .. "=" .. serializeValue(value)) end
     end
     push("MOVEMENT", "Movement controller detected: " .. className,
         table.concat(details, " | ") .. " | Path=" .. safeFullName(instance))
+end
+
+local function sampleMovementControllers()
+    for instance, record in pairs(State.SeenControllers) do
+        if instance and instance.Parent and record and record.Owner == "PLAYER" then
+            local current = readControllerSnapshot(instance)
+            local changes = {}
+            for propertyName, value in pairs(current) do
+                local previous = record.Last and record.Last[propertyName]
+                local changed = false
+                if typeof(value) == "Vector3" and typeof(previous) == "Vector3" then
+                    local threshold = (propertyName == "Velocity" or propertyName == "VectorVelocity" or propertyName == "LineVelocity") and 8 or 2
+                    changed = (value - previous).Magnitude >= threshold
+                elseif typeof(value) == "CFrame" and typeof(previous) == "CFrame" then
+                    local positionChanged = (value.Position - previous.Position).Magnitude >= 2
+                    local orientationChanged = value.LookVector:Dot(previous.LookVector) < 0.985
+                        or value.UpVector:Dot(previous.UpVector) < 0.985
+                    changed = positionChanged or orientationChanged
+                elseif value ~= previous then
+                    changed = true
+                end
+                if changed then table.insert(changes, propertyName .. "=" .. serializeValue(value)) end
+            end
+            if #changes > 0 then
+                push("MOVEMENT", "Player movement controller updated: " .. record.Name,
+                    "Class=" .. record.Class .. " | " .. table.concat(changes, " | ") .. " | Path=" .. safeFullName(instance))
+                record.Last = current
+            end
+        end
+    end
 end
 
 local function watchCharacter(character)
@@ -880,8 +1191,6 @@ local function installEnvironmentMonitor()
     end
 
     watchProperty(Workspace, "Gravity", "ENVIRONMENT")
-    watchProperty(Lighting, "ClockTime", "ENVIRONMENT")
-    watchProperty(Lighting, "TimeOfDay", "ENVIRONMENT")
     watchProperty(Lighting, "Brightness", "ENVIRONMENT")
     watchProperty(Lighting, "GlobalShadows", "ENVIRONMENT")
     watchProperty(Lighting, "Ambient", "ENVIRONMENT")
@@ -928,8 +1237,11 @@ local function movementSampler()
                 end)
 
                 if position then
-                local nearest = getNearestTrackedNPC(position)
+                local nearestAlien = getNearestTrackedNPC(position, "ALIEN")
+                local nearestAny = getNearestTrackedNPC(position)
+                local nearest = nearestAlien or nearestAny
                 local targetName = nearest and nearest.Record.Name or "none"
+                local targetKind = nearest and nearest.Record.Kind or "none"
                 local targetDistance = nearest and nearest.Distance or -1
                 local verticalOffset = nearest and (position.Y - nearest.Position.Y) or 0
                 local sample = {
@@ -938,6 +1250,7 @@ local function movementSampler()
                     Floor = floorMaterial,
                     State = stateName,
                     Target = targetName,
+                    TargetKind = targetKind,
                     Distance = targetDistance,
                     VerticalOffset = verticalOffset,
                     Health = health,
@@ -963,24 +1276,28 @@ local function movementSampler()
                         local rootDelta = State.LastMovement and (position - State.LastMovement.Position).Magnitude or 0
                         local cameraPositionDelta = previousCamera and (cameraPosition - previousCamera.Position).Magnitude or 0
                         local lookDot = previousCamera and cameraLook:Dot(previousCamera.Look) or 1
+                        local cameraOffset = cameraPosition - position
+                        local previousOffset = previousCamera and previousCamera.Offset or nil
+                        local offsetDelta = previousOffset and (cameraOffset - previousOffset).Magnitude or 0
                         local cameraModeChanged = previousCamera and (cameraType ~= previousCamera.Type or cameraSubject ~= previousCamera.Subject)
-                        local cameraMovedWhileRootStable = previousCamera and rootDelta < 1.25
-                            and (cameraPositionDelta > 2.5 or lookDot < 0.985)
+                        local cameraOffsetJump = previousCamera and rootDelta < 1.25 and offsetDelta > 6
                         local now = os.clock()
-                        if (cameraModeChanged or cameraMovedWhileRootStable) and (now - State.LastCameraEventAt) >= 0.8 then
+                        if (cameraModeChanged or cameraOffsetJump) and (now - State.LastCameraEventAt) >= 1.0 then
                             State.LastCameraEventAt = now
-                            push("CAMERA", cameraMovedWhileRootStable and "Camera changed while character root stayed still" or "Camera mode/subject changed",
+                            push("CAMERA", cameraOffsetJump and "Camera offset changed sharply while character root stayed nearly still" or "Camera mode/subject changed",
                                 "CameraPos=" .. serializeValue(cameraPosition)
                                 .. " | CameraType=" .. safeString(cameraType)
                                 .. " | CameraSubject=" .. safeString(cameraSubject)
                                 .. " | RootPos=" .. serializeValue(position)
                                 .. " | RootDelta=" .. string.format("%.2f", rootDelta)
                                 .. " | CameraDelta=" .. string.format("%.2f", cameraPositionDelta)
+                                .. " | OffsetDelta=" .. string.format("%.2f", offsetDelta)
                                 .. " | LookDot=" .. string.format("%.4f", lookDot))
                         end
                         State.LastCamera = {
                             Position = cameraPosition,
                             Look = cameraLook,
+                            Offset = cameraOffset,
                             Type = cameraType,
                             Subject = cameraSubject,
                         }
@@ -989,12 +1306,22 @@ local function movementSampler()
 
                 local previous = State.LastMovement
                 local shouldLog = false
+                if previous then
+                    local displacement = (position - previous.Position).Magnitude
+                    if displacement >= 100 then
+                        push("MOVEMENT", "Large character reposition observed",
+                            "Distance=" .. string.format("%.1f", displacement)
+                            .. " | OldPos=" .. serializeValue(previous.Position)
+                            .. " | NewPos=" .. serializeValue(position)
+                            .. " | Target=" .. targetName .. " | TargetKind=" .. targetKind)
+                    end
+                end
                 if not previous then
                     shouldLog = true
                 else
                     if (position - previous.Position).Magnitude >= 2 then shouldLog = true end
                     if velocity and previous.Velocity and (velocity - previous.Velocity).Magnitude >= 8 then shouldLog = true end
-                    if targetName ~= previous.Target then shouldLog = true end
+                    if targetName ~= previous.Target or targetKind ~= previous.TargetKind then shouldLog = true end
                     if math.abs(targetDistance - previous.Distance) >= 3 then shouldLog = true end
                     if math.abs(verticalOffset - previous.VerticalOffset) >= 2 then shouldLog = true end
                     if floorMaterial ~= previous.Floor or stateName ~= previous.State then shouldLog = true end
@@ -1009,12 +1336,12 @@ local function movementSampler()
                         .. " | Floor=" .. floorMaterial .. " | HumanoidState=" .. stateName
                         .. " | Health=" .. health .. " | WalkSpeed=" .. walkSpeed .. " | HipHeight=" .. hipHeight
                         .. " | PlatformStand=" .. platformStand .. " | RootCanCollide=" .. rootCanCollide
-                        .. " | NearestNPC=" .. targetName .. " | NPCPos=" .. (nearest and serializeValue(nearest.Position) or "?")
+                        .. " | NearestTarget=" .. targetName .. " | TargetKind=" .. targetKind .. " | NPCPos=" .. (nearest and serializeValue(nearest.Position) or "?")
                         .. " | Distance=" .. (targetDistance >= 0 and string.format("%.1f", targetDistance) or "?")
                         .. " | PlayerY-minus-NPCY=" .. (nearest and string.format("%.1f", verticalOffset) or "?"))
                 end
 
-                if nearest and nearest.Distance <= 100 and verticalOffset <= -3 then
+                if nearestAlien and nearestAlien.Distance <= 100 and verticalOffset <= -3 then
                     if State.BelowTargetName ~= targetName then
                         State.BelowTargetName = targetName
                         State.BelowTargetSince = os.clock()
@@ -1022,8 +1349,9 @@ local function movementSampler()
                     elseif State.BelowTargetSince and (os.clock() - State.BelowTargetSince) >= 1.0 then
                         if not State.BelowTargetReported then
                             State.BelowTargetReported = true
-                            push("MOVEMENT", "Sustained below-target positioning observed",
-                                "Target=" .. targetName .. " | Distance=" .. string.format("%.1f", nearest.Distance)
+                            push("MOVEMENT", "Sustained below-alien positioning observed",
+                                "Target=" .. targetName .. " | Variant=" .. safeString(nearestAlien.Record.Variant)
+                                .. " | Distance=" .. string.format("%.1f", nearestAlien.Distance)
                                 .. " | VerticalOffset=" .. string.format("%.1f", verticalOffset)
                                 .. " | This is positional evidence, not proof of the movement method.")
                         end
@@ -1038,6 +1366,7 @@ local function movementSampler()
                 end
             end
         end
+        sampleMovementControllers()
         task.wait(MOVEMENT_SAMPLE_INTERVAL)
     end
 end
@@ -1051,9 +1380,9 @@ local function updateUI()
     pcall(function()
         ui.Status.Text = State.Recording and "● RECORDING" or "Ⅱ PAUSED"
         ui.Status.TextColor3 = State.Recording and Color3.fromRGB(105, 220, 150) or Color3.fromRGB(245, 190, 95)
-        ui.Stats.Text = string.format("NPCs %d     REMOTE OBJECTS %d     LOOT %d     TOKEN EVENTS %d     KILLS %d",
-            State.Counters.NPCs, State.Counters.Remotes, State.Counters.Loot,
-            State.Counters.TokenChanges, State.Counters.Kills)
+        ui.Stats.Text = string.format("NPCs %d | ALIENS %d | ZOMBIES %d | KILLS %d | TOKEN REWARDS %d",
+            State.Counters.NPCs, State.Counters.Aliens, State.Counters.Zombies,
+            State.Counters.Kills, State.Counters.TokenRewards)
         ui.RecordButton.Text = State.Recording and "PAUSE" or "RESUME"
 
         local startIndex = math.max(1, #State.Events - UI_ROW_COUNT + 1)
@@ -1079,21 +1408,22 @@ local function updateUI()
             end
         end
         ui.Footer.Text = "PlaceId=" .. safeString(game.PlaceId) .. " | Events=" .. safeString(#State.Events)
-            .. " | SAFE MODE: no global hooks / no outbound remote capture"
+            .. " | FOCUSED SAFE MODE: no hooks / no outbound remote capture"
     end)
 end
 
 local function exportLogs()
     local lines = {}
-    table.insert(lines, "LAST STOP OBSERVER V1.2 SAFE")
+    table.insert(lines, "LAST STOP OBSERVER V1.3 SAFE")
     table.insert(lines, "PlaceId=" .. safeString(game.PlaceId))
     table.insert(lines, "GameId=" .. safeString(game.GameId))
     table.insert(lines, "JobId=" .. safeString(game.JobId))
     table.insert(lines, "Player=" .. safeString(LocalPlayer and LocalPlayer.Name or "unknown"))
-    table.insert(lines, "GlobalHooks=DISABLED | ExecutorFunctionHooks=DISABLED | OutboundRemoteCapture=DISABLED")
-    table.insert(lines, string.format("Counters: NPCs=%d RemoteObjects=%d OutboundRemoteCalls=NOT_CAPTURED Loot=%d TokenEvents=%d Kills=%d ToolActivations=%d Errors=%d",
-        State.Counters.NPCs, State.Counters.Remotes, State.Counters.Loot, State.Counters.TokenChanges,
-        State.Counters.Kills, State.Counters.ToolActivations, State.Counters.Errors))
+    table.insert(lines, "GlobalHooks=DISABLED | ExecutorFunctionHooks=DISABLED | OutboundRemoteCapture=DISABLED | CameraWrites=NONE")
+    table.insert(lines, string.format("Counters: NPCs=%d Aliens=%d Zombies=%d RemoteObjects=%d OutboundRemoteCalls=NOT_CAPTURED Loot=%d TokenEvents=%d TokenRewards=%d Kills=%d ToolActivations=%d ScanEvents=%d Errors=%d",
+        State.Counters.NPCs, State.Counters.Aliens, State.Counters.Zombies, State.Counters.Remotes, State.Counters.Loot,
+        State.Counters.TokenChanges, State.Counters.TokenRewards, State.Counters.Kills, State.Counters.ToolActivations,
+        State.Counters.ScanEvents, State.Counters.Errors))
     table.insert(lines, "--- EVENT LOG ---")
     for _, event in ipairs(State.Events) do
         table.insert(lines, string.format("[%s] [%.3f] [%s] %s | %s", event.time, event.clock, event.category, event.message, event.details))
@@ -1115,12 +1445,12 @@ local function exportLogs()
     end
     if type(writefile) == "function" then
         local okText = pcall(function()
-            writefile("LastStopObserver/last_stop_observer_v1_2_log.txt", textOutput)
+            writefile("LastStopObserver/last_stop_observer_v1_3_log.txt", textOutput)
         end)
         local okJson = false
         if jsonOutput ~= "" then
             okJson = pcall(function()
-                writefile("LastStopObserver/last_stop_observer_v1_2_events.json", jsonOutput)
+                writefile("LastStopObserver/last_stop_observer_v1_3_events.json", jsonOutput)
             end)
         end
         wrote = okText or okJson
@@ -1134,7 +1464,7 @@ local function exportLogs()
     end
 
     if wrote then
-        push("SYSTEM", "Diagnostics exported", "Check Real workspace: LastStopObserver/last_stop_observer_v1_2_log.txt and last_stop_observer_events.json")
+        push("SYSTEM", "Diagnostics exported", "Check Real workspace: LastStopObserver/last_stop_observer_v1_3_log.txt and LastStopObserver/last_stop_observer_v1_3_events.json")
     else
         push("ERROR", "Export unavailable", "writefile and setclipboard were unavailable or failed. Use the in-game log / executor console as fallback.")
         if type(warn) == "function" then
@@ -1155,7 +1485,7 @@ local function buildUI()
     end
 
     local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "LastStopObserverV12Safe"
+    screenGui.Name = "LastStopObserverV13Safe"
     screenGui.ResetOnSpawn = false
     screenGui.IgnoreGuiInset = true
     screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1195,7 +1525,7 @@ local function buildUI()
     title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.fromRGB(242, 242, 250)
-    title.Text = "LAST STOP  /  OBSERVER V1.2 SAFE"
+    title.Text = "LAST STOP  /  OBSERVER V1.3 SAFE"
     title.Parent = top
 
     local status = Instance.new("TextLabel")
@@ -1333,7 +1663,17 @@ local function buildUI()
     connectSignal(exportButton.MouseButton1Click, exportLogs)
     connectSignal(clearButton.MouseButton1Click, function()
         State.Events = {}
-        State.Counters = {NPCs = 0, Remotes = 0, Loot = 0, TokenChanges = 0, Kills = 0, ToolActivations = 0, Errors = 0}
+        State.Counters = {NPCs = 0, Remotes = 0, Loot = 0, TokenChanges = 0, Kills = 0, ToolActivations = 0, Errors = 0, Aliens = 0, Zombies = 0, TokenRewards = 0, ScanEvents = 0}
+        State.KillStackCounts = {}
+        State.TokenRewardStates = {}
+        State.ScanState = {}
+        for _, record in pairs(State.Entities) do
+            if record and record.Model and record.Model.Parent then
+                State.Counters.NPCs = State.Counters.NPCs + 1
+                if record.Kind == "ALIEN" then State.Counters.Aliens = State.Counters.Aliens + 1 end
+                if record.Kind == "ZOMBIE" then State.Counters.Zombies = State.Counters.Zombies + 1 end
+            end
+        end
         State.RemoteDedupe = {}
         State.PropertyDedupe = {}
         State.ErrorDedupe = {}
@@ -1395,7 +1735,7 @@ end
 -- Build UI before monitoring so the initial scan can be reviewed immediately.
 buildUI()
 
-push("SYSTEM", "Observer started", "Safe passive mode. No global hooks, input hooks, camera hooks, or outbound remote interception.")
+push("SYSTEM", "Observer started", "Focused safe mode. No global hooks, input hooks, camera writes, or outbound remote interception.")
 if PreviousHookBuildDetected then
     push("WARNING", "Previous V1.1 hook build detected", "Its wrappers cannot be removed from this live client session. Rejoin Roblox before testing this safe build.")
 end
@@ -1412,7 +1752,7 @@ local initialDescendants = {}
 pcall(function()
     initialDescendants = Workspace:GetDescendants()
 end)
-push("SYSTEM", "Initial Workspace scan", "Descendants=" .. safeString(#initialDescendants))
+push("SYSTEM", "Initial Workspace inventory scan", "Descendants=" .. safeString(#initialDescendants))
 for _, instance in ipairs(initialDescendants) do
     local className = ""
     local name = ""
@@ -1541,5 +1881,5 @@ task.spawn(function()
     end
 end)
 
-push("SYSTEM", "Ready", "Safe mode active. Remote inventory is visible; outbound remote calls are intentionally not intercepted. Test one feature at a time.")
+push("SYSTEM", "Ready", "V1.3 ready. Scan state, alien variants, kill notices, token rewards, player movement controllers, and pickup prompts are prioritized. Outbound remote calls remain unobserved.")
 updateUI()
