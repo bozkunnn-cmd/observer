@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0
+LAST STOP - ALIEN TOKEN FARMER V1.0.1 (INTEGRATED DIAGNOSTICS)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -24,6 +24,8 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
 local LocalPlayer = Players.LocalPlayer
 
 local ENTITY_CONTAINER = Workspace:WaitForChild("ENTITY_CONTAINER", 15)
@@ -84,6 +86,93 @@ local flyGyro = nil
 local originalLighting = {}
 local fullbrightApplied = false
 local mainLoopThread = nil
+local diagEvents = {}
+local diagCounts = {}
+local diagLastByKey = {}
+local diagMaxEvents = 1800
+local diagErrorCount = 0
+local diagPanel = nil
+local diagText = nil
+local diagCountLabel = nil
+local refreshDiagPanel = nil
+local flightLogRoot = nil
+local monitoredHumanoids = {}
+
+local function diagTraceback(err)
+    local message = tostring(err)
+    if debug and type(debug.traceback) == "function" then
+        local ok, trace = pcall(debug.traceback, message, 2)
+        if ok and trace then
+            return tostring(trace)
+        end
+    end
+    return message
+end
+
+local function recordEvent(category, message, details)
+    local event = {
+        time = os.date("%H:%M:%S"),
+        clock = math.floor(os.clock() * 1000) / 1000,
+        category = tostring(category or "INFO"),
+        message = tostring(message or ""),
+        details = tostring(details or ""),
+    }
+    table.insert(diagEvents, event)
+    if #diagEvents > diagMaxEvents then
+        table.remove(diagEvents, 1)
+    end
+    diagCounts[event.category] = (diagCounts[event.category] or 0) + 1
+    if event.category == "ERROR" then
+        diagErrorCount = diagErrorCount + 1
+    end
+    if refreshDiagPanel and diagPanel and diagPanel.Visible then
+        pcall(refreshDiagPanel)
+    end
+    return event
+end
+
+local function recordThrottled(key, interval, category, message, details)
+    local now = os.clock()
+    local previous = diagLastByKey[key]
+    if previous == nil or now - previous >= interval then
+        diagLastByKey[key] = now
+        return recordEvent(category, message, details)
+    end
+    return nil
+end
+
+local function buildDiagnosticReport()
+    local lines = {
+        "LAST STOP ALIEN FARMER - DIAGNOSTICS",
+        "Version: 1.0.1",
+        "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
+        "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
+        "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
+        "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
+        "Alien kill notifications: " .. tostring(alienKills),
+        "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
+        "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
+        "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
+        "Events retained: " .. tostring(#diagEvents) .. " / " .. tostring(diagMaxEvents),
+        "Event categories: " .. (function()
+            local keys = {}
+            for key in pairs(diagCounts) do table.insert(keys, key) end
+            table.sort(keys)
+            local parts = {}
+            for _, key in ipairs(keys) do table.insert(parts, key .. "=" .. tostring(diagCounts[key])) end
+            return table.concat(parts, ", ")
+        end)(),
+        string.rep("-", 72),
+    }
+    for _, event in ipairs(diagEvents) do
+        local line = string.format("[%s] [%.3f] [%s] %s", event.time, event.clock, event.category, event.message)
+        if event.details ~= "" then
+            line = line .. " | " .. event.details
+        end
+        table.insert(lines, line)
+    end
+    return table.concat(lines, "\n")
+end
 
 local function log(message)
     pcall(function()
@@ -94,6 +183,34 @@ end
 local function setStatus(message)
     currentStatus = tostring(message)
 end
+
+local executorName = "Unknown"
+if type(identifyexecutor) == "function" then
+    local ok, value = pcall(identifyexecutor)
+    if ok and value then
+        executorName = tostring(value)
+    end
+end
+recordEvent("SYSTEM", "Diagnostics initialized", "Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+
+pcall(function()
+    LogService.MessageOut:Connect(function(message, messageType)
+        if messageType == Enum.MessageType.MessageError then
+            recordThrottled("client-error:" .. tostring(message), 1.5, "ERROR", "Client error observed (origin may be game or script)", tostring(message))
+        end
+    end)
+end)
+
+pcall(function()
+    local ScriptContext = game:GetService("ScriptContext")
+    ScriptContext.Error:Connect(function(message, stackTrace, scriptInstance)
+        local sourceName = "unknown script"
+        if scriptInstance then
+            pcall(function() sourceName = scriptInstance:GetFullName() end)
+        end
+        recordThrottled("script-context-error:" .. tostring(message), 1.5, "ERROR", "ScriptContext error", "Source=" .. sourceName .. " | Message=" .. tostring(message) .. " | Stack=" .. tostring(stackTrace))
+    end)
+end)
 
 local function getCharacter()
     local character = LocalPlayer.Character
@@ -119,7 +236,10 @@ local function ensureToolEquipped()
 
     local equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
-        equippedToolName = equipped.Name
+        if equippedToolName ~= equipped.Name then
+            equippedToolName = equipped.Name
+            recordEvent("WEAPON", "Tool already equipped", equippedToolName)
+        end
         return true
     end
 
@@ -143,13 +263,16 @@ local function ensureToolEquipped()
     end
 
     if not candidate then
+        recordThrottled("no-tool", 3, "WEAPON", "No usable tool found", "Backpack contains no Tool instance")
         return false
     end
 
-    local ok = pcall(function()
+    recordEvent("WEAPON", "Equip requested", candidate.Name)
+    local ok, equipError = pcall(function()
         humanoid:EquipTool(candidate)
     end)
     if not ok then
+        recordEvent("ERROR", "EquipTool failed", diagTraceback(equipError))
         return false
     end
 
@@ -157,8 +280,10 @@ local function ensureToolEquipped()
     equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
         equippedToolName = equipped.Name
+        recordEvent("WEAPON", "Tool equipped", equippedToolName)
         return true
     end
+    recordThrottled("equip-not-confirmed", 2, "WEAPON", "Equip request not confirmed", candidate.Name)
     return false
 end
 
@@ -327,6 +452,11 @@ local function applyFullbright()
         Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
     end)
     fullbrightApplied = ok
+    if ok then
+        recordEvent("VISUAL", "Fullbright applied", "Brightness=2 | ClockTime=14 | FogEnd=100000 | GlobalShadows=false")
+    else
+        recordEvent("ERROR", "Fullbright application failed", "Lighting properties could not be updated")
+    end
 end
 
 local function restoreFullbright()
@@ -342,6 +472,7 @@ local function restoreFullbright()
         if originalLighting.OutdoorAmbient ~= nil then Lighting.OutdoorAmbient = originalLighting.OutdoorAmbient end
     end)
     fullbrightApplied = false
+    recordEvent("VISUAL", "Original lighting restored", "Fullbright disabled during cleanup")
 end
 
 local function setupFlight()
@@ -364,6 +495,7 @@ local function setupFlight()
         activeHumanoid = humanoid
         flyVelocity = nil
         flyGyro = nil
+        flightLogRoot = nil
     end
 
     for _, descendant in ipairs(character:GetDescendants()) do
@@ -397,6 +529,10 @@ local function setupFlight()
         flyGyro.Parent = root
     end
 
+    if flightLogRoot ~= root then
+        flightLogRoot = root
+        recordEvent("FLIGHT", "Flight controllers initialized", "BodyVelocity=LSAF_FlyVel | BodyGyro=LSAF_FlyGyro | PlatformStand=" .. tostring(humanoid.PlatformStand) .. " | RootCanCollide=" .. tostring(root.CanCollide))
+    end
     return true
 end
 
@@ -409,17 +545,28 @@ local function moveCharacter(position, lookAtPosition)
         return false
     end
     local lookAt = lookAtPosition or (position + Vector3.new(0, 0, -1))
-    pcall(function()
-        root.CFrame = CFrame.lookAt(position, lookAt)
+    local targetCFrame = CFrame.lookAt(position, lookAt)
+    local ok, moveError = pcall(function()
+        root.CFrame = targetCFrame
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         if flyVelocity then
             flyVelocity.Velocity = Vector3.zero
         end
         if flyGyro then
-            flyGyro.CFrame = CFrame.lookAt(position, lookAt)
+            flyGyro.CFrame = targetCFrame
         end
     end)
+    if not ok then
+        recordEvent("ERROR", "Character reposition failed", diagTraceback(moveError))
+        return false
+    end
+    local cameraGap = "unknown"
+    local camera = Workspace.CurrentCamera
+    if camera then
+        cameraGap = string.format("%.1f", (camera.CFrame.Position - root.Position).Magnitude)
+    end
+    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s | PlatformStand=%s", position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
     return true
 end
 
@@ -430,10 +577,17 @@ local function moveBelowAlien(entry)
     local targetPosition = entry.root.Position
     local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
     currentTarget = entry.variant .. " / " .. entry.model.Name
-    return moveCharacter(hoverPosition, targetPosition)
+    local _, playerRoot = getCharacter()
+    local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
+    local moved = moveCharacter(hoverPosition, targetPosition)
+    recordEvent("TARGET", "Hover-below positioning requested", string.format("Variant=%s | Model=%s | Target=(%.1f, %.1f, %.1f) | DesiredPlayerY=%.1f | PreviousDistance=%.1f | Success=%s", entry.variant, entry.model.Name, targetPosition.X, targetPosition.Y, targetPosition.Z, hoverPosition.Y, beforeDistance, tostring(moved)))
+    return moved
 end
 
 local function restoreMovement()
+    if activeHumanoid or flyVelocity or flyGyro then
+        recordEvent("FLIGHT", "Restoring character movement and collision state", "Emergency stop / cleanup requested")
+    end
     if activeHumanoid and activeHumanoid.Parent then
         pcall(function() activeHumanoid.PlatformStand = false end)
     end
@@ -479,11 +633,14 @@ local function sendMeleeSweep(entries)
     end
 
     local sentHits = 0
-    local okAttack = pcall(function()
+    local okAttack, attackError = pcall(function()
         ReplicaSignal:FireServer(120, "Melee", "Attack", direction, 1)
     end)
     if not okAttack then
         remoteErrors = remoteErrors + 1
+        recordEvent("ERROR", "Melee Attack call failed locally", diagTraceback(attackError))
+    else
+        recordEvent("COMBAT", "Melee Attack request dispatched", string.format("Nearest=%s | Direction=(%.2f, %.2f, %.2f) | Local call returned without error; server acceptance unknown", nearest.variant .. "/" .. nearest.model.Name, direction.X, direction.Y, direction.Z))
     end
 
     for _, entry in ipairs(entries) do
@@ -494,12 +651,14 @@ local function sendMeleeSweep(entries)
             local distance = (entry.root.Position - root.Position).Magnitude
             if distance <= CONFIG.ALIEN_ATTACK_RANGE then
                 local parts = getHitParts(entry.model)
+                local targetHitCount = 0
+                local targetPartNames = {}
                 for _, part in ipairs(parts) do
                     if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
                         break
                     end
                     if part and part.Parent then
-                        local okHit = pcall(function()
+                        local okHit, hitError = pcall(function()
                             ReplicaSignal:FireServer(
                                 120,
                                 "Melee",
@@ -512,14 +671,23 @@ local function sendMeleeSweep(entries)
                         end)
                         if okHit then
                             sentHits = sentHits + 1
+                            targetHitCount = targetHitCount + 1
+                            if #targetPartNames < 6 then
+                                table.insert(targetPartNames, part.Name)
+                            end
                         else
                             remoteErrors = remoteErrors + 1
+                            recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
                         end
                     end
+                end
+                if targetHitCount > 0 then
+                    recordEvent("COMBAT", "Melee Hit requests dispatched", string.format("Target=%s/%s | Parts=%d | Names=%s | Local calls returned without error; server damage not independently verified", entry.variant, entry.model.Name, targetHitCount, table.concat(targetPartNames, ", ")))
                 end
             end
         end
     end
+    recordEvent("COMBAT", "Attack sweep finished", "Hit requests without local error=" .. tostring(sentHits) .. " | Local call errors=" .. tostring(remoteErrors))
     return sentHits
 end
 
@@ -550,19 +718,19 @@ local function activatePrompt(prompt)
     if not prompt or not prompt.Parent or not prompt.Enabled then
         return false
     end
-    local ok = false
+    local ok, activationError = false, nil
     if type(fireproximityprompt) == "function" then
-        ok = pcall(function()
+        ok, activationError = pcall(function()
             fireproximityprompt(prompt)
         end)
     else
-        ok = pcall(function()
+        ok, activationError = pcall(function()
             prompt:InputHoldBegin()
             task.wait(math.max(prompt.HoldDuration, 0.05))
             prompt:InputHoldEnd()
         end)
     end
-    return ok
+    return ok, activationError
 end
 
 local function collectTokensAround(center, radius)
@@ -584,19 +752,27 @@ local function collectTokensAround(center, radius)
                 collectedThisPass[prompt] = true
                 local position = getPromptPosition(prompt) or item.position
                 if position then
-                    moveCharacter(position + Vector3.new(0, 2, 0), position)
+                    local promptPath = "unknown"
+                    pcall(function() promptPath = prompt:GetFullName() end)
+                    recordEvent("TOKEN", "Alien Token pickup detected", string.format("Path=%s | Position=(%.1f, %.1f, %.1f) | DistanceFromCluster=%.1f | MaxActivationDistance=%.1f", promptPath, position.X, position.Y, position.Z, item.distance, prompt.MaxActivationDistance))
+                    local moved = moveCharacter(position + Vector3.new(0, 2, 0), position)
                     task.wait(0.08)
                     tokenAttempts = tokenAttempts + 1
-                    local triggered = activatePrompt(prompt)
+                    recordEvent("TOKEN", "Pickup attempt started", "Path=" .. promptPath .. " | MoveToPickup=" .. tostring(moved) .. " | Attempt=" .. tostring(tokenAttempts))
+                    local triggered, triggerError = activatePrompt(prompt)
+                    recordEvent("TOKEN", triggered and "Prompt activation call returned" or "Prompt activation call failed", "Path=" .. promptPath .. " | LocalResult=" .. tostring(triggered) .. (triggerError and " | Error=" .. diagTraceback(triggerError) or ""))
                     task.wait(CONFIG.TOKEN_SETTLE_WAIT)
                     if triggered and (not prompt.Parent or not prompt.Enabled) then
                         tokenPickupsConfirmed = tokenPickupsConfirmed + 1
                         confirmed = confirmed + 1
                         setStatus("Collected Alien Token pickup")
+                        recordEvent("TOKEN", "Pickup confirmed by prompt removal/disable", "Path=" .. promptPath .. " | ConfirmedThisPass=" .. tostring(confirmed) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
                     elseif triggered then
                         setStatus("Token pickup triggered; waiting for confirmation")
+                        recordThrottled("token-unconfirmed:" .. promptPath, 1, "TOKEN", "Pickup not confirmed", "Prompt remained present and enabled after activation")
                     else
                         remoteErrors = remoteErrors + 1
+                        recordEvent("ERROR", "Token pickup activation failed", "Path=" .. promptPath .. " | " .. diagTraceback(triggerError))
                     end
                 end
             end
@@ -625,7 +801,9 @@ local function engageAliens(seedEntries)
 
     local clusterCenter = firstTarget.root.Position
     local startTime = os.clock()
-    local startKillCount = alienKills
+    local initialKillCount = alienKills
+    local startKillCount = initialKillCount
+    recordEvent("TARGET", "Alien cluster engagement started", string.format("InitialTarget=%s/%s | Count=%d | Center=(%.1f, %.1f, %.1f)", firstTarget.variant, firstTarget.model.Name, #seedEntries, clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
     local lastProgressTime = os.clock()
     setStatus("Engaging alien cluster")
 
@@ -640,6 +818,7 @@ local function engageAliens(seedEntries)
             break
         end
 
+        recordThrottled("target-selection", 0.75, "TARGET", "Alien target selected", "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name .. " | ClusterTargets=" .. tostring(#entries))
         moveBelowAlien(nearest)
         local hits = sendMeleeSweep(entries)
         if hits > 0 then
@@ -662,7 +841,9 @@ local function engageAliens(seedEntries)
     end
 
     setStatus("Collecting drops from cleared alien area")
-    collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
+    recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime) .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount) .. " | CurrentKillNotifications=" .. tostring(alienKills))
+    local collected = collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
+    recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
     currentTarget = "None"
 end
 
@@ -671,14 +852,17 @@ local function getCurrentScanPosition()
 end
 
 local function advanceScan()
+    local oldZ = scanZ
+    local oldLap = lap
     scanZ = scanZ - CONFIG.SCAN_STEP
     if scanZ < CONFIG.SCAN_MIN_Z then
         lap = lap + 1
         scanZ = CONFIG.SCAN_START_Z
     end
     local position = getCurrentScanPosition()
-    moveCharacter(position, position + Vector3.new(0, 0, -1))
+    local moved = moveCharacter(position, position + Vector3.new(0, 0, -1))
     setStatus("Scanning lap " .. tostring(lap) .. " / Z=" .. tostring(scanZ))
+    recordEvent("SCAN", "Scan route advanced", "Lap=" .. tostring(oldLap) .. "->" .. tostring(lap) .. " | Z=" .. tostring(oldZ) .. "->" .. tostring(scanZ) .. " | Step=" .. tostring(CONFIG.SCAN_STEP) .. " | MoveSuccess=" .. tostring(moved))
     task.wait(CONFIG.SCAN_WAIT)
 end
 
@@ -698,6 +882,7 @@ local function mainLoop()
     end
 
     setStatus("Automatic farming started")
+    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
 
     while running do
         waitWhilePaused()
@@ -721,13 +906,21 @@ local function mainLoop()
 
             local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
             if #aliens > 0 then
+                local variantCounts = {AlienType1 = 0, AlienType2 = 0, AlienType3 = 0}
+                for _, entry in ipairs(aliens) do
+                    variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
+                end
+                recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
                 setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
                 engageAliens(aliens)
             else
+                recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
                 local looseTokens = getAlienTokenPrompts(scanPosition, 80)
                 if #looseTokens > 0 then
+                    recordEvent("TOKEN", "Loose Alien Tokens found during scan", "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
                     setStatus("Loose Alien Tokens detected")
-                    collectTokensAround(scanPosition, 100)
+                    local collected = collectTokensAround(scanPosition, 100)
+                    recordEvent("TOKEN", "Loose-token collection pass finished", "ConfirmedThisPass=" .. tostring(collected))
                 end
                 advanceScan()
             end
@@ -752,13 +945,38 @@ local function trackTextLabel(label)
 
     local function inspectText()
         local textValue = tostring(label.Text or "")
-        local lowerText = string.lower(textValue)
+        local plainText = string.gsub(textValue, "<[^>]*>", "")
+        local lowerText = string.lower(plainText)
         local oldText = lastLabelText[label]
+        local pathLower = ""
+        pcall(function() pathLower = string.lower(label:GetFullName()) end)
+        local isAlienKillPath = string.find(pathLower, "killed:", 1, true) and string.find(pathLower, "alien", 1, true)
+        local isAlienKillCount = isAlienKillPath and string.find(pathLower, ".count", 1, true)
 
-        if string.find(lowerText, "killed:%s*alien") then
-            if not oldText or not string.find(string.lower(oldText), "killed:%s*alien") then
+        if isAlienKillCount then
+            local currentCount = tonumber(string.match(plainText, "%((%d+)x%)"))
+            local oldPlainText = string.gsub(oldText or "", "<[^>]*>", "")
+            local previousCount = tonumber(string.match(oldPlainText, "%((%d+)x%)"))
+            local delta = 0
+            if currentCount then
+                if previousCount == nil then
+                    delta = currentCount
+                elseif currentCount > previousCount then
+                    delta = currentCount - previousCount
+                elseif currentCount < previousCount then
+                    delta = currentCount
+                end
+            end
+            if delta > 0 then
+                alienKills = alienKills + delta
+                lastAlienKillAt = os.clock()
+                recordEvent("KILL", "Alien kill counter increased", "Delta=" .. tostring(delta) .. " | NotificationCount=" .. tostring(currentCount) .. " | TotalObserved=" .. tostring(alienKills) .. " | Path=" .. pathLower)
+            end
+        elseif not isAlienKillPath and string.find(lowerText, "killed:%s*alien") then
+            if not oldText or not string.find(string.lower(string.gsub(oldText, "<[^>]*>", "")), "killed:%s*alien") then
                 alienKills = alienKills + 1
                 lastAlienKillAt = os.clock()
+                recordEvent("KILL", "Alien kill notification observed", "KillNotifications=" .. tostring(alienKills) .. " | Text=" .. plainText)
             end
         end
 
@@ -768,6 +986,7 @@ local function trackTextLabel(label)
             if amount and frame and not rewardFramesSeen[frame] then
                 rewardToastEstimate = rewardToastEstimate + amount
                 rewardFramesSeen[frame] = true
+                recordEvent("REWARD", "Alien Token reward toast observed", "ToastAmount=" .. tostring(amount) .. " | RunningToastEstimate=" .. tostring(rewardToastEstimate) .. " | This is not a verified wallet balance")
             elseif textValue == "" and frame then
                 rewardFramesSeen[frame] = nil
             end
@@ -780,6 +999,30 @@ local function trackTextLabel(label)
 
     inspectText()
     label:GetPropertyChangedSignal("Text"):Connect(inspectText)
+end
+
+local function monitorCharacter(character)
+    if not character then
+        return
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8)
+    if not humanoid or monitoredHumanoids[humanoid] then
+        return
+    end
+    monitoredHumanoids[humanoid] = true
+    recordEvent("PLAYER", "Character monitor attached", "Health=" .. tostring(humanoid.Health) .. "/" .. tostring(humanoid.MaxHealth))
+    local previousHealth = humanoid.Health
+    humanoid.HealthChanged:Connect(function(newHealth)
+        if newHealth < previousHealth then
+            recordEvent("PLAYER", "Player health decreased", string.format("Health=%.1f->%.1f", previousHealth, newHealth))
+        elseif newHealth > previousHealth then
+            recordThrottled("health-heal", 0.5, "PLAYER", "Player health increased", string.format("Health=%.1f->%.1f", previousHealth, newHealth))
+        end
+        previousHealth = newHealth
+    end)
+    humanoid.Died:Connect(function()
+        recordEvent("PLAYER", "Player humanoid died", "Health=" .. tostring(humanoid.Health))
+    end)
 end
 
 local function hookPlayerGui()
@@ -814,7 +1057,7 @@ screenGui.Parent = guiParent
 
 local frame = Instance.new("Frame")
 frame.Name = "Main"
-frame.Size = UDim2.new(0, 285, 0, 190)
+frame.Size = UDim2.new(0, 330, 0, 220)
 frame.Position = UDim2.new(0, 20, 0.35, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 22, 28)
 frame.BorderSizePixel = 0
@@ -836,7 +1079,7 @@ title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = frame
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, -16, 0, 32)
+statusLabel.Size = UDim2.new(1, -16, 0, 34)
 statusLabel.Position = UDim2.new(0, 8, 0, 36)
 statusLabel.BackgroundTransparency = 1
 statusLabel.Text = "Initializing..."
@@ -848,10 +1091,10 @@ statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = frame
 
 local statsLabel = Instance.new("TextLabel")
-statsLabel.Size = UDim2.new(1, -16, 0, 64)
+statsLabel.Size = UDim2.new(1, -16, 0, 100)
 statsLabel.Position = UDim2.new(0, 8, 0, 72)
 statsLabel.BackgroundTransparency = 1
-statsLabel.Text = "Aliens killed: 0\nToken pickups confirmed: 0\nReward toast estimate: 0"
+statsLabel.Text = "Alien kills: 0\nToken pickups confirmed: 0\nReward toast estimate: 0"
 statsLabel.TextColor3 = Color3.fromRGB(190, 200, 210)
 statsLabel.Font = Enum.Font.Code
 statsLabel.TextSize = 11
@@ -860,7 +1103,7 @@ statsLabel.TextYAlignment = Enum.TextYAlignment.Top
 statsLabel.Parent = frame
 
 local pauseButton = Instance.new("TextButton")
-pauseButton.Size = UDim2.new(0.48, -6, 0, 30)
+pauseButton.Size = UDim2.new(0.31, -6, 0, 30)
 pauseButton.Position = UDim2.new(0, 8, 1, -38)
 pauseButton.BackgroundColor3 = Color3.fromRGB(54, 86, 120)
 pauseButton.TextColor3 = Color3.new(1, 1, 1)
@@ -873,8 +1116,8 @@ pauseCorner.CornerRadius = UDim.new(0, 6)
 pauseCorner.Parent = pauseButton
 
 local stopButton = Instance.new("TextButton")
-stopButton.Size = UDim2.new(0.48, -6, 0, 30)
-stopButton.Position = UDim2.new(0.52, -2, 1, -38)
+stopButton.Size = UDim2.new(0.31, -6, 0, 30)
+stopButton.Position = UDim2.new(0.345, -2, 1, -38)
 stopButton.BackgroundColor3 = Color3.fromRGB(130, 55, 55)
 stopButton.TextColor3 = Color3.new(1, 1, 1)
 stopButton.Font = Enum.Font.GothamBold
@@ -884,6 +1127,210 @@ stopButton.Parent = frame
 local stopCorner = Instance.new("UICorner")
 stopCorner.CornerRadius = UDim.new(0, 6)
 stopCorner.Parent = stopButton
+
+local diagButton = Instance.new("TextButton")
+diagButton.Size = UDim2.new(0.31, -6, 0, 30)
+diagButton.Position = UDim2.new(0.69, -2, 1, -38)
+diagButton.BackgroundColor3 = Color3.fromRGB(70, 92, 105)
+diagButton.TextColor3 = Color3.new(1, 1, 1)
+diagButton.Font = Enum.Font.GothamBold
+diagButton.TextSize = 10
+diagButton.Text = "DIAGNOSTICS"
+diagButton.Parent = frame
+local diagButtonCorner = Instance.new("UICorner")
+diagButtonCorner.CornerRadius = UDim.new(0, 6)
+diagButtonCorner.Parent = diagButton
+
+local diagPanelCorner
+local diagScroll
+local diagCopyButton
+local diagExportButton
+local diagCloseButton
+
+diagPanel = Instance.new("Frame")
+diagPanel.Name = "Diagnostics"
+diagPanel.Size = UDim2.new(0, 440, 0, 310)
+diagPanel.Position = UDim2.new(0, 360, 0.35, 0)
+diagPanel.BackgroundColor3 = Color3.fromRGB(16, 20, 26)
+diagPanel.BorderSizePixel = 0
+diagPanel.Visible = false
+diagPanel.Parent = screenGui
+diagPanelCorner = Instance.new("UICorner")
+diagPanelCorner.CornerRadius = UDim.new(0, 9)
+diagPanelCorner.Parent = diagPanel
+
+local diagTitle = Instance.new("TextLabel")
+diagTitle.Size = UDim2.new(1, -90, 0, 26)
+diagTitle.Position = UDim2.new(0, 10, 0, 7)
+diagTitle.BackgroundTransparency = 1
+diagTitle.Text = "DIAGNOSTICS / EVENT TIMELINE"
+diagTitle.TextColor3 = Color3.fromRGB(115, 235, 150)
+diagTitle.Font = Enum.Font.GothamBold
+diagTitle.TextSize = 12
+diagTitle.TextXAlignment = Enum.TextXAlignment.Left
+diagTitle.Parent = diagPanel
+
+diagCountLabel = Instance.new("TextLabel")
+diagCountLabel.Size = UDim2.new(1, -20, 0, 18)
+diagCountLabel.Position = UDim2.new(0, 10, 0, 34)
+diagCountLabel.BackgroundTransparency = 1
+diagCountLabel.Text = "Events: 0 | Errors: 0"
+diagCountLabel.TextColor3 = Color3.fromRGB(180, 190, 200)
+diagCountLabel.Font = Enum.Font.Code
+diagCountLabel.TextSize = 10
+diagCountLabel.TextXAlignment = Enum.TextXAlignment.Left
+diagCountLabel.Parent = diagPanel
+
+diagCloseButton = Instance.new("TextButton")
+diagCloseButton.Size = UDim2.new(0, 28, 0, 24)
+diagCloseButton.Position = UDim2.new(1, -36, 0, 7)
+diagCloseButton.BackgroundColor3 = Color3.fromRGB(95, 55, 55)
+diagCloseButton.Text = "X"
+diagCloseButton.TextColor3 = Color3.new(1, 1, 1)
+diagCloseButton.Font = Enum.Font.GothamBold
+diagCloseButton.TextSize = 11
+diagCloseButton.Parent = diagPanel
+
+local diagScrollCorner
+
+diagScroll = Instance.new("ScrollingFrame")
+diagScroll.Size = UDim2.new(1, -20, 1, -104)
+diagScroll.Position = UDim2.new(0, 10, 0, 56)
+diagScroll.BackgroundColor3 = Color3.fromRGB(25, 30, 38)
+diagScroll.BorderSizePixel = 0
+diagScroll.ScrollBarThickness = 6
+diagScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+diagScroll.Parent = diagPanel
+diagScrollCorner = Instance.new("UICorner")
+diagScrollCorner.CornerRadius = UDim.new(0, 5)
+diagScrollCorner.Parent = diagScroll
+
+diagText = Instance.new("TextLabel")
+diagText.Size = UDim2.new(1, -12, 0, 0)
+diagText.Position = UDim2.new(0, 6, 0, 6)
+diagText.AutomaticSize = Enum.AutomaticSize.Y
+diagText.BackgroundTransparency = 1
+diagText.Text = "Waiting for events..."
+diagText.TextColor3 = Color3.fromRGB(205, 215, 225)
+diagText.Font = Enum.Font.Code
+diagText.TextSize = 10
+diagText.TextWrapped = true
+diagText.TextXAlignment = Enum.TextXAlignment.Left
+diagText.TextYAlignment = Enum.TextYAlignment.Top
+diagText.Parent = diagScroll
+
+local function buildVisibleDiagnostics()
+    local lines = {}
+    local first = math.max(1, #diagEvents - 59)
+    for index = first, #diagEvents do
+        local event = diagEvents[index]
+        local line = string.format("[%s] [%s] %s", event.time, event.category, event.message)
+        if event.details ~= "" then
+            line = line .. " | " .. event.details
+        end
+        table.insert(lines, line)
+    end
+    return #lines > 0 and table.concat(lines, "\n") or "Waiting for events..."
+end
+
+refreshDiagPanel = function()
+    if not diagPanel or not diagPanel.Parent then
+        return
+    end
+    diagText.Text = buildVisibleDiagnostics()
+    diagCountLabel.Text = "Events: " .. tostring(#diagEvents) .. " / " .. tostring(diagMaxEvents) .. " | Errors: " .. tostring(diagErrorCount)
+    task.defer(function()
+        if diagScroll and diagScroll.Parent and diagText and diagText.Parent then
+            local height = diagText.TextBounds.Y + 16
+            diagScroll.CanvasSize = UDim2.new(0, 0, 0, height)
+            diagScroll.CanvasPosition = Vector2.new(0, math.max(0, height - diagScroll.AbsoluteSize.Y))
+        end
+    end)
+end
+
+local function copyDiagnostics()
+    recordEvent("DIAGNOSTICS", "Copy requested", "Preparing current event history")
+    local report = buildDiagnosticReport()
+    local clipboardFunction = setclipboard or toclipboard
+    if type(clipboardFunction) == "function" then
+        local ok, copyError = pcall(clipboardFunction, report)
+        if ok then
+            setStatus("Diagnostics copied to clipboard")
+            recordEvent("DIAGNOSTICS", "Diagnostics copied", "Clipboard API returned without error")
+        else
+            recordEvent("ERROR", "Clipboard copy failed", diagTraceback(copyError))
+            setStatus("Clipboard copy failed; use Export Logs")
+        end
+    else
+        setStatus("Clipboard API unavailable; use Export Logs")
+        recordEvent("ERROR", "Clipboard API unavailable", "Neither setclipboard nor toclipboard is exposed by this executor")
+    end
+end
+
+local function exportDiagnostics()
+    if type(writefile) ~= "function" then
+        recordEvent("ERROR", "File export unavailable", "Executor does not expose writefile")
+        setStatus("File export unavailable; try Copy Diagnostics")
+        return
+    end
+    local folderName = "LastStopAlienFarmer"
+    local prefix = ""
+    if type(makefolder) == "function" then
+        local folderReady = false
+        if type(isfolder) == "function" then
+            local checkOk, exists = pcall(isfolder, folderName)
+            folderReady = checkOk and exists == true
+        end
+        if not folderReady then
+            local makeOk = pcall(makefolder, folderName)
+            folderReady = makeOk
+            if type(isfolder) == "function" then
+                local checkOk, exists = pcall(isfolder, folderName)
+                folderReady = checkOk and exists == true
+            end
+        end
+        if folderReady then
+            prefix = folderName .. "/"
+        end
+    end
+    recordEvent("DIAGNOSTICS", "Export requested", "Writing text and JSON event history")
+    local report = buildDiagnosticReport()
+    local jsonPayload = ""
+    local jsonOk, jsonResult = pcall(function()
+        return HttpService:JSONEncode({
+            version = "1.0.1",
+            gameId = game.GameId,
+            placeId = game.PlaceId,
+            status = currentStatus,
+            alienKills = alienKills,
+            tokenAttempts = tokenAttempts,
+            tokenPickupsConfirmed = tokenPickupsConfirmed,
+            rewardToastEstimate = rewardToastEstimate,
+            localCallErrors = remoteErrors,
+            capturedErrors = diagErrorCount,
+            categoryCounts = diagCounts,
+            config = CONFIG,
+            events = diagEvents,
+        })
+    end)
+    if jsonOk then
+        jsonPayload = jsonResult
+    else
+        recordEvent("ERROR", "JSON serialization failed", diagTraceback(jsonResult))
+    end
+    local textOk, textError = pcall(writefile, prefix .. "diagnostics.txt", report)
+    local dataOk, dataError = false, "JSON serialization unavailable"
+    if jsonOk then
+        dataOk, dataError = pcall(writefile, prefix .. "diagnostics.json", jsonPayload)
+    end
+    if textOk and dataOk then
+        setStatus("Diagnostics exported to " .. prefix)
+        recordEvent("DIAGNOSTICS", "Export completed", "Files=diagnostics.txt, diagnostics.json | Folder=" .. (prefix ~= "" and prefix or "executor root"))
+    else
+        setStatus("Export failed; inspect diagnostics")
+        recordEvent("ERROR", "File export failed", "Text=" .. tostring(textError) .. " | JSON=" .. tostring(dataError))
+    end
+end
 
 local function refreshGui()
     if statusLabel and statusLabel.Parent then
@@ -896,7 +1343,9 @@ local function refreshGui()
             .. "\nReward toast estimate: " .. tostring(rewardToastEstimate)
             .. "\nTool: " .. tostring(equippedToolName)
             .. "\nLap: " .. tostring(lap) .. "  Scan Z: " .. tostring(scanZ)
-            .. "\nRemote errors: " .. tostring(remoteErrors)
+            .. "\nLocal call errors: " .. tostring(remoteErrors)
+            .. " | Diagnostics: " .. tostring(#diagEvents)
+            .. " | Captured errors: " .. tostring(diagErrorCount)
     end
     if pauseButton and pauseButton.Parent then
         pauseButton.Text = paused and "RESUME" or "PAUSE"
@@ -909,10 +1358,12 @@ pauseButton.Activated:Connect(function()
     end
     paused = not paused
     setStatus(paused and "Paused" or "Resuming")
+    recordEvent("SYSTEM", paused and "Farming paused" or "Farming resumed", "Pause control activated")
     refreshGui()
 end)
 
 local function stopFarm()
+    recordEvent("SYSTEM", "Stop requested by user", "Emergency stop button activated")
     running = false
     paused = false
     restoreMovement()
@@ -923,12 +1374,54 @@ end
 
 stopButton.Activated:Connect(stopFarm)
 
-LocalPlayer.CharacterAdded:Connect(function()
+diagButton.Activated:Connect(function()
+    diagPanel.Visible = not diagPanel.Visible
+    refreshDiagPanel()
+end)
+diagCloseButton.Activated:Connect(function()
+    diagPanel.Visible = false
+end)
+
+diagCopyButton = Instance.new("TextButton")
+diagCopyButton.Size = UDim2.new(0.48, -6, 0, 30)
+diagCopyButton.Position = UDim2.new(0, 10, 1, -38)
+diagCopyButton.BackgroundColor3 = Color3.fromRGB(54, 86, 120)
+diagCopyButton.TextColor3 = Color3.new(1, 1, 1)
+diagCopyButton.Font = Enum.Font.GothamBold
+diagCopyButton.TextSize = 10
+diagCopyButton.Text = "COPY DIAGNOSTICS"
+diagCopyButton.Parent = diagPanel
+local diagCopyCorner = Instance.new("UICorner")
+diagCopyCorner.CornerRadius = UDim.new(0, 6)
+diagCopyCorner.Parent = diagCopyButton
+
+diagExportButton = Instance.new("TextButton")
+diagExportButton.Size = UDim2.new(0.48, -6, 0, 30)
+diagExportButton.Position = UDim2.new(0.52, -2, 1, -38)
+diagExportButton.BackgroundColor3 = Color3.fromRGB(65, 105, 75)
+diagExportButton.TextColor3 = Color3.new(1, 1, 1)
+diagExportButton.Font = Enum.Font.GothamBold
+diagExportButton.TextSize = 10
+diagExportButton.Text = "EXPORT LOGS"
+diagExportButton.Parent = diagPanel
+local diagExportCorner = Instance.new("UICorner")
+diagExportCorner.CornerRadius = UDim.new(0, 6)
+diagExportCorner.Parent = diagExportButton
+
+diagCopyButton.Activated:Connect(copyDiagnostics)
+diagExportButton.Activated:Connect(exportDiagnostics)
+
+LocalPlayer.CharacterAdded:Connect(function(character)
     task.wait(1)
+    monitorCharacter(character)
+    recordEvent("PLAYER", "Character respawned", "Character=" .. tostring(character.Name))
     if running then
         setupFlight()
     end
 end)
+if LocalPlayer.Character then
+    task.spawn(monitorCharacter, LocalPlayer.Character)
+end
 
 hookPlayerGui()
 
@@ -940,18 +1433,44 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while screenGui.Parent do
+        local _, root = getCharacter()
+        local camera = Workspace.CurrentCamera
+        if root and camera then
+            local gap = (camera.CFrame.Position - root.Position).Magnitude
+            if gap > 100 then
+                recordThrottled("camera-root-gap", 0.75, "CAMERA", "Large camera/root separation observed", string.format("Gap=%.1f studs | Root=(%.1f, %.1f, %.1f) | Camera=(%.1f, %.1f, %.1f)", gap, root.Position.X, root.Position.Y, root.Position.Z, camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z))
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
 local function startFarm()
     if running then
         return
     end
     running = true
     paused = false
+    recordEvent("SYSTEM", "Farming started", "Automatic scan/combat/token loop started")
     applyFullbright()
     setupFlight()
     if mainLoopThread then
         mainLoopThread = nil
     end
-    mainLoopThread = task.spawn(mainLoop)
+    mainLoopThread = task.spawn(function()
+        local ok, loopError = pcall(mainLoop)
+        if not ok then
+            recordEvent("ERROR", "Main farming loop crashed", diagTraceback(loopError))
+            running = false
+            paused = false
+            restoreMovement()
+            restoreFullbright()
+            setStatus("Stopped after error - open Diagnostics")
+            refreshGui()
+        end
+    end)
     refreshGui()
 end
 
@@ -962,4 +1481,6 @@ task.delay(2, function()
     end
 end)
 
-log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only.")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=integrated | Hooks=none")
+refreshDiagPanel()
+log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
