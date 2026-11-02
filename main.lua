@@ -1,20 +1,26 @@
 --[=[
-LAST STOP OBSERVER V1.1
-Target: Project Real (capability-gated)
-Purpose: Passive client-side diagnostics for Last Stop.
+LAST STOP OBSERVER V1.2 SAFE
+Target: Project Real
+Purpose: Low-interference, passive client-side diagnostics for Last Stop.
 
 SAFETY / SCOPE
+- Installs NO hookmetamethod, hookfunction, __namecall, or __newindex hooks.
+- Does NOT intercept input helpers, Drawing.new, camera writes, or outbound remotes.
 - Does NOT attack, move, teleport, collect, fire remotes, or change game state.
-- Observes client-visible entities, health changes, tools, prompts, loot-like objects,
-  selected UI counters, movement/property changes, and RemoteEvent/RemoteFunction calls.
-- Remote and __newindex hooks are pass-through only. If a hook cannot be installed,
-  the rest of the observer continues without it.
+- Observes client-visible entities, health, tools, prompts, loot-like objects, UI counters,
+  movement controllers, character position, and camera position through ordinary signals/sampling.
+- Outbound FireServer/InvokeServer calls are intentionally NOT captured in this safe build.
 - It cannot see server-only logic or every internal operation of another script.
 ]=]
 
 local ENV = (type(getgenv) == "function" and getgenv()) or _G
+local PreviousHookBuildDetected = false
 if type(ENV.__LAST_STOP_OBSERVER_V1) == "table" then
     local old = ENV.__LAST_STOP_OBSERVER_V1
+    pcall(function()
+        local hooks = old.Hooks
+        PreviousHookBuildDetected = hooks ~= nil and (hooks.Namecall == true or hooks.NewIndex == true or (tonumber(hooks.Functions) or 0) > 0)
+    end)
     if type(old.Unload) == "function" then
         pcall(old.Unload)
     end
@@ -34,13 +40,11 @@ local LocalPlayer = Players.LocalPlayer
 local State = {
     Alive = true,
     Recording = true,
-    HookBusy = false,
     Events = {},
     Connections = {},
     Entities = {},
     SeenTools = {},
     SeenControllers = {},
-    SeenVisuals = {},
     SeenPrompts = {},
     SeenObjects = {},
     SeenValues = {},
@@ -53,29 +57,24 @@ local State = {
     Counters = {
         NPCs = 0,
         Remotes = 0,
-        RemoteCalls = 0,
         Loot = 0,
         TokenChanges = 0,
         Kills = 0,
         ToolActivations = 0,
-        PropertyWrites = 0,
         Errors = 0,
     },
     LastMovement = nil,
+    LastCamera = nil,
+    LastCameraEventAt = 0,
     BelowTargetSince = nil,
     BelowTargetName = nil,
-    Hooks = {
-        Namecall = false,
-        NewIndex = false,
-        Functions = 0,
-    },
 }
 ENV.__LAST_STOP_OBSERVER_V1 = State
 
 local MAX_EVENTS = 5000
 local UI_ROW_COUNT = 13
 local REMOTE_DEDUPE_WINDOW = 0.10
-local MOVEMENT_SAMPLE_INTERVAL = 0.20
+local MOVEMENT_SAMPLE_INTERVAL = 0.35
 
 local function safeString(value)
     local ok, result = pcall(function()
@@ -208,8 +207,6 @@ local function push(category, message, details)
         State.Counters.Kills = State.Counters.Kills + 1
     elseif category == "WEAPON" and string.find(safeString(message), "Tool Activated", 1, true) then
         State.Counters.ToolActivations = State.Counters.ToolActivations + 1
-    elseif category == "PROPERTY" then
-        State.Counters.PropertyWrites = State.Counters.PropertyWrites + 1
     elseif category == "ERROR" then
         State.Counters.Errors = State.Counters.Errors + 1
     end
@@ -328,64 +325,75 @@ local function trackModel(model)
         return
     end
 
+    local entityContainer = Workspace:FindFirstChild("ENTITY_CONTAINER")
+    local isGameEntity = entityContainer ~= nil and model.Parent == entityContainer
     local humanoid = findHumanoid(model)
-    if not humanoid then
+    -- Last Stop's ENTITY_CONTAINER models can expose alien body parts without a Humanoid.
+    if not humanoid and not isGameEntity then
         return
     end
 
     local root = findModelRoot(model)
+    if not root then
+        return
+    end
     local name = safeString(model.Name)
-    local category = classifyName(name)
+    local category = classifyName(name .. " " .. safeFullName(model))
+    local initialHealth = humanoid and humanoid.Health or nil
     local record = {
         Model = model,
         Humanoid = humanoid,
         Root = root,
         Name = name,
         Category = category,
-        LastHealth = humanoid.Health,
-        Dead = humanoid.Health <= 0,
+        LastHealth = initialHealth,
+        Dead = initialHealth ~= nil and initialHealth <= 0 or false,
         Connections = {},
     }
     State.Entities[model] = record
     State.Counters.NPCs = State.Counters.NPCs + 1
 
-    local rootPosition = root and getPosition(root) or nil
+    local rootPosition = getPosition(root)
+    local healthText = humanoid and (safeString(humanoid.Health) .. "/" .. safeString(humanoid.MaxHealth)) or "custom/unknown"
     push("NPC", "Detected " .. category .. ": " .. name,
-        "Health=" .. safeString(humanoid.Health) .. "/" .. safeString(humanoid.MaxHealth)
+        "Health=" .. healthText
         .. " | Position=" .. (rootPosition and serializeValue(rootPosition) or "unknown")
         .. " | Model=" .. safeFullName(model)
-        .. " | Root=" .. (root and safeFullName(root) or "not found"))
+        .. " | Root=" .. safeFullName(root)
+        .. " | EntityContainer=" .. safeString(isGameEntity))
 
-    local healthConnection = connectSignal(humanoid.HealthChanged, function(newHealth)
-        if not State.Alive or not State.Recording then
+    if humanoid then
+        local healthConnection = connectSignal(humanoid.HealthChanged, function(newHealth)
+            if not State.Alive or not State.Recording then
+                record.LastHealth = newHealth
+                return
+            end
+            local oldHealth = record.LastHealth or newHealth
             record.LastHealth = newHealth
-            return
+            local delta = newHealth - oldHealth
+            if math.abs(delta) >= 0.01 then
+                local changeType = delta < 0 and "DAMAGE" or "HEAL"
+                push(changeType, record.Name .. " health " .. string.format("%.1f -> %.1f", oldHealth, newHealth),
+                    "Delta=" .. string.format("%+.1f", delta) .. " | Class=" .. record.Category)
+            end
+            if newHealth <= 0 and not record.Dead then
+                record.Dead = true
+                push("KILL", "NPC reached zero health: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
+            end
+        end)
+        if healthConnection then
+            table.insert(record.Connections, healthConnection)
         end
-        local oldHealth = record.LastHealth
-        record.LastHealth = newHealth
-        local delta = newHealth - oldHealth
-        if math.abs(delta) >= 0.01 then
-            local changeType = delta < 0 and "DAMAGE" or "HEAL"
-            push(changeType, record.Name .. " health " .. string.format("%.1f -> %.1f", oldHealth, newHealth),
-                "Delta=" .. string.format("%+.1f", delta) .. " | Class=" .. record.Category)
-        end
-        if newHealth <= 0 and not record.Dead then
-            record.Dead = true
-            push("KILL", "NPC reached zero health: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
-        end
-    end)
-    if healthConnection then
-        table.insert(record.Connections, healthConnection)
-    end
 
-    local diedConnection = connectSignal(humanoid.Died, function()
-        if not record.Dead then
-            record.Dead = true
-            push("KILL", "NPC Died event: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
+        local diedConnection = connectSignal(humanoid.Died, function()
+            if not record.Dead then
+                record.Dead = true
+                push("KILL", "NPC Died event: " .. record.Name, "Class=" .. record.Category .. " | " .. safeFullName(model))
+            end
+        end)
+        if diedConnection then
+            table.insert(record.Connections, diedConnection)
         end
-    end)
-    if diedConnection then
-        table.insert(record.Connections, diedConnection)
     end
 end
 
@@ -441,43 +449,6 @@ local function trackPrompt(prompt)
     logPrompt(prompt, "Prompt discovered")
 end
 
-local VISUAL_CLASSES = {
-    Highlight = true,
-    BillboardGui = true,
-    BoxHandleAdornment = true,
-    SelectionBox = true,
-    Beam = true,
-    Trail = true,
-    ParticleEmitter = true,
-    PointLight = true,
-    SpotLight = true,
-    SurfaceLight = true,
-}
-
-local function trackVisualObject(instance)
-    if not isInstance(instance) or State.SeenVisuals[instance] then
-        return
-    end
-    local className = ""
-    pcall(function() className = instance.ClassName end)
-    if not VISUAL_CLASSES[className] then
-        return
-    end
-    State.SeenVisuals[instance] = true
-    local properties = {}
-    local propertyNames = {"Adornee", "Enabled", "AlwaysOnTop", "FillColor", "OutlineColor",
-        "FillTransparency", "OutlineTransparency", "Size", "StudsOffset", "Color", "Brightness",
-        "Range", "Transparency", "Texture", "Rate", "Lifetime"}
-    for _, propertyName in ipairs(propertyNames) do
-        local ok, value = pcall(function() return instance[propertyName] end)
-        if ok and value ~= nil then
-            table.insert(properties, propertyName .. "=" .. serializeValue(value))
-        end
-    end
-    push("VISUAL", "Visual/effect object detected: " .. className .. " / " .. safeString(instance.Name),
-        table.concat(properties, " | ") .. " | Path=" .. safeFullName(instance))
-end
-
 local function trackInterestingObject(instance)
     if not isInstance(instance) or State.SeenObjects[instance] then
         return
@@ -509,7 +480,17 @@ local function watchValueObject(valueObject)
         return
     end
     local name = safeString(valueObject.Name)
-    if not containsAny(name, {"alien", "token"}) then
+    local path = safeFullName(valueObject)
+    local tokenRelated = containsAny(name, {"alien", "token"}) or containsAny(path, {"token"})
+    local entityContainer = Workspace:FindFirstChild("ENTITY_CONTAINER")
+    local healthRelated = false
+    if entityContainer and containsAny(name, {"health", "hp", "currenthealth"}) then
+        local insideOk, inside = pcall(function()
+            return valueObject:IsDescendantOf(entityContainer)
+        end)
+        healthRelated = insideOk and inside == true
+    end
+    if not tokenRelated and not healthRelated then
         return
     end
     State.SeenValues[valueObject] = true
@@ -517,10 +498,35 @@ local function watchValueObject(valueObject)
     pcall(function()
         previous = serializeValue(valueObject.Value)
     end)
-    push("TOKEN", "Token-like value found: " .. name, "Value=" .. previous .. " | Path=" .. safeFullName(valueObject))
+    local category = healthRelated and "NPC" or "TOKEN"
+    push(category, healthRelated and ("Entity health value found: " .. name) or ("Token-like value found: " .. name),
+        "Value=" .. previous .. " | Path=" .. path)
     connectSignal(valueObject.Changed, function(newValue)
-        push("TOKEN", name .. " changed", "Old=" .. previous .. " | New=" .. serializeValue(newValue) .. " | Path=" .. safeFullName(valueObject))
-        previous = serializeValue(newValue)
+        local oldValue = previous
+        local newSerialized = serializeValue(newValue)
+        if healthRelated then
+            local oldNumber = tonumber(oldValue)
+            local newNumber = tonumber(newValue)
+            if oldNumber and newNumber and oldNumber ~= newNumber then
+                push(newNumber < oldNumber and "DAMAGE" or "HEAL", "Entity " .. name .. " changed: " .. oldValue .. " -> " .. newSerialized,
+                    "Delta=" .. safeString(newNumber - oldNumber) .. " | Path=" .. path)
+                if newNumber <= 0 then
+                    local candidate = valueObject.Parent
+                    while candidate and candidate ~= entityContainer do
+                        local record = State.Entities[candidate]
+                        if record and not record.Dead then
+                            record.Dead = true
+                            push("KILL", "Entity health reached zero: " .. record.Name, "Path=" .. safeFullName(candidate))
+                            break
+                        end
+                        candidate = candidate.Parent
+                    end
+                end
+            end
+        else
+            push("TOKEN", name .. " changed", "Old=" .. oldValue .. " | New=" .. newSerialized .. " | Path=" .. path)
+        end
+        previous = newSerialized
     end)
 end
 
@@ -804,398 +810,6 @@ local function watchGuiTree(root)
     end)
 end
 
-local function collectReferencedNPCs(value, output, depth)
-    depth = depth or 0
-    if depth > 2 then
-        return
-    end
-    if isInstance(value) then
-        local candidate = value
-        while candidate and candidate ~= Workspace do
-            local record = State.Entities[candidate]
-            if record then
-                local label = record.Category .. ":" .. record.Name .. " @ " .. safeFullName(candidate)
-                for _, existing in ipairs(output) do
-                    if existing == label then
-                        return
-                    end
-                end
-                table.insert(output, label)
-                return
-            end
-            local ok, parent = pcall(function() return candidate.Parent end)
-            candidate = ok and parent or nil
-        end
-    elseif type(value) == "table" then
-        local count = 0
-        for _, item in pairs(value) do
-            count = count + 1
-            if count > 8 then break end
-            collectReferencedNPCs(item, output, depth + 1)
-        end
-    end
-end
-
-local function installRemoteHook()
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        push("SYSTEM", "Remote hook unavailable", "Missing hookmetamethod or getnamecallmethod; remote calls will not be intercepted.")
-        return
-    end
-
-    local wrap = type(newcclosure) == "function" and newcclosure or function(fn)
-        return fn
-    end
-
-    local original
-    local ok, result = pcall(function()
-        original = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            local packedArgs = table.pack(...)
-            if State.Alive and State.Recording and not State.HookBusy then
-                local method = nil
-                pcall(function()
-                    method = getnamecallmethod()
-                end)
-                if method == "FireServer" or method == "InvokeServer" then
-                    local className = ""
-                    pcall(function()
-                        className = self.ClassName
-                    end)
-                    if className == "RemoteEvent" or className == "RemoteFunction" then
-                        State.Counters.RemoteCalls = State.Counters.RemoteCalls + 1
-                        State.HookBusy = true
-                        pcall(function()
-                            local serialized = {}
-                            local referencedNPCs = {}
-                            for index = 1, math.min(packedArgs.n, 8) do
-                                table.insert(serialized, tostring(index) .. "=" .. serializeValue(packedArgs[index], 0))
-                                collectReferencedNPCs(packedArgs[index], referencedNPCs, 0)
-                            end
-                            local caller = "nil"
-                            if type(getcallingscript) == "function" then
-                                local callerScript = nil
-                                pcall(function()
-                                    callerScript = getcallingscript()
-                                end)
-                                if callerScript then
-                                    caller = safeFullName(callerScript)
-                                end
-                            end
-                            local executorContext = "unknown"
-                            if type(checkcaller) == "function" then
-                                local callerFlag = nil
-                                pcall(function()
-                                    callerFlag = checkcaller()
-                                end)
-                                executorContext = safeString(callerFlag)
-                            end
-                            local remotePath = safeFullName(self)
-                            local details = "Class=" .. className .. " | CallerScript=" .. caller
-                                .. " | checkcaller=" .. executorContext
-                                .. " | ReferencedNPCs=" .. (#referencedNPCs > 0 and table.concat(referencedNPCs, " ; ") or "none")
-                                .. " | Args=" .. table.concat(serialized, " ; ")
-                            local signature = remotePath .. "|" .. safeString(method) .. "|" .. table.concat(serialized, "|")
-                            local now = os.clock()
-                            local previous = State.RemoteDedupe[signature]
-                            if previous and (now - previous.clock) <= REMOTE_DEDUPE_WINDOW then
-                                previous.count = previous.count + 1
-                                previous.clock = now
-                                previous.event.details = details .. " | Repeated=" .. safeString(previous.count)
-                            else
-                                local event = push("REMOTE", safeString(method) .. " -> " .. remotePath, details)
-                                State.RemoteDedupe[signature] = {clock = now, count = 1, event = event}
-                            end
-                        end)
-                        State.HookBusy = false
-                    end
-                elseif method == "PivotTo" or method == "SetPrimaryPartCFrame" or method == "MoveTo"
-                    or method == "ChangeState" or method == "SetStateEnabled" or method == "Move"
-                    or method == "ApplyImpulse" or method == "ApplyAngularImpulse" then
-                    State.HookBusy = true
-                    pcall(function()
-                        local character = LocalPlayer and LocalPlayer.Character
-                        local relevant = false
-                        if character then
-                            if self == character then
-                                relevant = true
-                            else
-                                relevant = self:IsDescendantOf(character)
-                            end
-                        end
-                        local executorCall = false
-                        if type(checkcaller) == "function" then
-                            pcall(function() executorCall = checkcaller() end)
-                        end
-                        if relevant and executorCall then
-                            local serialized = {}
-                            for index = 1, math.min(packedArgs.n, 6) do
-                                table.insert(serialized, tostring(index) .. "=" .. serializeValue(packedArgs[index], 0))
-                            end
-                            push("MOVEMENT", "Executor method call: " .. safeString(method) .. " on " .. safeFullName(self),
-                                "Args=" .. table.concat(serialized, " ; "))
-                        end
-                    end)
-                    State.HookBusy = false
-                elseif method == "InputHoldBegin" or method == "InputHoldEnd" then
-                    local className = ""
-                    pcall(function() className = self.ClassName end)
-                    local executorCall = false
-                    if type(checkcaller) == "function" then
-                        pcall(function() executorCall = checkcaller() end)
-                    end
-                    if className == "ProximityPrompt" and executorCall then
-                        State.HookBusy = true
-                        pcall(function()
-                            logPrompt(self, "Executor prompt method " .. safeString(method))
-                        end)
-                        State.HookBusy = false
-                    end
-                end
-            end
-            return original(self, table.unpack(packedArgs, 1, packedArgs.n))
-        end))
-        return true
-    end)
-
-    if ok and result then
-        State.Hooks.Namecall = true
-        push("SYSTEM", "Remote observer hook installed", "FireServer and InvokeServer are logged passively.")
-    else
-        push("ERROR", "Remote observer hook failed", safeString(result))
-    end
-end
-
-local WATCHED_CHARACTER_PROPERTIES = {
-    CFrame = true,
-    Position = true,
-    Anchored = true,
-    CanCollide = true,
-    AssemblyLinearVelocity = true,
-    AssemblyAngularVelocity = true,
-    WalkSpeed = true,
-    JumpPower = true,
-    JumpHeight = true,
-    HipHeight = true,
-    PlatformStand = true,
-    AutoRotate = true,
-    Sit = true,
-    Health = true,
-    Velocity = true,
-    MaxForce = true,
-    MaxTorque = true,
-    P = true,
-    D = true,
-    Responsiveness = true,
-    MaxVelocity = true,
-    Enabled = true,
-    Attachment0 = true,
-    Attachment1 = true,
-    RigidityEnabled = true,
-    VectorVelocity = true,
-    LineVelocity = true,
-    Force = true,
-    RelativeTo = true,
-    Mode = true,
-    TargetPosition = true,
-}
-
-local WATCHED_WORLD_PROPERTIES = {
-    Gravity = true,
-    ClockTime = true,
-    TimeOfDay = true,
-    Brightness = true,
-    GlobalShadows = true,
-    Ambient = true,
-    OutdoorAmbient = true,
-    FogEnd = true,
-    ExposureCompensation = true,
-}
-
-local WATCHED_CAMERA_PROPERTIES = {
-    CFrame = true,
-    Focus = true,
-    CameraSubject = true,
-    CameraType = true,
-    FieldOfView = true,
-}
-
-local function installPropertyHook()
-    if type(hookmetamethod) ~= "function" then
-        push("SYSTEM", "Property hook unavailable", "Missing hookmetamethod; movement sampling remains active.")
-        return
-    end
-
-    local wrap = type(newcclosure) == "function" and newcclosure or function(fn)
-        return fn
-    end
-    local original
-    local ok, result = pcall(function()
-        original = hookmetamethod(game, "__newindex", wrap(function(self, key, value)
-            if State.Alive and State.Recording and not State.HookBusy and type(key) == "string" then
-                local shouldLog = false
-                local targetLabel = ""
-                State.HookBusy = true
-                pcall(function()
-                    local character = LocalPlayer and LocalPlayer.Character
-                    if character and isInstance(self) and self:IsDescendantOf(character) and WATCHED_CHARACTER_PROPERTIES[key] then
-                        shouldLog = true
-                        targetLabel = "Character " .. safeFullName(self)
-                    elseif self == Workspace and WATCHED_WORLD_PROPERTIES[key] then
-                        shouldLog = true
-                        targetLabel = "Workspace"
-                    elseif self == Lighting and WATCHED_WORLD_PROPERTIES[key] then
-                        shouldLog = true
-                        targetLabel = "Lighting"
-                    else
-                        local camera = Workspace.CurrentCamera
-                        if camera and self == camera and WATCHED_CAMERA_PROPERTIES[key] then
-                            local executorCall = false
-                            if type(checkcaller) == "function" then
-                                pcall(function() executorCall = checkcaller() end)
-                            end
-                            if executorCall then
-                                shouldLog = true
-                                targetLabel = "Camera"
-                            end
-                        end
-                    end
-                    if shouldLog then
-                        local oldValue = "?"
-                        pcall(function()
-                            oldValue = serializeValue(self[key])
-                        end)
-                        local newValue = serializeValue(value)
-                        local callerContext = "unknown"
-                        if type(checkcaller) == "function" then
-                            local callerFlag = nil
-                            pcall(function() callerFlag = checkcaller() end)
-                            callerContext = safeString(callerFlag)
-                        end
-                        local signature = targetLabel .. "|" .. key
-                        local now = os.clock()
-                        local previous = State.PropertyDedupe[signature]
-                        if previous and (now - previous.clock) <= 0.08 then
-                            previous.count = previous.count + 1
-                            previous.clock = now
-                            previous.event.details = "Old=" .. oldValue .. " | LatestNew=" .. newValue
-                                .. " | CallerContext=" .. callerContext .. " | Repeated=" .. safeString(previous.count)
-                        else
-                            local event = push("PROPERTY", targetLabel .. " property write: " .. key,
-                                "Old=" .. oldValue .. " | New=" .. newValue .. " | CallerContext=" .. callerContext)
-                            State.PropertyDedupe[signature] = {clock = now, count = 1, event = event}
-                        end
-                    end
-                end)
-                State.HookBusy = false
-            end
-            return original(self, key, value)
-        end))
-        return true
-    end)
-
-    if ok and result then
-        State.Hooks.NewIndex = true
-        push("SYSTEM", "Property observer hook installed", "Selected character movement and lighting/world writes are logged passively.")
-    else
-        push("ERROR", "Property observer hook failed", safeString(result))
-    end
-end
-
-local function installExecutorFunctionHooks()
-    if type(hookfunction) ~= "function" then
-        push("SYSTEM", "Executor-function hooks unavailable", "Missing hookfunction; executor interaction helpers will not be intercepted.")
-        return
-    end
-    local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
-
-    local function findGlobal(name)
-        local value = nil
-        pcall(function() value = ENV[name] end)
-        if type(value) ~= "function" then
-            pcall(function() value = _G[name] end)
-        end
-        return value
-    end
-
-    local function hookGlobal(name, callback)
-        local target = findGlobal(name)
-        if type(target) ~= "function" then
-            return
-        end
-        local original = nil
-        local ok, result = pcall(function()
-            original = hookfunction(target, wrap(function(...)
-                local packed = table.pack(...)
-                if State.Alive and State.Recording and not State.HookBusy then
-                    State.HookBusy = true
-                    pcall(callback, packed)
-                    State.HookBusy = false
-                end
-                return original(table.unpack(packed, 1, packed.n))
-            end))
-            return true
-        end)
-        if ok and result then
-            State.Hooks.Functions = State.Hooks.Functions + 1
-            push("SYSTEM", "Executor helper hook installed: " .. name, "Pass-through observation only.")
-        else
-            push("ERROR", "Executor helper hook failed: " .. name, safeString(result))
-        end
-    end
-
-    hookGlobal("fireproximityprompt", function(args)
-        logPrompt(args[1], "Executor fireproximityprompt")
-    end)
-    hookGlobal("fireclickdetector", function(args)
-        local detector = args[1]
-        push("PROMPT", "Executor fireclickdetector", "Target=" .. serializeValue(detector) .. " | Clicks=" .. serializeValue(args[2]))
-    end)
-    hookGlobal("firetouchinterest", function(args)
-        push("LOOT", "Executor firetouchinterest", "Part1=" .. serializeValue(args[1])
-            .. " | Part2=" .. serializeValue(args[2]) .. " | TouchState=" .. serializeValue(args[3]))
-    end)
-    hookGlobal("mouse1click", function(args)
-        push("INPUT", "Executor mouse1click", "Args=" .. serializeValue(args[1]))
-    end)
-    hookGlobal("mouse1press", function(args)
-        push("INPUT", "Executor mouse1press", "Args=" .. serializeValue(args[1]))
-    end)
-    hookGlobal("mouse1release", function(args)
-        push("INPUT", "Executor mouse1release", "Args=" .. serializeValue(args[1]))
-    end)
-    hookGlobal("mousemoverel", function(args)
-        push("INPUT", "Executor mousemoverel", "X=" .. serializeValue(args[1]) .. " | Y=" .. serializeValue(args[2]))
-    end)
-    hookGlobal("mousemoveabs", function(args)
-        push("INPUT", "Executor mousemoveabs", "X=" .. serializeValue(args[1]) .. " | Y=" .. serializeValue(args[2]))
-    end)
-
-    local drawingTable = nil
-    pcall(function() drawingTable = Drawing end)
-    if type(drawingTable) == "table" and type(drawingTable.new) == "function" then
-        local originalDrawingNew = nil
-        local ok, result = pcall(function()
-            originalDrawingNew = hookfunction(drawingTable.new, wrap(function(...)
-                local packed = table.pack(...)
-                local results = table.pack(originalDrawingNew(table.unpack(packed, 1, packed.n)))
-                if State.Alive and State.Recording and not State.HookBusy then
-                    State.HookBusy = true
-                    push("VISUAL", "Executor Drawing.new", "Type=" .. serializeValue(packed[1])
-                        .. " | Args=" .. serializeValue(packed[2]))
-                    State.HookBusy = false
-                end
-                return table.unpack(results, 1, results.n)
-            end))
-            return true
-        end)
-        if ok and result then
-            State.Hooks.Functions = State.Hooks.Functions + 1
-            push("SYSTEM", "Executor Drawing.new hook installed", "Drawing overlay creation will be logged when observable.")
-        else
-            push("SYSTEM", "Drawing.new hook unavailable", safeString(result))
-        end
-    end
-end
-
 local function installPromptSignals()
     connectNamedSignal(ProximityPromptService, "PromptShown", function(prompt)
         logPrompt(prompt, "Prompt shown")
@@ -1275,18 +889,12 @@ local function installEnvironmentMonitor()
     watchProperty(Lighting, "FogEnd", "ENVIRONMENT")
     watchProperty(Lighting, "ExposureCompensation", "ENVIRONMENT")
 
-    local lightingDescendants = {}
-    pcall(function() lightingDescendants = Lighting:GetDescendants() end)
-    for _, descendant in ipairs(lightingDescendants) do
-        trackVisualObject(descendant)
-    end
     connectSignal(Lighting.DescendantAdded, function(descendant)
-        trackVisualObject(descendant)
-    end)
-    connectSignal(Lighting.DescendantRemoving, function(descendant)
-        if State.SeenVisuals[descendant] then
-            push("ENVIRONMENT", "Lighting effect removed: " .. safeString(descendant.Name), "Class=" .. safeString(descendant.ClassName))
-            State.SeenVisuals[descendant] = nil
+        local className = safeString(descendant.ClassName)
+        local name = safeString(descendant.Name)
+        if containsAny(className .. " " .. name, {"colorcorrection", "atmosphere", "bloom", "sunrays", "blur", "depthoffield", "tint"}) then
+            push("ENVIRONMENT", "Lighting effect added: " .. className .. " / " .. name,
+                "Path=" .. safeFullName(descendant))
         end
     end)
 end
@@ -1338,6 +946,46 @@ local function movementSampler()
                     PlatformStand = platformStand,
                     RootCanCollide = rootCanCollide,
                 }
+
+                -- Sample camera independently; no camera hooks or writes are installed.
+                local camera = Workspace.CurrentCamera
+                if camera then
+                    local cameraCFrame, cameraType, cameraSubject
+                    pcall(function()
+                        cameraCFrame = camera.CFrame
+                        cameraType = safeString(camera.CameraType)
+                        cameraSubject = safeString(camera.CameraSubject)
+                    end)
+                    if cameraCFrame then
+                        local cameraPosition = cameraCFrame.Position
+                        local cameraLook = cameraCFrame.LookVector
+                        local previousCamera = State.LastCamera
+                        local rootDelta = State.LastMovement and (position - State.LastMovement.Position).Magnitude or 0
+                        local cameraPositionDelta = previousCamera and (cameraPosition - previousCamera.Position).Magnitude or 0
+                        local lookDot = previousCamera and cameraLook:Dot(previousCamera.Look) or 1
+                        local cameraModeChanged = previousCamera and (cameraType ~= previousCamera.Type or cameraSubject ~= previousCamera.Subject)
+                        local cameraMovedWhileRootStable = previousCamera and rootDelta < 1.25
+                            and (cameraPositionDelta > 2.5 or lookDot < 0.985)
+                        local now = os.clock()
+                        if (cameraModeChanged or cameraMovedWhileRootStable) and (now - State.LastCameraEventAt) >= 0.8 then
+                            State.LastCameraEventAt = now
+                            push("CAMERA", cameraMovedWhileRootStable and "Camera changed while character root stayed still" or "Camera mode/subject changed",
+                                "CameraPos=" .. serializeValue(cameraPosition)
+                                .. " | CameraType=" .. safeString(cameraType)
+                                .. " | CameraSubject=" .. safeString(cameraSubject)
+                                .. " | RootPos=" .. serializeValue(position)
+                                .. " | RootDelta=" .. string.format("%.2f", rootDelta)
+                                .. " | CameraDelta=" .. string.format("%.2f", cameraPositionDelta)
+                                .. " | LookDot=" .. string.format("%.4f", lookDot))
+                        end
+                        State.LastCamera = {
+                            Position = cameraPosition,
+                            Look = cameraLook,
+                            Type = cameraType,
+                            Subject = cameraSubject,
+                        }
+                    end
+                end
 
                 local previous = State.LastMovement
                 local shouldLog = false
@@ -1403,8 +1051,8 @@ local function updateUI()
     pcall(function()
         ui.Status.Text = State.Recording and "● RECORDING" or "Ⅱ PAUSED"
         ui.Status.TextColor3 = State.Recording and Color3.fromRGB(105, 220, 150) or Color3.fromRGB(245, 190, 95)
-        ui.Stats.Text = string.format("NPCs %d     REMOTE CALLS %d     LOOT %d     TOKEN EVENTS %d     KILLS %d",
-            State.Counters.NPCs, State.Counters.RemoteCalls, State.Counters.Loot,
+        ui.Stats.Text = string.format("NPCs %d     REMOTE OBJECTS %d     LOOT %d     TOKEN EVENTS %d     KILLS %d",
+            State.Counters.NPCs, State.Counters.Remotes, State.Counters.Loot,
             State.Counters.TokenChanges, State.Counters.Kills)
         ui.RecordButton.Text = State.Recording and "PAUSE" or "RESUME"
 
@@ -1431,23 +1079,21 @@ local function updateUI()
             end
         end
         ui.Footer.Text = "PlaceId=" .. safeString(game.PlaceId) .. " | Events=" .. safeString(#State.Events)
-            .. " | Hooks: Remote=" .. safeString(State.Hooks.Namecall) .. " Property=" .. safeString(State.Hooks.NewIndex)
-            .. " Helpers=" .. safeString(State.Hooks.Functions)
+            .. " | SAFE MODE: no global hooks / no outbound remote capture"
     end)
 end
 
 local function exportLogs()
     local lines = {}
-    table.insert(lines, "LAST STOP OBSERVER V1.1")
+    table.insert(lines, "LAST STOP OBSERVER V1.2 SAFE")
     table.insert(lines, "PlaceId=" .. safeString(game.PlaceId))
     table.insert(lines, "GameId=" .. safeString(game.GameId))
     table.insert(lines, "JobId=" .. safeString(game.JobId))
     table.insert(lines, "Player=" .. safeString(LocalPlayer and LocalPlayer.Name or "unknown"))
-    table.insert(lines, "RemoteHook=" .. safeString(State.Hooks.Namecall) .. " | PropertyHook=" .. safeString(State.Hooks.NewIndex)
-        .. " | ExecutorHelperHooks=" .. safeString(State.Hooks.Functions))
-    table.insert(lines, string.format("Counters: NPCs=%d RemoteEvents=%d RemoteCalls=%d Loot=%d TokenEvents=%d Kills=%d ToolActivations=%d PropertyWrites=%d Errors=%d",
-        State.Counters.NPCs, State.Counters.Remotes, State.Counters.RemoteCalls, State.Counters.Loot, State.Counters.TokenChanges,
-        State.Counters.Kills, State.Counters.ToolActivations, State.Counters.PropertyWrites, State.Counters.Errors))
+    table.insert(lines, "GlobalHooks=DISABLED | ExecutorFunctionHooks=DISABLED | OutboundRemoteCapture=DISABLED")
+    table.insert(lines, string.format("Counters: NPCs=%d RemoteObjects=%d OutboundRemoteCalls=NOT_CAPTURED Loot=%d TokenEvents=%d Kills=%d ToolActivations=%d Errors=%d",
+        State.Counters.NPCs, State.Counters.Remotes, State.Counters.Loot, State.Counters.TokenChanges,
+        State.Counters.Kills, State.Counters.ToolActivations, State.Counters.Errors))
     table.insert(lines, "--- EVENT LOG ---")
     for _, event in ipairs(State.Events) do
         table.insert(lines, string.format("[%s] [%.3f] [%s] %s | %s", event.time, event.clock, event.category, event.message, event.details))
@@ -1469,12 +1115,12 @@ local function exportLogs()
     end
     if type(writefile) == "function" then
         local okText = pcall(function()
-            writefile("LastStopObserver/last_stop_observer_log.txt", textOutput)
+            writefile("LastStopObserver/last_stop_observer_v1_2_log.txt", textOutput)
         end)
         local okJson = false
         if jsonOutput ~= "" then
             okJson = pcall(function()
-                writefile("LastStopObserver/last_stop_observer_events.json", jsonOutput)
+                writefile("LastStopObserver/last_stop_observer_v1_2_events.json", jsonOutput)
             end)
         end
         wrote = okText or okJson
@@ -1488,7 +1134,7 @@ local function exportLogs()
     end
 
     if wrote then
-        push("SYSTEM", "Diagnostics exported", "Check Real workspace: LastStopObserver/last_stop_observer_log.txt and last_stop_observer_events.json")
+        push("SYSTEM", "Diagnostics exported", "Check Real workspace: LastStopObserver/last_stop_observer_v1_2_log.txt and last_stop_observer_events.json")
     else
         push("ERROR", "Export unavailable", "writefile and setclipboard were unavailable or failed. Use the in-game log / executor console as fallback.")
         if type(warn) == "function" then
@@ -1509,7 +1155,7 @@ local function buildUI()
     end
 
     local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "LastStopObserverV1"
+    screenGui.Name = "LastStopObserverV12Safe"
     screenGui.ResetOnSpawn = false
     screenGui.IgnoreGuiInset = true
     screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1549,7 +1195,7 @@ local function buildUI()
     title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.fromRGB(242, 242, 250)
-    title.Text = "LAST STOP  /  OBSERVER V1.1"
+    title.Text = "LAST STOP  /  OBSERVER V1.2 SAFE"
     title.Parent = top
 
     local status = Instance.new("TextLabel")
@@ -1571,7 +1217,7 @@ local function buildUI()
     stats.TextSize = 11
     stats.TextXAlignment = Enum.TextXAlignment.Left
     stats.TextColor3 = Color3.fromRGB(190, 195, 214)
-    stats.Text = "NPCs 0     REMOTES 0     LOOT 0     TOKEN EVENTS 0     KILLS 0"
+    stats.Text = "NPCs 0     REMOTE OBJECTS 0     LOOT 0     TOKEN EVENTS 0     KILLS 0"
     stats.Parent = main
 
     local logFrame = Instance.new("ScrollingFrame")
@@ -1687,7 +1333,7 @@ local function buildUI()
     connectSignal(exportButton.MouseButton1Click, exportLogs)
     connectSignal(clearButton.MouseButton1Click, function()
         State.Events = {}
-        State.Counters = {NPCs = 0, Remotes = 0, RemoteCalls = 0, Loot = 0, TokenChanges = 0, Kills = 0, ToolActivations = 0, PropertyWrites = 0, Errors = 0}
+        State.Counters = {NPCs = 0, Remotes = 0, Loot = 0, TokenChanges = 0, Kills = 0, ToolActivations = 0, Errors = 0}
         State.RemoteDedupe = {}
         State.PropertyDedupe = {}
         State.ErrorDedupe = {}
@@ -1730,7 +1376,7 @@ local function buildUI()
         pcall(function()
             screenGui:Destroy()
         end)
-        push("SYSTEM", "Observer unloaded", "Metamethod wrappers, if installed, remain pass-through and inactive.")
+        push("SYSTEM", "Observer unloaded", "No global hooks were installed by this version.")
         ENV.__LAST_STOP_OBSERVER_V1 = nil
     end
     State.Unload = unload
@@ -1749,13 +1395,13 @@ end
 -- Build UI before monitoring so the initial scan can be reviewed immediately.
 buildUI()
 
-push("SYSTEM", "Observer started", "Read-only mode. No game remotes are invoked by this script.")
+push("SYSTEM", "Observer started", "Safe passive mode. No global hooks, input hooks, camera hooks, or outbound remote interception.")
+if PreviousHookBuildDetected then
+    push("WARNING", "Previous V1.1 hook build detected", "Its wrappers cannot be removed from this live client session. Rejoin Roblox before testing this safe build.")
+end
 push("SYSTEM", "Runtime identity", "PlaceId=" .. safeString(game.PlaceId) .. " | GameId=" .. safeString(game.GameId)
     .. " | JobId=" .. safeString(game.JobId) .. " | Executor=" .. (type(identifyexecutor) == "function" and safeString(identifyexecutor()) or "unknown"))
 
-installRemoteHook()
-installPropertyHook()
-installExecutorFunctionHooks()
 installPromptSignals()
 installErrorMonitor()
 installEnvironmentMonitor()
@@ -1774,6 +1420,10 @@ for _, instance in ipairs(initialDescendants) do
         className = instance.ClassName
         name = instance.Name
     end)
+    if MOVEMENT_CONTROLLER_CLASSES[className] then
+        watchMovementController(instance)
+    end
+    watchValueObject(instance)
     if className == "Model" then
         trackModel(instance)
     elseif className == "RemoteEvent" or className == "RemoteFunction" then
@@ -1785,8 +1435,6 @@ for _, instance in ipairs(initialDescendants) do
         end
     elseif className == "ProximityPrompt" then
         trackPrompt(instance)
-    elseif VISUAL_CLASSES[className] then
-        trackVisualObject(instance)
     elseif className == "ClickDetector" then
         push("PROMPT", "ClickDetector discovered: " .. name, "Path=" .. safeFullName(instance))
     elseif containsAny(name, {"alien", "token", "pickup", "drop", "collect", "loot"}) then
@@ -1803,6 +1451,10 @@ connectSignal(Workspace.DescendantAdded, function(instance)
         className = instance.ClassName
         name = instance.Name
     end)
+    if MOVEMENT_CONTROLLER_CLASSES[className] then
+        watchMovementController(instance)
+    end
+    watchValueObject(instance)
     if className == "Model" then
         trackModel(instance)
     elseif className == "RemoteEvent" or className == "RemoteFunction" then
@@ -1814,8 +1466,6 @@ connectSignal(Workspace.DescendantAdded, function(instance)
         end
     elseif className == "ProximityPrompt" then
         trackPrompt(instance)
-    elseif VISUAL_CLASSES[className] then
-        trackVisualObject(instance)
     elseif className == "ClickDetector" then
         push("PROMPT", "ClickDetector added: " .. name, "Path=" .. safeFullName(instance))
     elseif containsAny(name, {"alien", "token", "pickup", "drop", "collect", "loot"}) then
@@ -1834,10 +1484,6 @@ connectSignal(Workspace.DescendantRemoving, function(instance)
     if State.SeenPrompts[instance] then
         push("PROMPT", "Prompt removed: " .. safeString(instance.Name), "Path=" .. safeFullName(instance))
         State.SeenPrompts[instance] = nil
-    end
-    if State.SeenVisuals[instance] then
-        push("VISUAL", "Visual/effect object removed: " .. safeString(instance.Name), "Path=" .. safeFullName(instance))
-        State.SeenVisuals[instance] = nil
     end
 end)
 
@@ -1895,5 +1541,5 @@ task.spawn(function()
     end
 end)
 
-push("SYSTEM", "Ready", "Run the other script after this observer is active. Export logs after testing each feature separately.")
+push("SYSTEM", "Ready", "Safe mode active. Remote inventory is visible; outbound remote calls are intentionally not intercepted. Test one feature at a time.")
 updateUI()
