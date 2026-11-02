@@ -1,5 +1,5 @@
 --[=[
-LAST STOP OBSERVER V1.0
+LAST STOP OBSERVER V1.1
 Target: Project Real (capability-gated)
 Purpose: Passive client-side diagnostics for Last Stop.
 
@@ -47,6 +47,7 @@ local State = {
     SeenTexts = {},
     RemoteDedupe = {},
     PropertyDedupe = {},
+    ErrorDedupe = {},
     UI = {},
     Rows = {},
     Counters = {
@@ -1217,9 +1218,33 @@ end
 
 local function installErrorMonitor()
     connectNamedSignal(LogService, "MessageOut", function(message, messageType)
+        if not State.Alive or not State.Recording then
+            return
+        end
+
         local kind = safeString(messageType)
-        if containsAny(kind, {"error", "warning"}) or containsAny(message, {"error", "failed", "traceback"}) then
-            push("ERROR", "Client output " .. kind, string.sub(safeString(message), 1, 260))
+        local actualMessage = string.sub(safeString(message), 1, 260)
+        if containsAny(kind, {"error", "warning"}) or containsAny(actualMessage, {"error", "failed", "traceback"}) then
+            -- Keep the actual client output in the visible message field. The old
+            -- version put only the enum type in the UI and hid the useful text in details.
+            local signature = kind .. "|" .. actualMessage
+            local now = os.clock()
+            local previous = State.ErrorDedupe[signature]
+
+            if previous and (now - previous.clock) <= 1.25 and previous.event then
+                previous.clock = now
+                previous.count = previous.count + 1
+                previous.event.message = actualMessage .. " (repeated " .. safeString(previous.count) .. "x)"
+                previous.event.details = "Type=" .. kind .. " | Repeated=" .. safeString(previous.count)
+                State.Counters.Errors = State.Counters.Errors + 1
+            else
+                local event = push("ERROR", actualMessage, "Type=" .. kind .. " | Source=LogService")
+                State.ErrorDedupe[signature] = {
+                    clock = now,
+                    count = 1,
+                    event = event,
+                }
+            end
         end
     end)
 end
@@ -1413,7 +1438,7 @@ end
 
 local function exportLogs()
     local lines = {}
-    table.insert(lines, "LAST STOP OBSERVER V1.0")
+    table.insert(lines, "LAST STOP OBSERVER V1.1")
     table.insert(lines, "PlaceId=" .. safeString(game.PlaceId))
     table.insert(lines, "GameId=" .. safeString(game.GameId))
     table.insert(lines, "JobId=" .. safeString(game.JobId))
@@ -1524,7 +1549,7 @@ local function buildUI()
     title.TextSize = 14
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.TextColor3 = Color3.fromRGB(242, 242, 250)
-    title.Text = "LAST STOP  /  OBSERVER V1.0"
+    title.Text = "LAST STOP  /  OBSERVER V1.1"
     title.Parent = top
 
     local status = Instance.new("TextLabel")
@@ -1665,6 +1690,7 @@ local function buildUI()
         State.Counters = {NPCs = 0, Remotes = 0, RemoteCalls = 0, Loot = 0, TokenChanges = 0, Kills = 0, ToolActivations = 0, PropertyWrites = 0, Errors = 0}
         State.RemoteDedupe = {}
         State.PropertyDedupe = {}
+        State.ErrorDedupe = {}
         push("SYSTEM", "Event log cleared", "Existing monitoring connections remain active.")
         updateUI()
     end)
