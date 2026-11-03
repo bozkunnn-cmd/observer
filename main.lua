@@ -1,16 +1,18 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.3 (COMBAT + FLIGHT + TOKEN FIX)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF1 (COMBAT HOTFIX; BASELINE PRESERVED)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
   Workspace.ITEM_CONTAINER.<GUID>.Main.CollectAlienTokenPrompt
+  ReplicatedStorage.ClientSource.ReplicaRemoteEvents.Replica_ReplicaSignal
 
-The previous build incorrectly treated direct RemoteEvent calls as confirmed attacks.
-V1.0.3 uses the melee event shape observed in the supplied diagnostics.
-Remote dispatch is not proof of server-side damage; kill notifications remain the confirmation signal.
+Observed melee signal shape from the supplied V1.2 diagnostics:
+  FireServer(120, "Melee", "Attack", direction, 1)
+  FireServer(120, "Melee", "Hit", part, hitPosition, normal, material)
 
 No external loaders, no global metamethod hooks, no input hooks.
+The attack signal is based on observed traffic, but still needs in-game validation.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -20,6 +22,7 @@ end
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
@@ -27,8 +30,12 @@ local LocalPlayer = Players.LocalPlayer
 
 local ENTITY_CONTAINER = Workspace:WaitForChild("ENTITY_CONTAINER", 15)
 local ITEM_CONTAINER = Workspace:WaitForChild("ITEM_CONTAINER", 15)
-if not ENTITY_CONTAINER or not ITEM_CONTAINER then
-    warn("[LSAF] Required game containers were not found. Join a live run and execute again.")
+local ClientSource = ReplicatedStorage:WaitForChild("ClientSource", 15)
+local ReplicaRemoteEvents = ClientSource and ClientSource:WaitForChild("ReplicaRemoteEvents", 15)
+local ReplicaSignal = ReplicaRemoteEvents and ReplicaRemoteEvents:WaitForChild("Replica_ReplicaSignal", 15)
+
+if not ENTITY_CONTAINER or not ITEM_CONTAINER or not ReplicaSignal then
+    warn("[LSAF] Required game objects were not found. Join a live run and execute again.")
     return
 end
 
@@ -38,15 +45,15 @@ local CONFIG = {
     SCAN_START_Z = 500,
     SCAN_STEP = 600,
     SCAN_MIN_Z = -100000,
-    REPEAT_SCAN_ROUTE = false,
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
-    ALIEN_ATTACK_RANGE = 120,
+    ALIEN_ATTACK_RANGE = 50,
     HOVER_BELOW = 6.5,
-    HOVER_FORWARD_OFFSET = 0,
-    ATTACK_INTERVAL = 0.35,
-    ENGAGE_TIMEOUT = 30,
-    NO_KILL_TIMEOUT = 8,
+    ATTACK_INTERVAL = 0.05,
+    ENGAGE_TIMEOUT = 18,
+    NO_KILL_TIMEOUT = 6,
+    MAX_HITS_PER_TARGET = 10,
+    MAX_HITS_PER_SWEEP = 36,
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -62,12 +69,10 @@ local alienKills = 0
 local tokenAttempts = 0
 local tokenPickupsConfirmed = 0
 local rewardToastEstimate = 0
-local actionErrors = 0
+local remoteErrors = 0
 local currentTarget = "None"
 local equippedToolName = "None"
 local currentStatus = "Initializing"
-local lastToolActivation = 0
-local toolActivatedConnections = {}
 local lastAlienKillAt = os.clock()
 local lastLabelText = {}
 local rewardFramesSeen = {}
@@ -76,9 +81,8 @@ local collisionSnapshot = {}
 local activeCharacter = nil
 local activeRoot = nil
 local activeHumanoid = nil
-local flyPosition = nil
+local flyVelocity = nil
 local flyGyro = nil
-local scanComplete = false
 local originalLighting = {}
 local fullbrightApplied = false
 local mainLoopThread = nil
@@ -140,7 +144,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.3",
+        "Version: 1.0.1-HF1",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -148,7 +152,7 @@ local function buildDiagnosticReport()
         "Alien kill notifications: " .. tostring(alienKills),
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
-        "Action errors: " .. tostring(actionErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
+        "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
         "Events retained: " .. tostring(#diagEvents) .. " / " .. tostring(diagMaxEvents),
         "Event categories: " .. (function()
             local keys = {}
@@ -224,133 +228,80 @@ local function getCharacter()
     return character, root, humanoid
 end
 
-local function getToolDescriptor(tool)
-    if not tool then
-        return "<no tool>"
-    end
-    local pieces = { tostring(tool.Name or "UnknownTool") }
-    pcall(function()
-        if tool.ToolTip and tool.ToolTip ~= "" then
-            table.insert(pieces, "ToolTip=" .. tostring(tool.ToolTip))
-        end
-    end)
-    pcall(function()
-        for key, value in pairs(tool:GetAttributes()) do
-            table.insert(pieces, tostring(key) .. "=" .. tostring(value))
-        end
-    end)
-    pcall(function()
-        local childNames = {}
-        for _, child in ipairs(tool:GetChildren()) do
-            table.insert(childNames, child.Name .. ":" .. child.ClassName)
-            if #childNames >= 12 then
-                break
-            end
-        end
-        if #childNames > 0 then
-            table.insert(pieces, "Children=" .. table.concat(childNames, ","))
-        end
-    end)
-    return table.concat(pieces, " | ")
-end
-
-local function looksLikeMeleeTool(tool)
-    if not tool or not tool:IsA("Tool") then
-        return false
-    end
-    local descriptor = string.lower(getToolDescriptor(tool))
-    local keywords = { "shovel", "melee", "sword", "axe", "bat", "club", "crowbar" }
-    for _, keyword in ipairs(keywords) do
-        if string.find(descriptor, keyword, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
-local function watchToolActivation(tool)
-    if not tool or toolActivatedConnections[tool] then
-        return
-    end
-    local ok, connection = pcall(function()
-        return tool.Activated:Connect(function()
-            recordEvent("COMBAT", "Tool.Activated event observed", getToolDescriptor(tool))
-        end)
-    end)
-    if ok and connection then
-        toolActivatedConnections[tool] = connection
-    else
-        recordThrottled("tool-activation-watch", 3, "WEAPON", "Tool activation event unavailable", getToolDescriptor(tool))
-    end
-end
-
 local function ensureToolEquipped()
     local character, _, humanoid = getCharacter()
     if not character or not humanoid then
-        return nil
+        return false
     end
 
+    -- Last Stop gives the player one starting melee tool: the shovel in hotbar slot 1.
+    -- Its runtime name may be a GUID, so do not depend on Name/ToolTip keywords.
     local equipped = character:FindFirstChildOfClass("Tool")
+    if equipped then
+        if equippedToolName ~= equipped.Name then
+            equippedToolName = equipped.Name
+            recordEvent("WEAPON", "Starting shovel already equipped", equippedToolName .. " | Slot=1")
+        end
+        return true
+    end
+
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then
+        recordThrottled("no-backpack", 3, "WEAPON", "Waiting for Backpack", "Cannot equip starting shovel / hotbar slot 1")
+        return false
+    end
+
+    -- The shovel is the only starting Tool, so the first Tool in Backpack is slot 1.
     local candidate = nil
-
-    if equipped and looksLikeMeleeTool(equipped) then
-        candidate = equipped
-    elseif backpack then
-        for _, child in ipairs(backpack:GetChildren()) do
-            if child:IsA("Tool") and looksLikeMeleeTool(child) then
-                candidate = child
-                break
-            end
-        end
-    end
-
-    -- Some game tools have GUID names. If metadata does not identify a melee
-    -- tool, keep the current tool as an explicitly unverified fallback.
-    if not candidate then
-        candidate = equipped
-        if not candidate and backpack then
-            for _, child in ipairs(backpack:GetChildren()) do
-                if child:IsA("Tool") then
-                    candidate = child
-                    break
-                end
-            end
-        end
-        if candidate then
-            recordThrottled("unverified-tool", 5, "WEAPON", "Using unclassified Tool fallback", getToolDescriptor(candidate))
+    for _, child in ipairs(backpack:GetChildren()) do
+        if child:IsA("Tool") then
+            candidate = child
+            break
         end
     end
 
     if not candidate then
-        recordThrottled("no-tool", 3, "WEAPON", "No Tool available", "Character and Backpack contain no Tool instance")
+        recordThrottled("no-tool", 3, "WEAPON", "Starting shovel not found", "No Tool in Backpack or Character")
+        return false
+    end
+
+    recordEvent("WEAPON", "Equipping starting shovel", candidate.Name .. " | Source=Backpack first Tool | HotbarSlot=1")
+    local ok, equipError = pcall(function()
+        humanoid:EquipTool(candidate)
+    end)
+    if not ok then
+        recordEvent("ERROR", "Starting shovel EquipTool failed", diagTraceback(equipError))
+        return false
+    end
+
+    task.wait(0.12)
+    equipped = character:FindFirstChildOfClass("Tool")
+    if equipped then
+        equippedToolName = equipped.Name
+        recordEvent("WEAPON", "Starting shovel equipped", equippedToolName .. " | Slot=1 | ToolEnabled=" .. tostring(equipped.Enabled))
+        return true
+    end
+
+    recordThrottled("equip-not-confirmed", 2, "WEAPON", "Starting shovel equip not confirmed", candidate.Name)
+    return false
+end
+
+local function getPromptPosition(prompt)
+    if not prompt or not prompt.Parent then
         return nil
     end
-
-    if candidate.Parent ~= character then
-        recordEvent("WEAPON", "Equip requested", getToolDescriptor(candidate))
-        local ok, equipError = pcall(function()
-            humanoid:EquipTool(candidate)
-        end)
-        if not ok then
-            recordEvent("ERROR", "EquipTool failed", diagTraceback(equipError))
-            return nil
-        end
-        task.wait(0.12)
-        equipped = character:FindFirstChildOfClass("Tool")
-        if not equipped then
-            recordThrottled("equip-not-confirmed", 2, "WEAPON", "Equip request not confirmed", getToolDescriptor(candidate))
-            return nil
-        end
-        candidate = equipped
-        recordEvent("WEAPON", "Tool equipped", getToolDescriptor(candidate))
-    elseif equippedToolName ~= candidate.Name then
-        recordEvent("WEAPON", "Tool already equipped", getToolDescriptor(candidate))
+    local parent = prompt.Parent
+    if parent:IsA("BasePart") then
+        return parent.Position
     end
-
-    equippedToolName = candidate.Name
-    watchToolActivation(candidate)
-    return candidate
+    if parent:IsA("Attachment") then
+        return parent.WorldPosition
+    end
+    local part = parent:FindFirstChildWhichIsA("BasePart", true)
+    if part then
+        return part.Position
+    end
+    return nil
 end
 
 local function isAlienModel(model)
@@ -426,6 +377,68 @@ local function getAliensNear(position, radius)
     return results
 end
 
+local function getClosestHitPart(model, origin)
+    if not model or not origin then
+        return nil, nil
+    end
+
+    -- Match the working Auto Kill's "Closest" body-part selection.
+    -- Valid targets are the rig's standard body parts or geometry under Dress/AlienTypeX.
+    local rigBodyNames = {
+        ["Head"] = true,
+        ["Torso"] = true,
+        ["UpperTorso"] = true,
+        ["LowerTorso"] = true,
+        ["Right Arm"] = true,
+        ["Left Arm"] = true,
+        ["Right Leg"] = true,
+        ["Left Leg"] = true,
+    }
+    local blockedNames = {
+        ["humanoidrootpart"] = true,
+        ["entitydetector"] = true,
+        ["handle"] = true,
+        ["sword"] = true,
+        ["blade"] = true,
+        ["hitbox"] = true,
+    }
+
+    local bestPart = nil
+    local bestDistance = math.huge
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            local lowerName = string.lower(descendant.Name)
+            local blocked = blockedNames[lowerName] == true
+            local ancestor = descendant.Parent
+            while ancestor and ancestor ~= model do
+                if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
+                    blocked = true
+                    break
+                end
+                local ancestorName = string.lower(ancestor.Name)
+                if ancestorName == "sword" or ancestorName == "blade" or ancestorName == "weapon" or ancestorName == "accessories" then
+                    blocked = true
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+
+            local fullPath = string.lower(descendant:GetFullName())
+            local isRigBody = rigBodyNames[descendant.Name] == true
+            local isAlienDressGeometry = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
+            if not blocked and (isRigBody or isAlienDressGeometry) then
+                local distance = (descendant.Position - origin).Magnitude
+                if distance < bestDistance then
+                    bestPart = descendant
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return bestPart, bestDistance
+end
+
 local function getNearestEntry(entries)
     local nearest = nil
     local bestDistance = math.huge
@@ -489,57 +502,85 @@ end
 
 local function setupFlight()
     local character, root, humanoid = getCharacter()
-    if not character or not root or not humanoid then return false end
+    if not character or not root or not humanoid then
+        return false
+    end
 
     if activeCharacter ~= character then
+        if activeCharacter then
+            for part, oldValue in pairs(collisionSnapshot) do
+                if part and part.Parent then
+                    pcall(function() part.CanCollide = oldValue end)
+                end
+            end
+        end
+        collisionSnapshot = {}
         activeCharacter = character
         activeRoot = root
         activeHumanoid = humanoid
-        flyPosition = nil
+        flyVelocity = nil
         flyGyro = nil
         flightLogRoot = nil
     end
 
-    -- Keep normal collision and humanoid control. Only add a temporary positional
-    -- stabilizer; never set every character part CanCollide=false.
-    pcall(function() humanoid.PlatformStand = false end)
-    if not flyPosition or not flyPosition.Parent then
-        flyPosition = Instance.new("BodyPosition")
-        flyPosition.Name = "LSAF_PositionHold"
-        flyPosition.MaxForce = Vector3.new(180000, 180000, 180000)
-        flyPosition.P = 18000
-        flyPosition.D = 1200
-        flyPosition.Position = root.Position
-        flyPosition.Parent = root
+    for _, descendant in ipairs(character:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            if collisionSnapshot[descendant] == nil then
+                collisionSnapshot[descendant] = descendant.CanCollide
+            end
+            descendant.CanCollide = false
+        end
     end
+
+    humanoid.PlatformStand = true
+    root.CanCollide = false
+
+    if not flyVelocity or not flyVelocity.Parent then
+        flyVelocity = Instance.new("BodyVelocity")
+        flyVelocity.Name = "LSAF_FlyVel"
+        flyVelocity.MaxForce = Vector3.new(100000, 100000, 100000)
+        flyVelocity.P = 1250
+        flyVelocity.Velocity = Vector3.zero
+        flyVelocity.Parent = root
+    end
+
     if not flyGyro or not flyGyro.Parent then
         flyGyro = Instance.new("BodyGyro")
         flyGyro.Name = "LSAF_FlyGyro"
-        flyGyro.MaxTorque = Vector3.new(90000, 90000, 90000)
-        flyGyro.P = 3500
-        flyGyro.D = 180
+        flyGyro.MaxTorque = Vector3.new(100000, 100000, 100000)
+        flyGyro.P = 5000
+        flyGyro.D = 100
         flyGyro.CFrame = root.CFrame
         flyGyro.Parent = root
     end
+
     if flightLogRoot ~= root then
         flightLogRoot = root
-        recordEvent("FLIGHT", "Safe positional stabilizer initialized", "BodyPosition=LSAF_PositionHold | BodyGyro=LSAF_FlyGyro | PlatformStand=false | Character collisions preserved")
+        recordEvent("FLIGHT", "Flight controllers initialized", "BodyVelocity=LSAF_FlyVel | BodyGyro=LSAF_FlyGyro | PlatformStand=" .. tostring(humanoid.PlatformStand) .. " | RootCanCollide=" .. tostring(root.CanCollide))
     end
     return true
 end
 
 local function moveCharacter(position, lookAtPosition)
-    if not setupFlight() then return false end
+    if not setupFlight() then
+        return false
+    end
     local root = activeRoot
-    if not root or not root.Parent then return false end
+    if not root or not root.Parent then
+        return false
+    end
     local lookAt = lookAtPosition or (position + Vector3.new(0, 0, -1))
     local targetCFrame = CFrame.lookAt(position, lookAt)
     local ok, moveError = pcall(function()
         root.CFrame = targetCFrame
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
-        if flyPosition then flyPosition.Position = position end
-        if flyGyro then flyGyro.CFrame = targetCFrame end
+        if flyVelocity then
+            flyVelocity.Velocity = Vector3.zero
+        end
+        if flyGyro then
+            flyGyro.CFrame = targetCFrame
+        end
     end)
     if not ok then
         recordEvent("ERROR", "Character reposition failed", diagTraceback(moveError))
@@ -549,11 +590,8 @@ local function moveCharacter(position, lookAtPosition)
     local camera = Workspace.CurrentCamera
     if camera then
         cameraGap = string.format("%.1f", (camera.CFrame.Position - root.Position).Magnitude)
-        if (camera.CFrame.Position - root.Position).Magnitude > 100 then
-            pcall(function() camera.CameraSubject = activeHumanoid end)
-        end
     end
-    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s | PlatformStand=%s | CollisionPreserved=true", position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
+    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s | PlatformStand=%s", position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
     return true
 end
 
@@ -562,26 +600,31 @@ local function moveBelowAlien(entry)
         return false
     end
     local targetPosition = entry.root.Position
-    local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, CONFIG.HOVER_FORWARD_OFFSET)
-    local horizontalLookAt = Vector3.new(targetPosition.X, hoverPosition.Y, targetPosition.Z)
+    local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
     currentTarget = entry.variant .. " / " .. entry.model.Name
     local _, playerRoot = getCharacter()
     local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
-    local moved = moveCharacter(hoverPosition, horizontalLookAt)
-    recordEvent("TARGET", "Hover-below positioning requested", string.format("Variant=%s | Model=%s | Target=(%.1f, %.1f, %.1f) | DesiredPlayerY=%.1f | HorizontalOffset=%.1f | PreviousDistance=%.1f | Success=%s", entry.variant, entry.model.Name, targetPosition.X, targetPosition.Y, targetPosition.Z, hoverPosition.Y, CONFIG.HOVER_FORWARD_OFFSET, beforeDistance, tostring(moved)))
+    local moved = moveCharacter(hoverPosition, targetPosition)
+    recordEvent("TARGET", "Hover-below positioning requested", string.format("Variant=%s | Model=%s | Target=(%.1f, %.1f, %.1f) | DesiredPlayerY=%.1f | PreviousDistance=%.1f | Success=%s", entry.variant, entry.model.Name, targetPosition.X, targetPosition.Y, targetPosition.Z, hoverPosition.Y, beforeDistance, tostring(moved)))
     return moved
 end
 
 local function restoreMovement()
-    if activeHumanoid or flyPosition or flyGyro then
+    if activeHumanoid or flyVelocity or flyGyro then
         recordEvent("FLIGHT", "Restoring character movement and collision state", "Emergency stop / cleanup requested")
     end
     if activeHumanoid and activeHumanoid.Parent then
         pcall(function() activeHumanoid.PlatformStand = false end)
     end
-    if flyPosition then
-        pcall(function() flyPosition:Destroy() end)
-        flyPosition = nil
+    for part, oldValue in pairs(collisionSnapshot) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = oldValue end)
+        end
+    end
+    collisionSnapshot = {}
+    if flyVelocity then
+        pcall(function() flyVelocity:Destroy() end)
+        flyVelocity = nil
     end
     if flyGyro then
         pcall(function() flyGyro:Destroy() end)
@@ -592,70 +635,102 @@ local function restoreMovement()
     activeHumanoid = nil
 end
 
-local function activateMeleeTool(entries)
-    local nearest = getNearestEntry(entries)
-    if not nearest or not nearest.root or not nearest.root.Parent then return false end
-    if os.clock() - lastToolActivation < CONFIG.ATTACK_INTERVAL then return false end
-
-    local remoteFolder = game:GetService("ReplicatedStorage"):FindFirstChild("ClientSource")
-    remoteFolder = remoteFolder and remoteFolder:FindFirstChild("ReplicaRemoteEvents")
-    local meleeRemote = remoteFolder and remoteFolder:FindFirstChild("Replica_ReplicaSignal")
-    if not meleeRemote or not meleeRemote:IsA("RemoteEvent") then
-        recordThrottled("melee-remote-missing", 3, "ERROR", "Observed melee remote unavailable", "ReplicatedStorage.ClientSource.ReplicaRemoteEvents.Replica_ReplicaSignal")
-        return false
+local function sendMeleeSweep(entries)
+    local character, root = getCharacter()
+    if not character or not root or not ReplicaSignal then
+        return 0
     end
 
-    local _, playerRoot = getCharacter()
-    if not playerRoot then return false end
-    local delta = nearest.root.Position - playerRoot.Position
-    local direction = delta.Magnitude > 0 and delta.Unit or Vector3.new(0, 1, 0)
+    -- Equip the one starting weapon (the shovel in hotbar slot 1). Do not gate
+    -- on Tool.Enabled: Last Stop toggles that flag during its own cooldown.
+    if not ensureToolEquipped() then
+        setStatus("Waiting for starting shovel in hotbar slot 1")
+        return 0
+    end
+    local equippedTool = character:FindFirstChildOfClass("Tool")
+    if not equippedTool then
+        setStatus("Starting shovel is not equipped")
+        return 0
+    end
+
+    local nearest = getNearestEntry(entries)
+    if not nearest or not nearest.root then
+        return 0
+    end
+
+    local direction = nearest.root.Position - root.Position
+    if direction.Magnitude < 0.001 then
+        direction = root.CFrame.LookVector
+    else
+        direction = direction.Unit
+    end
+
     local okAttack, attackError = pcall(function()
-        meleeRemote:FireServer(120, "Melee", "Attack", direction, 1)
+        ReplicaSignal:FireServer(120, "Melee", "Attack", direction, 1)
     end)
     if not okAttack then
-        actionErrors = actionErrors + 1
-        recordEvent("ERROR", "Melee Attack dispatch failed", diagTraceback(attackError))
-        return false
+        remoteErrors = remoteErrors + 1
+        recordEvent("ERROR", "Melee Attack call failed locally", diagTraceback(attackError))
+        return 0
     end
+    recordThrottled("melee-attack-dispatched", 0.05, "COMBAT", "Melee Attack request dispatched", string.format(
+        "Target=%s/%s | Tool=%s | ToolEnabled=%s | Interval=%.2fs | Server acceptance unknown",
+        nearest.variant, nearest.model.Name, equippedTool.Name, tostring(equippedTool.Enabled), CONFIG.ATTACK_INTERVAL
+    ))
 
-    local sentParts = 0
-    local sentNames = {}
+    local sentHits = 0
     for _, entry in ipairs(entries) do
-        if entry.model and entry.model.Parent and entry.variant and entry.root and entry.root.Parent then
-            for _, part in ipairs(entry.model:GetDescendants()) do
-                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                    local hitOk, hitError = pcall(function()
-                        meleeRemote:FireServer(120, "Melee", "Hit", part, part.Position, Vector3.new(0, 1, 0), part.Material)
-                    end)
-                    if hitOk then
-                        sentParts = sentParts + 1
-                        if #sentNames < 12 then table.insert(sentNames, part.Name) end
-                    else
-                        actionErrors = actionErrors + 1
-                        recordThrottled("melee-hit-error", 1, "ERROR", "Melee Hit dispatch failed", diagTraceback(hitError))
+        if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
+            break
+        end
+        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
+            local targetDistance = (entry.root.Position - root.Position).Magnitude
+            if targetDistance <= CONFIG.ALIEN_ATTACK_RANGE then
+                local hitPart, partDistance = getClosestHitPart(entry.model, root.Position)
+                if hitPart and hitPart.Parent then
+                    local targetHitCount = 0
+                    for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
+                        if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
+                            break
+                        end
+                        if not hitPart.Parent then
+                            break
+                        end
+                        local okHit, hitError = pcall(function()
+                            ReplicaSignal:FireServer(
+                                120,
+                                "Melee",
+                                "Hit",
+                                hitPart,
+                                hitPart.Position,
+                                Vector3.new(0, 1, 0),
+                                hitPart.Material
+                            )
+                        end)
+                        if okHit then
+                            sentHits = sentHits + 1
+                            targetHitCount = targetHitCount + 1
+                        else
+                            remoteErrors = remoteErrors + 1
+                            recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
+                        end
                     end
+                    if targetHitCount > 0 then
+                        recordEvent("COMBAT", "Melee closest-part hits dispatched", string.format(
+                            "Target=%s/%s | Part=%s | Repeats=%d | PartDistance=%.1f | TargetDistance=%.1f | Local dispatch only; server damage unverified",
+                            entry.variant, entry.model.Name, hitPart.Name, targetHitCount,
+                            tonumber(partDistance) or -1, targetDistance
+                        ))
+                    end
+                else
+                    recordThrottled("no-hit-part:" .. entry.model.Name, 1, "COMBAT", "No valid alien body part found", entry.variant .. "/" .. entry.model.Name)
                 end
             end
         end
     end
 
-    lastToolActivation = os.clock()
-    recordEvent("COMBAT", "Observed melee protocol dispatched", string.format("Target=%s/%s | Attack=sent | HitParts=%d | PartNames=%s | Server damage/acceptance remains unverified", nearest.variant, nearest.model.Name, sentParts, table.concat(sentNames, ", ")))
-    return sentParts > 0
-end
-
-local function getPromptPosition(prompt)
-    if not prompt then return nil end
-    local node = prompt.Parent
-    while node and node ~= ITEM_CONTAINER do
-        if node:IsA("BasePart") then return node.Position end
-        if node:IsA("Model") then
-            local part = node.PrimaryPart or node:FindFirstChildWhichIsA("BasePart", true)
-            if part then return part.Position end
-        end
-        node = node.Parent
-    end
-    return nil
+    recordEvent("COMBAT", "Attack sweep finished", "Closest-part hit requests without local error=" .. tostring(sentHits) .. " | Local call errors=" .. tostring(remoteErrors))
+    return sentHits
 end
 
 local function getAlienTokenPrompts(center, radius)
@@ -738,7 +813,7 @@ local function collectTokensAround(center, radius)
                         setStatus("Token pickup triggered; waiting for confirmation")
                         recordThrottled("token-unconfirmed:" .. promptPath, 1, "TOKEN", "Pickup not confirmed", "Prompt remained present and enabled after activation")
                     else
-                        actionErrors = actionErrors + 1
+                        remoteErrors = remoteErrors + 1
                         recordEvent("ERROR", "Token pickup activation failed", "Path=" .. promptPath .. " | " .. diagTraceback(triggerError))
                     end
                 end
@@ -787,11 +862,11 @@ local function engageAliens(seedEntries)
 
         recordThrottled("target-selection", 0.75, "TARGET", "Alien target selected", "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name .. " | ClusterTargets=" .. tostring(#entries))
         moveBelowAlien(nearest)
-        local activated = activateMeleeTool(entries)
-        if activated then
-            setStatus("Melee tool activated against " .. tostring(#entries) .. " alien(s)")
+        local hits = sendMeleeSweep(entries)
+        if hits > 0 then
+            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " hit parts")
         else
-            setStatus("Alien target found; waiting for melee tool")
+            setStatus("Alien target found; no hit parts available")
         end
 
         if alienKills > startKillCount then
@@ -821,26 +896,16 @@ end
 local function advanceScan()
     local oldZ = scanZ
     local oldLap = lap
-    local nextZ = scanZ - CONFIG.SCAN_STEP
-    if nextZ < CONFIG.SCAN_MIN_Z then
-        if CONFIG.REPEAT_SCAN_ROUTE then
-            lap = lap + 1
-            scanZ = CONFIG.SCAN_START_Z
-        else
-            scanComplete = true
-            setStatus("Scan route complete")
-            recordEvent("SCAN", "Scan route completed", "Reached configured minimum Z=" .. tostring(CONFIG.SCAN_MIN_Z) .. " | Repeat route disabled")
-            return false
-        end
-    else
-        scanZ = nextZ
+    scanZ = scanZ - CONFIG.SCAN_STEP
+    if scanZ < CONFIG.SCAN_MIN_Z then
+        lap = lap + 1
+        scanZ = CONFIG.SCAN_START_Z
     end
     local position = getCurrentScanPosition()
     local moved = moveCharacter(position, position + Vector3.new(0, 0, -1))
     setStatus("Scanning lap " .. tostring(lap) .. " / Z=" .. tostring(scanZ))
     recordEvent("SCAN", "Scan route advanced", "Lap=" .. tostring(oldLap) .. "->" .. tostring(lap) .. " | Z=" .. tostring(oldZ) .. "->" .. tostring(scanZ) .. " | Step=" .. tostring(CONFIG.SCAN_STEP) .. " | MoveSuccess=" .. tostring(moved))
     task.wait(CONFIG.SCAN_WAIT)
-    return moved
 end
 
 local function waitWhilePaused()
@@ -859,10 +924,9 @@ local function mainLoop()
     end
 
     setStatus("Automatic farming started")
-    recordEvent("SYSTEM", "Combat mode", "Uses observed Replica_ReplicaSignal Melee Attack/Hit event shape. Dispatch is not proof of server acceptance; kill counter requires observed game notifications.")
     recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
 
-    while running and not scanComplete do
+    while running do
         waitWhilePaused()
         if not running then
             break
@@ -891,10 +955,6 @@ local function mainLoop()
                 recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
                 setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
                 engageAliens(aliens)
-                if running and not scanComplete then
-                    recordEvent("SCAN", "Advancing after alien engagement", "Preventing repeated engagement at the same scan coordinate")
-                    advanceScan()
-                end
             else
                 recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
                 local looseTokens = getAlienTokenPrompts(scanPosition, 80)
@@ -915,15 +975,7 @@ local function mainLoop()
 
     restoreMovement()
     restoreFullbright()
-    for tool, connection in pairs(toolActivatedConnections) do
-        pcall(function() connection:Disconnect() end)
-        toolActivatedConnections[tool] = nil
-    end
-    if scanComplete then
-        setStatus("Scan route complete - stopped safely")
-    else
-        setStatus("Stopped")
-    end
+    setStatus("Stopped")
 end
 
 -- Lightweight kill/reward feed tracking. No hooks or interception.
@@ -1040,7 +1092,7 @@ if not guiParent then
 end
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "LastStopAlienFarmerV102"
+screenGui.Name = "LastStopAlienFarmerV1"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.Parent = guiParent
@@ -1288,7 +1340,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.3",
+            version = "1.0.1-HF1",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -1296,7 +1348,7 @@ local function exportDiagnostics()
             tokenAttempts = tokenAttempts,
             tokenPickupsConfirmed = tokenPickupsConfirmed,
             rewardToastEstimate = rewardToastEstimate,
-            actionErrors = actionErrors,
+            localCallErrors = remoteErrors,
             capturedErrors = diagErrorCount,
             categoryCounts = diagCounts,
             config = CONFIG,
@@ -1327,13 +1379,13 @@ local function refreshGui()
         statusLabel.Text = currentStatus .. "\nTarget: " .. tostring(currentTarget)
     end
     if statsLabel and statsLabel.Parent then
-        statsLabel.Text = "Alien kills confirmed: " .. tostring(alienKills)
+        statsLabel.Text = "Alien kills: " .. tostring(alienKills)
             .. "\nToken pickups confirmed: " .. tostring(tokenPickupsConfirmed)
             .. " / attempts: " .. tostring(tokenAttempts)
             .. "\nReward toast estimate: " .. tostring(rewardToastEstimate)
             .. "\nTool: " .. tostring(equippedToolName)
             .. "\nLap: " .. tostring(lap) .. "  Scan Z: " .. tostring(scanZ)
-            .. "\nAction errors: " .. tostring(actionErrors)
+            .. "\nLocal call errors: " .. tostring(remoteErrors)
             .. " | Diagnostics: " .. tostring(#diagEvents)
             .. " | Captured errors: " .. tostring(diagErrorCount)
     end
@@ -1358,10 +1410,6 @@ local function stopFarm()
     paused = false
     restoreMovement()
     restoreFullbright()
-    for tool, connection in pairs(toolActivatedConnections) do
-        pcall(function() connection:Disconnect() end)
-        toolActivatedConnections[tool] = nil
-    end
     setStatus("Stopped by user")
     refreshGui()
 end
