@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF1 (COMBAT HOTFIX; BASELINE PRESERVED)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF2 (TIMING + SCAN HOTFIX; BASELINE PRESERVED)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -50,6 +50,7 @@ local CONFIG = {
     ALIEN_ATTACK_RANGE = 50,
     HOVER_BELOW = 6.5,
     ATTACK_INTERVAL = 0.05,
+    MELEE_HIT_DELAY = 0.026, -- observed Attack -> first Hit delay in the working Auto Kill traffic
     ENGAGE_TIMEOUT = 18,
     NO_KILL_TIMEOUT = 6,
     MAX_HITS_PER_TARGET = 10,
@@ -144,7 +145,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF1",
+        "Version: 1.0.1-HF2",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -673,7 +674,10 @@ local function sendMeleeSweep(entries)
         recordEvent("ERROR", "Melee Attack call failed locally", diagTraceback(attackError))
         return 0
     end
-    recordThrottled("melee-attack-dispatched", 0.05, "COMBAT", "Melee Attack request dispatched", string.format(
+    -- The captured working Auto Kill sequence sent its first Hit about 26 ms
+    -- after Attack. HF1 sent them back-to-back, which may miss the game's hit window.
+    task.wait(CONFIG.MELEE_HIT_DELAY)
+    recordThrottled("melee-attack-dispatched", 0.25, "COMBAT", "Melee Attack request dispatched", string.format(
         "Target=%s/%s | Tool=%s | ToolEnabled=%s | Interval=%.2fs | Server acceptance unknown",
         nearest.variant, nearest.model.Name, equippedTool.Name, tostring(equippedTool.Enabled), CONFIG.ATTACK_INTERVAL
     ))
@@ -716,7 +720,7 @@ local function sendMeleeSweep(entries)
                         end
                     end
                     if targetHitCount > 0 then
-                        recordEvent("COMBAT", "Melee closest-part hits dispatched", string.format(
+                        recordThrottled("melee-hit-summary:" .. entry.model.Name, 0.5, "COMBAT", "Melee closest-part hits dispatched", string.format(
                             "Target=%s/%s | Part=%s | Repeats=%d | PartDistance=%.1f | TargetDistance=%.1f | Local dispatch only; server damage unverified",
                             entry.variant, entry.model.Name, hitPart.Name, targetHitCount,
                             tonumber(partDistance) or -1, targetDistance
@@ -729,7 +733,7 @@ local function sendMeleeSweep(entries)
         end
     end
 
-    recordEvent("COMBAT", "Attack sweep finished", "Closest-part hit requests without local error=" .. tostring(sentHits) .. " | Local call errors=" .. tostring(remoteErrors))
+    recordThrottled("melee-sweep-summary", 0.5, "COMBAT", "Attack sweep finished", "Closest-part hit requests without local error=" .. tostring(sentHits) .. " | Local call errors=" .. tostring(remoteErrors))
     return sentHits
 end
 
@@ -879,14 +883,18 @@ local function engageAliens(seedEntries)
             break
         end
 
-        task.wait(CONFIG.ATTACK_INTERVAL)
+        task.wait(math.max(0, CONFIG.ATTACK_INTERVAL - CONFIG.MELEE_HIT_DELAY))
     end
 
     setStatus("Collecting drops from cleared alien area")
     recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime) .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount) .. " | CurrentKillNotifications=" .. tostring(alienKills))
     local collected = collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
     recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
+    local remaining = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
+    local clusterCleared = (#remaining == 0)
+    recordEvent("TARGET", "Cluster clearance check", "RemainingAliens=" .. tostring(#remaining) .. " | Cleared=" .. tostring(clusterCleared))
     currentTarget = "None"
+    return clusterCleared
 end
 
 local function getCurrentScanPosition()
@@ -954,7 +962,15 @@ local function mainLoop()
                 end
                 recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
                 setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
-                engageAliens(aliens)
+                local clusterCleared = engageAliens(aliens)
+                if running and not paused then
+                    if clusterCleared then
+                        advanceScan()
+                    else
+                        setStatus("Aliens remain; retrying current cluster")
+                        task.wait(0.5)
+                    end
+                end
             else
                 recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
                 local looseTokens = getAlienTokenPrompts(scanPosition, 80)
