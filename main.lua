@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF4 (DIAGNOSTICS-ONLY; HF3 BEHAVIOR PRESERVED)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF4.1 (OBSERVER COMPLETENESS; FARM BEHAVIOR PRESERVED)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -11,7 +11,8 @@ Observed melee signal shape from the supplied V1.2 diagnostics:
   FireServer(120, "Melee", "Attack", direction, 1)
   FireServer(120, "Melee", "Hit", part, hitPosition, normal, material)
 
-No external loaders, no global metamethod hooks, no input hooks.
+No external loaders, no global metamethod hooks, no input interception.
+Passive UserInputService event listeners are used for diagnostics; no synthetic input is sent.
 The attack signal is based on observed traffic, but still needs in-game validation.
 ]]
 
@@ -26,6 +27,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 local ENTITY_CONTAINER = Workspace:WaitForChild("ENTITY_CONTAINER", 15)
@@ -115,6 +117,17 @@ local lastManualToolActivationAt = nil
 local lastAutoAttackAt = nil
 local lastAutoHitAt = nil
 local lastAutoHitByModel = {}
+local manualMouseDownCount = 0
+local manualMouseUpCount = 0
+local manualTouchCount = 0
+local lastManualInputAt = nil
+local lastManualInputKind = "None"
+local lastManualInputProcessed = nil
+local movementAnomalyCount = 0
+local fallWarningCount = 0
+local movementSamples = 0
+local movementMonitorCharacters = setmetatable({}, { __mode = "k" })
+local expectedCharacterMove = nil
 
 local function diagTraceback(err)
     local message = tostring(err)
@@ -159,19 +172,57 @@ local function recordThrottled(key, interval, category, message, details)
     return nil
 end
 
+local function buildAlienHealthSnapshot()
+    local snapshot = {}
+    for model, record in pairs(monitoredAliens) do
+        local sources = {}
+        for sourceName, value in pairs(record.sources or {}) do
+            table.insert(sources, { name = tostring(sourceName), value = tonumber(value) })
+        end
+        table.sort(sources, function(a, b) return a.name < b.name end)
+        table.insert(snapshot, {
+            variant = tostring(record.variant),
+            modelName = tostring(model.Name),
+            inEntityContainer = model.Parent == ENTITY_CONTAINER,
+            deadSignal = record.dead == true,
+            removed = record.removed == true,
+            sourceCount = tonumber(record.sourceCount) or 0,
+            uiSourceCount = (function()
+                local count = 0
+                for _ in pairs(record.uiSources or {}) do count = count + 1 end
+                return count
+            end)(),
+            lastHealthValue = record.lastHealthValue,
+            lastHealthDelta = record.lastHealthDelta,
+            lastHealthSource = record.lastHealthSource,
+            lastHealthAttribution = record.lastHealthAttribution,
+            maxHealthSources = record.maxHealthSources or {},
+            sources = sources,
+        })
+    end
+    table.sort(snapshot, function(a, b)
+        if a.variant == b.variant then return a.modelName < b.modelName end
+        return a.variant < b.variant
+    end)
+    return snapshot
+end
+
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF4-DIAGNOSTICS",
+        "Version: 1.0.1-HF4.1-OBSERVER",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
         "Alien kill notifications: " .. tostring(alienKills),
         "Alien monitors: " .. tostring(monitoredAlienModelsTotal) .. " | Numeric health sources: " .. tostring(alienHealthSourcesFound),
-        "Observed alien damage changes: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
+        "Alien health-source decrease signals: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
         "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
         "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
+        "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
+        "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
+        "Camera/root offset is informational only; under-alien safety camera positioning is intentional and is not classified as an error.",
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
         "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
@@ -186,6 +237,36 @@ local function buildDiagnosticReport()
         end)(),
         string.rep("-", 72),
     }
+    local healthSnapshot = buildAlienHealthSnapshot()
+    table.insert(lines, "Alien health snapshot (client-visible sources only):")
+    if #healthSnapshot == 0 then
+        table.insert(lines, "  No alien models have been attached to the health observer yet.")
+    else
+        for index, npc in ipairs(healthSnapshot) do
+            if index > 40 then
+                table.insert(lines, "  ... " .. tostring(#healthSnapshot - 40) .. " additional alien records omitted from text summary; see JSON export.")
+                break
+            end
+            local sourceParts = {}
+            for _, source in ipairs(npc.sources) do
+                table.insert(sourceParts, source.name .. "=" .. tostring(source.value))
+            end
+            local maxParts = {}
+            for sourceName, value in pairs(npc.maxHealthSources or {}) do
+                table.insert(maxParts, tostring(sourceName) .. "=" .. tostring(value))
+            end
+            table.sort(maxParts)
+            table.insert(lines, string.format(
+                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | Max=%s | %s",
+                npc.variant, npc.modelName, tostring(npc.inEntityContainer), npc.sourceCount, npc.uiSourceCount,
+                tostring(npc.deadSignal), tostring(npc.removed), tostring(npc.lastHealthValue),
+                tostring(npc.lastHealthDelta), tostring(npc.lastHealthAttribution),
+                #maxParts > 0 and table.concat(maxParts, "; ") or "unknown",
+                #sourceParts > 0 and table.concat(sourceParts, "; ") or "No numeric health source"
+            ))
+        end
+    end
+    table.insert(lines, string.rep("-", 72))
     for _, event in ipairs(diagEvents) do
         local line = string.format("[%s] [%.3f] [%s] %s", event.time, event.clock, event.category, event.message)
         if event.details ~= "" then
@@ -403,7 +484,8 @@ end
 local function isHealthValueName(name)
     local lower = string.lower(tostring(name or ""))
     local normalized = string.gsub(lower, "[%s_%-]", "")
-    if string.find(normalized, "maxhealth", 1, true) or string.find(normalized, "maxhp", 1, true) then
+    if string.find(normalized, "maxhealth", 1, true) or string.find(normalized, "maxhp", 1, true)
+        or string.find(normalized, "maxhitpoint", 1, true) then
         return false
     end
     return normalized == "health"
@@ -415,18 +497,40 @@ local function isHealthValueName(name)
         or normalized == "healthpercent"
         or normalized == "hppercent"
         or normalized == "healthratio"
+        or normalized == "hitpoints"
+        or normalized == "currenthitpoints"
+        or normalized == "hitpoint"
+        or normalized == "currenthitpoint"
+        or normalized == "healthnow"
+        or normalized == "hpnow"
         or string.find(normalized, "currenthealth", 1, true) ~= nil
         or string.find(normalized, "currenthp", 1, true) ~= nil
 end
 
+local function hasHealthNamedAncestor(instance, model)
+    local current = instance and instance.Parent
+    while current and current ~= model do
+        local normalized = string.gsub(string.lower(tostring(current.Name or "")), "[%s_%-]", "")
+        if string.find(normalized, "health", 1, true) or normalized == "hp" or string.find(normalized, "hitpoint", 1, true) then
+            return true
+        end
+        current = current.Parent
+    end
+    return false
+end
+
 local function getAlienDamageAttribution(model)
     local now = os.clock()
-    local manualAge = lastManualToolActivationAt and (now - lastManualToolActivationAt) or math.huge
+    local manualToolAge = lastManualToolActivationAt and (now - lastManualToolActivationAt) or math.huge
+    local manualInputAge = lastManualInputAt and (now - lastManualInputAt) or math.huge
+    local manualAge = math.min(manualToolAge, manualInputAge)
     local autoAge = lastAutoHitByModel[model] and (now - lastAutoHitByModel[model]) or math.huge
     if manualAge <= 1.25 and autoAge <= 1.25 then
-        return "AMBIGUOUS: native Tool.Activated and farmer Hit requests both occurred recently"
+        return "AMBIGUOUS: manual input/native activation and farmer Hit requests both occurred recently"
+    elseif manualToolAge <= 1.25 and manualInputAge <= 1.25 then
+        return "Mouse/touch input plus native Tool.Activated recently (timing correlation only)"
     elseif manualAge <= 1.25 then
-        return "Recent native Tool.Activated signal (likely manual input; timing correlation only)"
+        return "Recent manual mouse/touch input or native Tool.Activated (timing correlation only)"
     elseif autoAge <= 1.25 then
         return "Farmer sent a Hit request to this alien recently (timing correlation only)"
     elseif lastAutoAttackAt and (now - lastAutoAttackAt) <= 1.25 then
@@ -453,13 +557,19 @@ local function recordAlienHealthChange(record, sourceKey, oldValue, newValue)
         return
     end
 
+    record.lastHealthValue = newValue
+    record.lastHealthDelta = newValue - oldValue
+    record.lastHealthSource = tostring(sourceKey)
+    record.lastHealthChangeAt = os.clock()
+    record.lastHealthAttribution = getAlienDamageAttribution(record.model)
+
     if newValue < oldValue then
         local amount = oldValue - newValue
         alienDamageEvents = alienDamageEvents + 1
         recordEvent("DAMAGE", "Alien health decreased", string.format(
-            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Damage=%.3f | Attribution=%s",
+            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Damage=%.3f | Attribution=%s | ManualInput=%s | Paused=%s",
             tostring(record.variant), tostring(record.model.Name), tostring(sourceKey),
-            oldValue, newValue, amount, getAlienDamageAttribution(record.model)
+            oldValue, newValue, amount, tostring(record.lastHealthAttribution), tostring(lastManualInputKind), tostring(paused)
         ))
     else
         recordEvent("HEAL", "Alien health increased", string.format(
@@ -518,6 +628,11 @@ local function parseHealthText(textValue)
     local percent = string.match(text, "([%d%.]+)%s*%%")
     if percent then
         return tonumber(percent), 100
+    end
+    local labelled = string.match(text, "[Hh][Pp]?%s*[:=]%s*([%d%.]+)")
+        or string.match(text, "[Hh]ealth%s*[:=]%s*([%d%.]+)")
+    if labelled then
+        return tonumber(labelled), nil
     end
     if string.match(text, "^%s*[%d%.]+%s*$") then
         return tonumber(text), nil
@@ -583,8 +698,10 @@ local function attachAlienHealthUi(record, instance)
                 if newSize ~= previousSize then
                     local oldWidth = previousSize.X.Scale + previousSize.X.Offset / 100000
                     local newWidth = newSize.X.Scale + newSize.X.Offset / 100000
+                    local oldHeight = previousSize.Y.Scale + previousSize.Y.Offset / 100000
+                    local newHeight = newSize.Y.Scale + newSize.Y.Offset / 100000
                     alienHealthUiEvents = alienHealthUiEvents + 1
-                    local direction = newWidth < oldWidth and "shrunk (possible damage indicator)" or "changed"
+                    local direction = (newWidth < oldWidth or newHeight < oldHeight) and "shrunk (possible damage indicator)" or "changed"
                     recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
                         "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
                         .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize) .. " | Path=" .. path)
@@ -595,13 +712,34 @@ local function attachAlienHealthUi(record, instance)
         if ok and connection then table.insert(record.connections, connection) end
     end
 
+    if isGuiObject then
+        local previousVisible = instance.Visible
+        local visibleOk, visibleConnection = pcall(function()
+            return instance:GetPropertyChangedSignal("Visible"):Connect(function()
+                local currentVisible = instance.Visible
+                if currentVisible ~= previousVisible then
+                    alienHealthUiEvents = alienHealthUiEvents + 1
+                    recordEvent("NPC_UI", "Alien health-bar GUI visibility changed", "Model=" .. tostring(record.model.Name)
+                        .. " | Object=" .. tostring(instance.Name) .. " | Old=" .. tostring(previousVisible)
+                        .. " | New=" .. tostring(currentVisible) .. " | Path=" .. path)
+                    previousVisible = currentVisible
+                end
+            end)
+        end)
+        if visibleOk and visibleConnection then table.insert(record.connections, visibleConnection) end
+    end
+
     if isTextObject then
         local sourceKey = "HealthBarText:" .. path
-        local initialCurrent = parseHealthText(instance.Text)
+        local initialCurrent, initialMaximum = parseHealthText(instance.Text)
+        if initialMaximum then
+            record.maxHealthSources[sourceKey] = initialMaximum
+        end
         if initialCurrent then
             attachNumericAlienHealthSource(record, sourceKey, initialCurrent, function(callback)
                 return instance:GetPropertyChangedSignal("Text"):Connect(function()
-                    local current = parseHealthText(instance.Text)
+                    local current, maximum = parseHealthText(instance.Text)
+                    if maximum then record.maxHealthSources[sourceKey] = maximum end
                     if current then callback(current) end
                 end)
             end)
@@ -611,7 +749,8 @@ local function attachAlienHealthUi(record, instance)
                 return instance:GetPropertyChangedSignal("Text"):Connect(function()
                     local currentText = tostring(instance.Text or "")
                     if currentText ~= previousText then
-                        local currentNumeric = parseHealthText(currentText)
+                        local currentNumeric, currentMaximum = parseHealthText(currentText)
+                        if currentMaximum then record.maxHealthSources[sourceKey] = currentMaximum end
                         if currentNumeric then
                             if record.sources[sourceKey] ~= nil then
                                 local oldNumeric = record.sources[sourceKey]
@@ -645,7 +784,28 @@ local function inspectAlienHealthInstance(record, instance)
     end
 
     if instance:IsA("Humanoid") then
-        attachNumericAlienHealthSource(record, "Humanoid.Health:" .. tostring(instance:GetFullName()), instance.Health, function(callback)
+        local humanoidPath = tostring(instance:GetFullName())
+        local maxHealthKey = "Humanoid.MaxHealth:" .. humanoidPath
+        if record.maxHealthSources[maxHealthKey] == nil then
+            record.maxHealthSources[maxHealthKey] = instance.MaxHealth
+            recordEvent("NPC_HEALTH", "Alien Humanoid max-health baseline", "Variant=" .. tostring(record.variant)
+                .. " | Model=" .. tostring(record.model.Name) .. " | MaxHealth=" .. tostring(instance.MaxHealth)
+                .. " | Path=" .. humanoidPath)
+            local maxOk, maxConnection = pcall(function()
+                local previousMax = instance.MaxHealth
+                return instance:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+                    local currentMax = instance.MaxHealth
+                    if currentMax ~= previousMax then
+                        recordEvent("NPC_HEALTH", "Alien Humanoid MaxHealth changed", "Model=" .. tostring(record.model.Name)
+                            .. " | Old=" .. tostring(previousMax) .. " | New=" .. tostring(currentMax) .. " | Path=" .. humanoidPath)
+                        previousMax = currentMax
+                        record.maxHealthSources[maxHealthKey] = currentMax
+                    end
+                end)
+            end)
+            if maxOk and maxConnection then table.insert(record.connections, maxConnection) end
+        end
+        attachNumericAlienHealthSource(record, "Humanoid.Health:" .. humanoidPath, instance.Health, function(callback)
             return instance.HealthChanged:Connect(callback)
         end)
         if not record.humanoidDeathSignals[instance] then
@@ -662,7 +822,7 @@ local function inspectAlienHealthInstance(record, instance)
     local attributes = {}
     pcall(function() attributes = instance:GetAttributes() end)
     for attributeName, attributeValue in pairs(attributes) do
-        if isHealthValueName(attributeName) and tonumber(attributeValue) then
+        if (isHealthValueName(attributeName) or (string.lower(tostring(attributeName)) == "value" and hasHealthNamedAncestor(instance, record.model))) and tonumber(attributeValue) then
             local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
             attachNumericAlienHealthSource(record, sourceKey, attributeValue, function(callback)
                 return instance:GetAttributeChangedSignal(attributeName):Connect(function()
@@ -675,7 +835,7 @@ local function inspectAlienHealthInstance(record, instance)
         record.attributeWatchers[instance] = true
         local attributeOk, attributeConnection = pcall(function()
             return instance.AttributeChanged:Connect(function(attributeName)
-                if isHealthValueName(attributeName) then
+                if isHealthValueName(attributeName) or (string.lower(tostring(attributeName)) == "value" and hasHealthNamedAncestor(instance, record.model)) then
                     local currentValue = instance:GetAttribute(attributeName)
                     if tonumber(currentValue) then
                         local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
@@ -691,7 +851,7 @@ local function inspectAlienHealthInstance(record, instance)
         if attributeOk and attributeConnection then table.insert(record.connections, attributeConnection) end
     end
 
-    if instance:IsA("ValueBase") and isHealthValueName(instance.Name) then
+    if instance:IsA("ValueBase") and (isHealthValueName(instance.Name) or (string.lower(tostring(instance.Name)) == "value" and hasHealthNamedAncestor(instance, record.model))) then
         local sourceKey = "ValueObject:" .. tostring(instance:GetFullName())
         attachNumericAlienHealthSource(record, sourceKey, instance.Value, function(callback)
             return instance:GetPropertyChangedSignal("Value"):Connect(function()
@@ -716,6 +876,7 @@ local function monitorAlienModel(model)
         model = model,
         variant = variant,
         sources = {},
+        maxHealthSources = {},
         sourceCount = 0,
         uiSources = {},
         humanoidDeathSignals = {},
@@ -723,6 +884,11 @@ local function monitorAlienModel(model)
         connections = {},
         dead = false,
         removed = false,
+        lastHealthValue = nil,
+        lastHealthDelta = nil,
+        lastHealthSource = nil,
+        lastHealthAttribution = nil,
+        lastHealthChangeAt = nil,
     }
     monitoredAliens[model] = record
     monitoredAlienModelsTotal = monitoredAlienModelsTotal + 1
@@ -996,7 +1162,7 @@ local function setupFlight()
     return true
 end
 
-local function moveCharacter(position, lookAtPosition)
+local function moveCharacter(position, lookAtPosition, moveReason)
     if not setupFlight() then
         return false
     end
@@ -1006,6 +1172,11 @@ local function moveCharacter(position, lookAtPosition)
     end
     local lookAt = lookAtPosition or (position + Vector3.new(0, 0, -1))
     local targetCFrame = CFrame.lookAt(position, lookAt)
+    expectedCharacterMove = {
+        position = position,
+        at = os.clock(),
+        reason = tostring(moveReason or "FARMER_REPOSITION"),
+    }
     local ok, moveError = pcall(function()
         root.CFrame = targetCFrame
         root.AssemblyLinearVelocity = Vector3.zero
@@ -1026,7 +1197,7 @@ local function moveCharacter(position, lookAtPosition)
     if camera then
         cameraGap = string.format("%.1f", (camera.CFrame.Position - root.Position).Magnitude)
     end
-    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s | PlatformStand=%s", position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
+    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Reason=%s | Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s (informational) | PlatformStand=%s", tostring(moveReason or "FARMER_REPOSITION"), position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
     return true
 end
 
@@ -1039,7 +1210,7 @@ local function moveBelowAlien(entry)
     currentTarget = entry.variant .. " / " .. entry.model.Name
     local _, playerRoot = getCharacter()
     local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
-    local moved = moveCharacter(hoverPosition, targetPosition)
+    local moved = moveCharacter(hoverPosition, targetPosition, "SAFE_HOVER_BELOW_ALIEN")
     recordEvent("TARGET", "Hover-below positioning requested", string.format("Variant=%s | Model=%s | Target=(%.1f, %.1f, %.1f) | DesiredPlayerY=%.1f | PreviousDistance=%.1f | Success=%s", entry.variant, entry.model.Name, targetPosition.X, targetPosition.Y, targetPosition.Z, hoverPosition.Y, beforeDistance, tostring(moved)))
     return moved
 end
@@ -1337,7 +1508,7 @@ local function collectTokensAround(center, radius)
                     local promptPath = "unknown"
                     pcall(function() promptPath = prompt:GetFullName() end)
                     recordEvent("TOKEN", "Alien Token pickup detected", string.format("Path=%s | Position=(%.1f, %.1f, %.1f) | DistanceFromCluster=%.1f | MaxActivationDistance=%.1f", promptPath, position.X, position.Y, position.Z, item.distance, prompt.MaxActivationDistance))
-                    local moved = moveCharacter(position + Vector3.new(0, 2, 0), position)
+                    local moved = moveCharacter(position + Vector3.new(0, 2, 0), position, "TOKEN_PICKUP")
                     task.wait(0.08)
                     tokenAttempts = tokenAttempts + 1
                     recordEvent("TOKEN", "Pickup attempt started", "Path=" .. promptPath .. " | MoveToPickup=" .. tostring(moved) .. " | Attempt=" .. tostring(tokenAttempts))
@@ -1446,7 +1617,7 @@ local function advanceScan()
         scanZ = CONFIG.SCAN_START_Z
     end
     local position = getCurrentScanPosition()
-    local moved = moveCharacter(position, position + Vector3.new(0, 0, -1))
+    local moved = moveCharacter(position, position + Vector3.new(0, 0, -1), "SCAN_ADVANCE")
     setStatus("Scanning lap " .. tostring(lap) .. " / Z=" .. tostring(scanZ))
     recordEvent("SCAN", "Scan route advanced", "Lap=" .. tostring(oldLap) .. "->" .. tostring(lap) .. " | Z=" .. tostring(oldZ) .. "->" .. tostring(scanZ) .. " | Step=" .. tostring(CONFIG.SCAN_STEP) .. " | MoveSuccess=" .. tostring(moved))
     task.wait(CONFIG.SCAN_WAIT)
@@ -1487,7 +1658,7 @@ local function mainLoop()
         else
             setupFlight()
             local scanPosition = getCurrentScanPosition()
-            moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1))
+            moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1), "SCAN_POINT")
             task.wait(0.25)
 
             local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
@@ -1595,6 +1766,102 @@ local function trackTextLabel(label)
     label:GetPropertyChangedSignal("Text"):Connect(inspectText)
 end
 
+local function monitorCharacterMovement(character)
+    if not character or movementMonitorCharacters[character] then
+        return
+    end
+    movementMonitorCharacters[character] = true
+    expectedCharacterMove = nil
+    task.spawn(function()
+        local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 8)
+        local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8)
+        if not root or not humanoid then
+            recordThrottled("movement-monitor-missing-root", 2, "MOVEMENT", "Character movement monitor could not attach", "RootPart or Humanoid was not available")
+            return
+        end
+
+        local previousPosition = root.Position
+        local previousAt = os.clock()
+        local previousState = humanoid:GetState()
+        local previousFloor = humanoid.FloorMaterial
+        recordEvent("MOVEMENT", "Character movement observer attached", string.format(
+            "Character=%s | Start=(%.1f, %.1f, %.1f) | State=%s | Floor=%s",
+            tostring(character.Name), previousPosition.X, previousPosition.Y, previousPosition.Z,
+            tostring(previousState), tostring(previousFloor)
+        ))
+
+        local stateConnection = humanoid.StateChanged:Connect(function(oldState, newState)
+            recordThrottled("humanoid-state:" .. tostring(newState), 0.2, "MOVEMENT", "Character humanoid state changed",
+                "Old=" .. tostring(oldState) .. " | New=" .. tostring(newState)
+                .. " | Health=" .. tostring(humanoid.Health) .. " | PlatformStand=" .. tostring(humanoid.PlatformStand))
+        end)
+        local floorConnection = humanoid:GetPropertyChangedSignal("FloorMaterial"):Connect(function()
+            local floor = humanoid.FloorMaterial
+            if floor ~= previousFloor then
+                recordThrottled("floor-material:" .. tostring(floor), 0.2, "MOVEMENT", "Character floor material changed",
+                    "Old=" .. tostring(previousFloor) .. " | New=" .. tostring(floor)
+                    .. " | State=" .. tostring(humanoid:GetState()))
+                previousFloor = floor
+            end
+        end)
+
+        while character.Parent and root.Parent and humanoid.Parent do
+            task.wait(0.12)
+            local now = os.clock()
+            local position = root.Position
+            local dt = math.max(now - previousAt, 0.001)
+            local displacement = position - previousPosition
+            local velocity = root.AssemblyLinearVelocity
+            local state = humanoid:GetState()
+            local floor = humanoid.FloorMaterial
+            local expected = expectedCharacterMove
+                and (now - expectedCharacterMove.at) <= 1.25
+                and (position - expectedCharacterMove.position).Magnitude <= 20
+            movementSamples = movementSamples + 1
+
+            if displacement.Magnitude >= 75 then
+                local from = string.format("(%.1f, %.1f, %.1f)", previousPosition.X, previousPosition.Y, previousPosition.Z)
+                local to = string.format("(%.1f, %.1f, %.1f)", position.X, position.Y, position.Z)
+                if expected then
+                    recordThrottled("expected-reposition:" .. tostring(expectedCharacterMove.reason), 0.25, "MOVEMENT",
+                        "Large farmer-requested reposition observed", string.format(
+                            "Reason=%s | From=%s | To=%s | Delta=%.1f | SampleDt=%.3f",
+                            tostring(expectedCharacterMove.reason), from, to, displacement.Magnitude, dt
+                        ))
+                else
+                    movementAnomalyCount = movementAnomalyCount + 1
+                    recordEvent("MOVEMENT_ALERT", "Unexpected character displacement / possible teleport",
+                        string.format("From=%s | To=%s | Delta=%.1f studs | Speed=%.1f studs/s | Velocity=(%.1f, %.1f, %.1f) | State=%s | Floor=%s | Health=%.1f/%.1f | Target=%s | Running=%s | Paused=%s",
+                            from, to, displacement.Magnitude, displacement.Magnitude / dt,
+                            velocity.X, velocity.Y, velocity.Z, tostring(state), tostring(floor),
+                            humanoid.Health, humanoid.MaxHealth, tostring(currentTarget), tostring(running), tostring(paused)))
+                end
+            end
+
+            local freefallState = state == Enum.HumanoidStateType.Freefall
+                or state == Enum.HumanoidStateType.FallingDown
+                or state == Enum.HumanoidStateType.Physics
+            local rapidDrop = floor == Enum.Material.Air
+                and not expected
+                and ((freefallState and velocity.Y <= -35) or (displacement.Y <= -15 and dt <= 0.4))
+            if rapidDrop then
+                local warningEvent = recordThrottled("possible-character-fall", 0.75, "MOVEMENT_ALERT", "Possible character fall / void descent",
+                    string.format("Position=(%.1f, %.1f, %.1f) | DeltaY=%.1f | VelocityY=%.1f | State=%s | Floor=%s | Health=%.1f/%.1f | Target=%s | ExpectedMove=%s",
+                        position.X, position.Y, position.Z, displacement.Y, velocity.Y, tostring(state), tostring(floor),
+                        humanoid.Health, humanoid.MaxHealth, tostring(currentTarget), tostring(expected)))
+                if warningEvent then fallWarningCount = fallWarningCount + 1 end
+            end
+
+            previousPosition = position
+            previousAt = now
+            previousState = state
+        end
+        pcall(function() stateConnection:Disconnect() end)
+        pcall(function() floorConnection:Disconnect() end)
+        recordEvent("MOVEMENT", "Character movement observer detached", "Character=" .. tostring(character.Name))
+    end)
+end
+
 local function monitorCharacter(character)
     if not character then
         return
@@ -1633,9 +1900,16 @@ local function monitorTool(tool)
         return tool.Activated:Connect(function()
             nativeToolActivations = nativeToolActivations + 1
             lastManualToolActivationAt = os.clock()
+            local inputAge = lastManualInputAt and (os.clock() - lastManualInputAt) or math.huge
             recordEvent("WEAPON", "Native Tool.Activated signal observed", "Tool=" .. tostring(tool.Name)
                 .. " | Count=" .. tostring(nativeToolActivations)
-                .. " | This indicates a native tool activation; it is not absolute proof of physical mouse input")
+                .. " | RecentMouseOrTouch=" .. tostring(inputAge <= 0.5)
+                .. " | InputAge=" .. (inputAge < math.huge and string.format("%.3f", inputAge) or "none")
+                .. " | InputKind=" .. tostring(lastManualInputKind)
+                .. " | InputGameProcessed=" .. tostring(lastManualInputProcessed)
+                .. " | Target=" .. tostring(currentTarget)
+                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
+                .. " | Native activation is timing evidence, not proof of damage")
         end)
     end)
     if activatedOk and activatedConnection then
@@ -1643,6 +1917,20 @@ local function monitorTool(tool)
     elseif not activatedOk then
         recordEvent("ERROR", "Tool.Activated monitor failed", "Tool=" .. tostring(tool.Name) .. " | Error=" .. tostring(activatedConnection))
     end
+
+    local equippedOk, equippedConnection = pcall(function()
+        return tool.Equipped:Connect(function()
+            recordEvent("WEAPON", "Tool Equipped event observed", "Tool=" .. tostring(tool.Name)
+                .. " | Parent=" .. tostring(tool.Parent and tool.Parent.Name))
+        end)
+    end)
+    if equippedOk and equippedConnection then table.insert(monitoredTools[tool].connections, equippedConnection) end
+    local unequippedOk, unequippedConnection = pcall(function()
+        return tool.Unequipped:Connect(function()
+            recordEvent("WEAPON", "Tool Unequipped event observed", "Tool=" .. tostring(tool.Name))
+        end)
+    end)
+    if unequippedOk and unequippedConnection then table.insert(monitoredTools[tool].connections, unequippedConnection) end
 
     local enabledOk, enabledConnection = pcall(function()
         local previousEnabled = tool.Enabled
@@ -1672,6 +1960,59 @@ local function monitorToolContainer(container)
     end)
 end
 
+local function startManualInputMonitoring()
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        local inputType = input.UserInputType
+        if inputType == Enum.UserInputType.MouseButton1 then
+            manualMouseDownCount = manualMouseDownCount + 1
+            local character = LocalPlayer.Character
+            local tool = character and character:FindFirstChildOfClass("Tool")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local camera = Workspace.CurrentCamera
+            if tool and not gameProcessed then
+                lastManualInputAt = os.clock()
+                lastManualInputKind = "MouseButton1"
+            end
+            lastManualInputProcessed = gameProcessed == true
+            local rootText = root and string.format("(%.1f, %.1f, %.1f)", root.Position.X, root.Position.Y, root.Position.Z) or "unknown"
+            local lookText = camera and string.format("(%.2f, %.2f, %.2f)", camera.CFrame.LookVector.X, camera.CFrame.LookVector.Y, camera.CFrame.LookVector.Z) or "unknown"
+            recordEvent("INPUT", "MouseButton1 input began", "Count=" .. tostring(manualMouseDownCount)
+                .. " | GameProcessed=" .. tostring(gameProcessed == true)
+                .. " | EquippedTool=" .. tostring(tool and tool.Name or "None")
+                .. " | Root=" .. rootText .. " | CameraLook=" .. lookText
+                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
+                .. " | Target=" .. tostring(currentTarget))
+        elseif inputType == Enum.UserInputType.Touch then
+            manualTouchCount = manualTouchCount + 1
+            local character = LocalPlayer.Character
+            local tool = character and character:FindFirstChildOfClass("Tool")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local camera = Workspace.CurrentCamera
+            if tool and not gameProcessed then
+                lastManualInputAt = os.clock()
+                lastManualInputKind = "Touch"
+            end
+            lastManualInputProcessed = gameProcessed == true
+            local rootText = root and string.format("(%.1f, %.1f, %.1f)", root.Position.X, root.Position.Y, root.Position.Z) or "unknown"
+            local lookText = camera and string.format("(%.2f, %.2f, %.2f)", camera.CFrame.LookVector.X, camera.CFrame.LookVector.Y, camera.CFrame.LookVector.Z) or "unknown"
+            recordEvent("INPUT", "Touch input began", "Count=" .. tostring(manualTouchCount)
+                .. " | GameProcessed=" .. tostring(gameProcessed == true)
+                .. " | EquippedTool=" .. tostring(tool and tool.Name or "None")
+                .. " | Root=" .. rootText .. " | CameraLook=" .. lookText
+                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
+                .. " | Target=" .. tostring(currentTarget))
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input, gameProcessed)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            manualMouseUpCount = manualMouseUpCount + 1
+            recordThrottled("mouse1-up", 0.08, "INPUT", "MouseButton1 input ended",
+                "Count=" .. tostring(manualMouseUpCount) .. " | GameProcessed=" .. tostring(gameProcessed == true))
+        end
+    end)
+    recordEvent("INPUT", "Manual input observer active", "Observes MouseButton1 and Touch only; no input interception or synthetic input")
+end
+
 local function startToolMonitoring()
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
     if not backpack then
@@ -1679,7 +2020,7 @@ local function startToolMonitoring()
     end
     monitorToolContainer(backpack)
     monitorToolContainer(LocalPlayer.Character)
-    recordEvent("WEAPON", "Native tool activation monitoring active", "Monitoring Tool.Activated and Tool.Enabled changes; no input hooks")
+    recordEvent("WEAPON", "Native tool activation monitoring active", "Monitoring Tool.Activated, Equipped/Unequipped, Enabled and physical mouse/touch input; no input interception")
 end
 
 local function hookPlayerGui()
@@ -1955,7 +2296,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF4-DIAGNOSTICS",
+            version = "1.0.1-HF4.1-OBSERVER",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -1968,6 +2309,15 @@ local function exportDiagnostics()
             nativeToolActivations = nativeToolActivations,
             automatedAttackRequests = automatedAttackRequests,
             automatedHitRequests = automatedHitRequests,
+            manualMouseDownCount = manualMouseDownCount,
+            manualMouseUpCount = manualMouseUpCount,
+            manualTouchCount = manualTouchCount,
+            lastManualInputKind = lastManualInputKind,
+            lastManualInputProcessed = lastManualInputProcessed,
+            movementSamples = movementSamples,
+            movementAnomalyCount = movementAnomalyCount,
+            fallWarningCount = fallWarningCount,
+            alienHealthSnapshot = buildAlienHealthSnapshot(),
             tokenAttempts = tokenAttempts,
             tokenPickupsConfirmed = tokenPickupsConfirmed,
             rewardToastEstimate = rewardToastEstimate,
@@ -2079,6 +2429,7 @@ diagExportButton.Activated:Connect(exportDiagnostics)
 LocalPlayer.CharacterAdded:Connect(function(character)
     task.wait(1)
     monitorCharacter(character)
+    monitorCharacterMovement(character)
     monitorToolContainer(character)
     recordEvent("PLAYER", "Character respawned", "Character=" .. tostring(character.Name))
     if running then
@@ -2087,10 +2438,12 @@ LocalPlayer.CharacterAdded:Connect(function(character)
 end)
 if LocalPlayer.Character then
     task.spawn(monitorCharacter, LocalPlayer.Character)
+    task.spawn(monitorCharacterMovement, LocalPlayer.Character)
 end
 
 startAlienHealthMonitoring()
 startToolMonitoring()
+startManualInputMonitoring()
 hookPlayerGui()
 
 -- Keep the compact HUD current without scanning the world every frame.
@@ -2108,7 +2461,7 @@ task.spawn(function()
         if root and camera then
             local gap = (camera.CFrame.Position - root.Position).Magnitude
             if gap > 100 then
-                recordThrottled("camera-root-gap", 0.75, "CAMERA", "Large camera/root separation observed", string.format("Gap=%.1f studs | Root=(%.1f, %.1f, %.1f) | Camera=(%.1f, %.1f, %.1f)", gap, root.Position.X, root.Position.Y, root.Position.Z, camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z))
+                recordThrottled("camera-root-gap", 2.0, "CAMERA", "Camera/root offset observed (informational; may be intentional safe-hover view)", string.format("Gap=%.1f studs | Root=(%.1f, %.1f, %.1f) | Camera=(%.1f, %.1f, %.1f) | Target=%s | No movement error inferred from camera offset alone", gap, root.Position.X, root.Position.Y, root.Position.Z, camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z, tostring(currentTarget)))
             end
         end
         task.wait(0.5)
@@ -2149,6 +2502,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF4 health/activation monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF4.1 health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
