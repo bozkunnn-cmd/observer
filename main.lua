@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF3 (SURFACE-HIT COMBAT HOTFIX; BASELINE PRESERVED)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF4 (DIAGNOSTICS-ONLY; HF3 BEHAVIOR PRESERVED)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -100,6 +100,21 @@ local diagCountLabel = nil
 local refreshDiagPanel = nil
 local flightLogRoot = nil
 local monitoredHumanoids = {}
+-- HF4 diagnostics-only counters and correlation timestamps.
+local monitoredAliens = {}
+local monitoredAlienModelsTotal = 0
+local alienHealthSourcesFound = 0
+local alienDamageEvents = 0
+local alienDeathEvents = 0
+local alienHealthUiEvents = 0
+local monitoredTools = {}
+local nativeToolActivations = 0
+local automatedAttackRequests = 0
+local automatedHitRequests = 0
+local lastManualToolActivationAt = nil
+local lastAutoAttackAt = nil
+local lastAutoHitAt = nil
+local lastAutoHitByModel = {}
 
 local function diagTraceback(err)
     local message = tostring(err)
@@ -147,12 +162,16 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF2",
+        "Version: 1.0.1-HF4-DIAGNOSTICS",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
         "Alien kill notifications: " .. tostring(alienKills),
+        "Alien monitors: " .. tostring(monitoredAlienModelsTotal) .. " | Numeric health sources: " .. tostring(alienHealthSourcesFound),
+        "Observed alien damage changes: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
+        "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
+        "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
         "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
@@ -378,6 +397,419 @@ local function getAliensNear(position, radius)
         return a.distance < b.distance
     end)
     return results
+end
+
+-- HF4: observe client-visible alien health without changing game state.
+local function isHealthValueName(name)
+    local lower = string.lower(tostring(name or ""))
+    local normalized = string.gsub(lower, "[%s_%-]", "")
+    if string.find(normalized, "maxhealth", 1, true) or string.find(normalized, "maxhp", 1, true) then
+        return false
+    end
+    return normalized == "health"
+        or normalized == "hp"
+        or normalized == "currenthealth"
+        or normalized == "currenthp"
+        or normalized == "healthvalue"
+        or normalized == "hpvalue"
+        or normalized == "healthpercent"
+        or normalized == "hppercent"
+        or normalized == "healthratio"
+        or string.find(normalized, "currenthealth", 1, true) ~= nil
+        or string.find(normalized, "currenthp", 1, true) ~= nil
+end
+
+local function getAlienDamageAttribution(model)
+    local now = os.clock()
+    local manualAge = lastManualToolActivationAt and (now - lastManualToolActivationAt) or math.huge
+    local autoAge = lastAutoHitByModel[model] and (now - lastAutoHitByModel[model]) or math.huge
+    if manualAge <= 1.25 and autoAge <= 1.25 then
+        return "AMBIGUOUS: native Tool.Activated and farmer Hit requests both occurred recently"
+    elseif manualAge <= 1.25 then
+        return "Recent native Tool.Activated signal (likely manual input; timing correlation only)"
+    elseif autoAge <= 1.25 then
+        return "Farmer sent a Hit request to this alien recently (timing correlation only)"
+    elseif lastAutoAttackAt and (now - lastAutoAttackAt) <= 1.25 then
+        return "Farmer Attack request was recent, but no per-alien Hit correlation (not proof)"
+    end
+    return "Unattributed: no recent monitored tool activation or farmer hit request"
+end
+
+local function markAlienDead(record, reason)
+    if not record or record.dead then
+        return
+    end
+    record.dead = true
+    alienDeathEvents = alienDeathEvents + 1
+    recordEvent("KILL", "Alien death signal observed", "Variant=" .. tostring(record.variant)
+        .. " | Model=" .. tostring(record.model.Name) .. " | Signal=" .. tostring(reason)
+        .. " | Death is client-observed, not independently server-verified")
+end
+
+local function recordAlienHealthChange(record, sourceKey, oldValue, newValue)
+    oldValue = tonumber(oldValue)
+    newValue = tonumber(newValue)
+    if not oldValue or not newValue or math.abs(newValue - oldValue) < 0.001 then
+        return
+    end
+
+    if newValue < oldValue then
+        local amount = oldValue - newValue
+        alienDamageEvents = alienDamageEvents + 1
+        recordEvent("DAMAGE", "Alien health decreased", string.format(
+            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Damage=%.3f | Attribution=%s",
+            tostring(record.variant), tostring(record.model.Name), tostring(sourceKey),
+            oldValue, newValue, amount, getAlienDamageAttribution(record.model)
+        ))
+    else
+        recordEvent("HEAL", "Alien health increased", string.format(
+            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Change=+%.3f",
+            tostring(record.variant), tostring(record.model.Name), tostring(sourceKey),
+            oldValue, newValue, newValue - oldValue
+        ))
+    end
+
+    if newValue <= 0 then
+        markAlienDead(record, sourceKey .. " reached zero")
+    end
+end
+
+local function attachNumericAlienHealthSource(record, sourceKey, initialValue, connectCallback)
+    if not record or record.sources[sourceKey] ~= nil then
+        return
+    end
+    local initialNumber = tonumber(initialValue)
+    if not initialNumber then
+        return
+    end
+    record.sources[sourceKey] = initialNumber
+    record.sourceCount = record.sourceCount + 1
+    alienHealthSourcesFound = alienHealthSourcesFound + 1
+    recordEvent("NPC_HEALTH", "Alien numeric health source attached", string.format(
+        "Variant=%s | Model=%s | Source=%s | InitialValue=%.3f",
+        tostring(record.variant), tostring(record.model.Name), tostring(sourceKey), initialNumber
+    ))
+    if initialNumber <= 0 then
+        markAlienDead(record, sourceKey .. " was already zero when monitored")
+    end
+
+    local ok, connection = pcall(connectCallback, function(newValue)
+        local currentNumber = tonumber(newValue)
+        if not currentNumber then
+            return
+        end
+        local previousNumber = record.sources[sourceKey]
+        record.sources[sourceKey] = currentNumber
+        recordAlienHealthChange(record, sourceKey, previousNumber, currentNumber)
+    end)
+    if ok and connection then
+        table.insert(record.connections, connection)
+    elseif not ok then
+        recordEvent("ERROR", "Alien health source connection failed", "Source=" .. tostring(sourceKey) .. " | Error=" .. tostring(connection))
+    end
+end
+
+local function parseHealthText(textValue)
+    local text = tostring(textValue or "")
+    local current, maximum = string.match(text, "([%d%.]+)%s*/%s*([%d%.]+)")
+    if current then
+        return tonumber(current), tonumber(maximum)
+    end
+    local percent = string.match(text, "([%d%.]+)%s*%%")
+    if percent then
+        return tonumber(percent), 100
+    end
+    if string.match(text, "^%s*[%d%.]+%s*$") then
+        return tonumber(text), nil
+    end
+    return nil, nil
+end
+
+local function findHealthBarAncestor(instance, model)
+    local current = instance
+    while current and current ~= model do
+        local lower = string.lower(tostring(current.Name or ""))
+        local normalized = string.gsub(lower, "[%s_%-]", "")
+        if string.find(normalized, "healthbar", 1, true) or normalized == "hpbar" then
+            return current
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+local function attachAlienHealthUi(record, instance)
+    if not record or not instance or record.uiSources[instance] then
+        return
+    end
+    local barRoot = findHealthBarAncestor(instance, record.model)
+    if not barRoot then
+        return
+    end
+
+    local isBillboard = instance:IsA("BillboardGui") or instance:IsA("SurfaceGui")
+    local isGuiObject = instance:IsA("GuiObject")
+    local isTextObject = instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
+    if not isBillboard and not isGuiObject then
+        return
+    end
+
+    record.uiSources[instance] = true
+    local path = "unknown"
+    pcall(function() path = instance:GetFullName() end)
+
+    if isBillboard then
+        local enabledValue = false
+        pcall(function() enabledValue = instance.Enabled end)
+        recordEvent("NPC_UI", "Alien health-bar container observed", "Variant=" .. tostring(record.variant)
+            .. " | Model=" .. tostring(record.model.Name) .. " | Enabled=" .. tostring(enabledValue)
+            .. " | Path=" .. path)
+        local ok, connection = pcall(function()
+            return instance:GetPropertyChangedSignal("Enabled"):Connect(function()
+                local newValue = instance.Enabled
+                alienHealthUiEvents = alienHealthUiEvents + 1
+                recordEvent("NPC_UI", "Alien health-bar visibility changed", "Model=" .. tostring(record.model.Name)
+                    .. " | Enabled=" .. tostring(newValue) .. " | Path=" .. path)
+            end)
+        end)
+        if ok and connection then table.insert(record.connections, connection) end
+    end
+
+    if isGuiObject then
+        local previousSize = instance.Size
+        local ok, connection = pcall(function()
+            return instance:GetPropertyChangedSignal("Size"):Connect(function()
+                local newSize = instance.Size
+                if newSize ~= previousSize then
+                    local oldWidth = previousSize.X.Scale + previousSize.X.Offset / 100000
+                    local newWidth = newSize.X.Scale + newSize.X.Offset / 100000
+                    alienHealthUiEvents = alienHealthUiEvents + 1
+                    local direction = newWidth < oldWidth and "shrunk (possible damage indicator)" or "changed"
+                    recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
+                        "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
+                        .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize) .. " | Path=" .. path)
+                    previousSize = newSize
+                end
+            end)
+        end)
+        if ok and connection then table.insert(record.connections, connection) end
+    end
+
+    if isTextObject then
+        local sourceKey = "HealthBarText:" .. path
+        local initialCurrent = parseHealthText(instance.Text)
+        if initialCurrent then
+            attachNumericAlienHealthSource(record, sourceKey, initialCurrent, function(callback)
+                return instance:GetPropertyChangedSignal("Text"):Connect(function()
+                    local current = parseHealthText(instance.Text)
+                    if current then callback(current) end
+                end)
+            end)
+        else
+            local previousText = tostring(instance.Text or "")
+            local ok, connection = pcall(function()
+                return instance:GetPropertyChangedSignal("Text"):Connect(function()
+                    local currentText = tostring(instance.Text or "")
+                    if currentText ~= previousText then
+                        local currentNumeric = parseHealthText(currentText)
+                        if currentNumeric then
+                            if record.sources[sourceKey] ~= nil then
+                                local oldNumeric = record.sources[sourceKey]
+                                record.sources[sourceKey] = currentNumeric
+                                recordAlienHealthChange(record, sourceKey, oldNumeric, currentNumeric)
+                            else
+                                record.sources[sourceKey] = currentNumeric
+                                record.sourceCount = record.sourceCount + 1
+                                alienHealthSourcesFound = alienHealthSourcesFound + 1
+                                recordEvent("NPC_HEALTH", "Numeric health-bar text source became available", "Model=" .. tostring(record.model.Name)
+                                    .. " | Source=" .. sourceKey .. " | InitialValue=" .. tostring(currentNumeric))
+                            end
+                        else
+                            alienHealthUiEvents = alienHealthUiEvents + 1
+                            recordThrottled("alien-health-ui-text:" .. path, 0.1, "NPC_UI", "Alien health-bar text changed",
+                                "Model=" .. tostring(record.model.Name) .. " | Old=" .. previousText
+                                .. " | New=" .. currentText .. " | Path=" .. path)
+                        end
+                        previousText = currentText
+                    end
+                end)
+            end)
+            if ok and connection then table.insert(record.connections, connection) end
+        end
+    end
+end
+
+local function inspectAlienHealthInstance(record, instance)
+    if not record or not instance then
+        return
+    end
+
+    if instance:IsA("Humanoid") then
+        attachNumericAlienHealthSource(record, "Humanoid.Health:" .. tostring(instance:GetFullName()), instance.Health, function(callback)
+            return instance.HealthChanged:Connect(callback)
+        end)
+        if not record.humanoidDeathSignals[instance] then
+            record.humanoidDeathSignals[instance] = true
+            local ok, connection = pcall(function()
+                return instance.Died:Connect(function()
+                    markAlienDead(record, "Humanoid.Died")
+                end)
+            end)
+            if ok and connection then table.insert(record.connections, connection) end
+        end
+    end
+
+    local attributes = {}
+    pcall(function() attributes = instance:GetAttributes() end)
+    for attributeName, attributeValue in pairs(attributes) do
+        if isHealthValueName(attributeName) and tonumber(attributeValue) then
+            local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
+            attachNumericAlienHealthSource(record, sourceKey, attributeValue, function(callback)
+                return instance:GetAttributeChangedSignal(attributeName):Connect(function()
+                    callback(instance:GetAttribute(attributeName))
+                end)
+            end)
+        end
+    end
+    if not record.attributeWatchers[instance] then
+        record.attributeWatchers[instance] = true
+        local attributeOk, attributeConnection = pcall(function()
+            return instance.AttributeChanged:Connect(function(attributeName)
+                if isHealthValueName(attributeName) then
+                    local currentValue = instance:GetAttribute(attributeName)
+                    if tonumber(currentValue) then
+                        local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
+                        attachNumericAlienHealthSource(record, sourceKey, currentValue, function(callback)
+                            return instance:GetAttributeChangedSignal(attributeName):Connect(function()
+                                callback(instance:GetAttribute(attributeName))
+                            end)
+                        end)
+                    end
+                end
+            end)
+        end)
+        if attributeOk and attributeConnection then table.insert(record.connections, attributeConnection) end
+    end
+
+    if instance:IsA("ValueBase") and isHealthValueName(instance.Name) then
+        local sourceKey = "ValueObject:" .. tostring(instance:GetFullName())
+        attachNumericAlienHealthSource(record, sourceKey, instance.Value, function(callback)
+            return instance:GetPropertyChangedSignal("Value"):Connect(function()
+                callback(instance.Value)
+            end)
+        end)
+    end
+
+    attachAlienHealthUi(record, instance)
+end
+
+local function monitorAlienModel(model)
+    if not model or not model:IsA("Model") or monitoredAliens[model] then
+        return
+    end
+    local variant = isAlienModel(model)
+    if not variant then
+        return
+    end
+
+    local record = {
+        model = model,
+        variant = variant,
+        sources = {},
+        sourceCount = 0,
+        uiSources = {},
+        humanoidDeathSignals = {},
+        attributeWatchers = {},
+        connections = {},
+        dead = false,
+        removed = false,
+    }
+    monitoredAliens[model] = record
+    monitoredAlienModelsTotal = monitoredAlienModelsTotal + 1
+
+    inspectAlienHealthInstance(record, model)
+    for _, descendant in ipairs(model:GetDescendants()) do
+        inspectAlienHealthInstance(record, descendant)
+    end
+
+    local addedOk, addedConnection = pcall(function()
+        return model.DescendantAdded:Connect(function(descendant)
+            inspectAlienHealthInstance(record, descendant)
+        end)
+    end)
+    if addedOk and addedConnection then table.insert(record.connections, addedConnection) end
+
+    local ancestryOk, ancestryConnection = pcall(function()
+        return model.AncestryChanged:Connect(function(_, parent)
+            if not parent and not record.removed then
+                record.removed = true
+                recordEvent("NPC_LIFECYCLE", "Alien model removed from Workspace", "Variant=" .. tostring(record.variant)
+                    .. " | Model=" .. tostring(model.Name) .. " | HealthDeathConfirmed=" .. tostring(record.dead)
+                    .. " | Removal alone is not counted as a kill")
+            end
+        end)
+    end)
+    if ancestryOk and ancestryConnection then table.insert(record.connections, ancestryConnection) end
+
+    local destroyingOk, destroyingConnection = pcall(function()
+        return model.Destroying:Connect(function()
+            if not record.removed then
+                record.removed = true
+                recordEvent("NPC_LIFECYCLE", "Alien model Destroying signal", "Variant=" .. tostring(record.variant)
+                    .. " | Model=" .. tostring(model.Name) .. " | HealthDeathConfirmed=" .. tostring(record.dead)
+                    .. " | Destruction alone is not counted as a kill")
+            end
+        end)
+    end)
+    if destroyingOk and destroyingConnection then table.insert(record.connections, destroyingConnection) end
+
+    if record.sourceCount == 0 then
+        recordEvent("NPC_HEALTH", "No numeric alien health source found at monitor attach", "Variant=" .. tostring(variant)
+            .. " | Model=" .. tostring(model.Name) .. " | HealthBarUI=" .. tostring(next(record.uiSources) ~= nil)
+            .. " | Watching new descendants, attributes, value objects, health-bar UI and removal")
+    else
+        recordEvent("NPC_HEALTH", "Alien health monitor attached", "Variant=" .. tostring(variant)
+            .. " | Model=" .. tostring(model.Name) .. " | NumericSources=" .. tostring(record.sourceCount)
+            .. " | HealthBarUI=" .. tostring(next(record.uiSources) ~= nil))
+    end
+end
+
+local function startAlienHealthMonitoring()
+    if not ENTITY_CONTAINER then
+        recordEvent("ERROR", "Alien health monitor could not start", "ENTITY_CONTAINER is missing")
+        return
+    end
+    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
+        task.spawn(function()
+            for attempt = 1, 20 do
+                if not model or model.Parent ~= ENTITY_CONTAINER then
+                    return
+                end
+                if isAlienModel(model) then
+                    monitorAlienModel(model)
+                    return
+                end
+                task.wait(0.1)
+            end
+        end)
+    end
+    ENTITY_CONTAINER.ChildAdded:Connect(function(model)
+        task.spawn(function()
+            for attempt = 1, 20 do
+                if not model or model.Parent ~= ENTITY_CONTAINER then
+                    return
+                end
+                if isAlienModel(model) then
+                    monitorAlienModel(model)
+                    return
+                end
+                task.wait(0.1)
+            end
+            recordThrottled("alien-monitor-unclassified:" .. tostring(model.Name), 5, "NPC_HEALTH", "New entity did not expose an AlienType1/2/3 marker during monitor window", "Model=" .. tostring(model.Name))
+        end)
+    end)
+    recordEvent("NPC_HEALTH", "Alien health monitoring active", "Container=Workspace.ENTITY_CONTAINER | ExistingModels="
+        .. tostring(monitoredAlienModelsTotal) .. " | Mode=Humanoid/attributes/ValueBase/HealthBar UI/despawn observation")
 end
 
 local function getClosestHitPart(model, origin)
@@ -741,6 +1173,8 @@ local function sendMeleeSweep(entries)
         direction = direction.Unit
     end
 
+    lastAutoAttackAt = os.clock()
+    automatedAttackRequests = automatedAttackRequests + 1
     local okAttack, attackError = pcall(function()
         ReplicaSignal:FireServer(120, "Melee", "Attack", direction, 1)
     end)
@@ -797,6 +1231,9 @@ local function sendMeleeSweep(entries)
                 if okHit then
                     sentHits = sentHits + 1
                     targetHitCount = targetHitCount + 1
+                    lastAutoHitAt = os.clock()
+                    automatedHitRequests = automatedHitRequests + 1
+                    lastAutoHitByModel[entry.model] = lastAutoHitAt
                 else
                     remoteErrors = remoteErrors + 1
                     recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
@@ -1182,6 +1619,69 @@ local function monitorCharacter(character)
     end)
 end
 
+local function monitorTool(tool)
+    if not tool or not tool:IsA("Tool") or monitoredTools[tool] then
+        return
+    end
+    monitoredTools[tool] = { connections = {} }
+    local toolPath = "unknown"
+    pcall(function() toolPath = tool:GetFullName() end)
+    recordEvent("WEAPON", "Tool diagnostic monitor attached", "Tool=" .. tostring(tool.Name)
+        .. " | Enabled=" .. tostring(tool.Enabled) .. " | Path=" .. toolPath)
+
+    local activatedOk, activatedConnection = pcall(function()
+        return tool.Activated:Connect(function()
+            nativeToolActivations = nativeToolActivations + 1
+            lastManualToolActivationAt = os.clock()
+            recordEvent("WEAPON", "Native Tool.Activated signal observed", "Tool=" .. tostring(tool.Name)
+                .. " | Count=" .. tostring(nativeToolActivations)
+                .. " | This indicates a native tool activation; it is not absolute proof of physical mouse input")
+        end)
+    end)
+    if activatedOk and activatedConnection then
+        table.insert(monitoredTools[tool].connections, activatedConnection)
+    elseif not activatedOk then
+        recordEvent("ERROR", "Tool.Activated monitor failed", "Tool=" .. tostring(tool.Name) .. " | Error=" .. tostring(activatedConnection))
+    end
+
+    local enabledOk, enabledConnection = pcall(function()
+        local previousEnabled = tool.Enabled
+        return tool:GetPropertyChangedSignal("Enabled"):Connect(function()
+            local currentEnabled = tool.Enabled
+            recordEvent("WEAPON", "Tool.Enabled changed", "Tool=" .. tostring(tool.Name)
+                .. " | Old=" .. tostring(previousEnabled) .. " | New=" .. tostring(currentEnabled))
+            previousEnabled = currentEnabled
+        end)
+    end)
+    if enabledOk and enabledConnection then
+        table.insert(monitoredTools[tool].connections, enabledConnection)
+    elseif not enabledOk then
+        recordEvent("ERROR", "Tool.Enabled monitor failed", "Tool=" .. tostring(tool.Name) .. " | Error=" .. tostring(enabledConnection))
+    end
+end
+
+local function monitorToolContainer(container)
+    if not container then
+        return
+    end
+    for _, child in ipairs(container:GetChildren()) do
+        monitorTool(child)
+    end
+    container.ChildAdded:Connect(function(child)
+        monitorTool(child)
+    end)
+end
+
+local function startToolMonitoring()
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then
+        backpack = LocalPlayer:WaitForChild("Backpack", 10)
+    end
+    monitorToolContainer(backpack)
+    monitorToolContainer(LocalPlayer.Character)
+    recordEvent("WEAPON", "Native tool activation monitoring active", "Monitoring Tool.Activated and Tool.Enabled changes; no input hooks")
+end
+
 local function hookPlayerGui()
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
     if not playerGui then
@@ -1455,11 +1955,19 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF1",
+            version = "1.0.1-HF4-DIAGNOSTICS",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
             alienKills = alienKills,
+            monitoredAlienModels = monitoredAlienModelsTotal,
+            alienHealthSourcesFound = alienHealthSourcesFound,
+            alienDamageEvents = alienDamageEvents,
+            alienDeathEvents = alienDeathEvents,
+            alienHealthUiEvents = alienHealthUiEvents,
+            nativeToolActivations = nativeToolActivations,
+            automatedAttackRequests = automatedAttackRequests,
+            automatedHitRequests = automatedHitRequests,
             tokenAttempts = tokenAttempts,
             tokenPickupsConfirmed = tokenPickupsConfirmed,
             rewardToastEstimate = rewardToastEstimate,
@@ -1571,6 +2079,7 @@ diagExportButton.Activated:Connect(exportDiagnostics)
 LocalPlayer.CharacterAdded:Connect(function(character)
     task.wait(1)
     monitorCharacter(character)
+    monitorToolContainer(character)
     recordEvent("PLAYER", "Character respawned", "Character=" .. tostring(character.Name))
     if running then
         setupFlight()
@@ -1580,6 +2089,8 @@ if LocalPlayer.Character then
     task.spawn(monitorCharacter, LocalPlayer.Character)
 end
 
+startAlienHealthMonitoring()
+startToolMonitoring()
 hookPlayerGui()
 
 -- Keep the compact HUD current without scanning the world every frame.
@@ -1638,6 +2149,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=integrated | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF4 health/activation monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
