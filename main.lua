@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF2 (TIMING + SCAN HOTFIX; BASELINE PRESERVED)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF3 (SURFACE-HIT COMBAT HOTFIX; BASELINE PRESERVED)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -54,7 +54,9 @@ local CONFIG = {
     ENGAGE_TIMEOUT = 18,
     NO_KILL_TIMEOUT = 6,
     MAX_HITS_PER_TARGET = 10,
-    MAX_HITS_PER_SWEEP = 36,
+    MAX_TARGETS_PER_SWEEP = 3,
+    MAX_HITS_PER_SWEEP = 30,
+    MELEE_HIT_MAX_DISTANCE = 10.5,
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -636,14 +638,47 @@ local function restoreMovement()
     activeHumanoid = nil
 end
 
+local function getSurfaceHit(part, origin)
+    if not part or not part.Parent or not origin then
+        return nil
+    end
+
+    -- The observer captured HitboxCaster sending a real contact position,
+    -- surface normal and material. HF1/HF2 instead sent part.Position and a
+    -- hard-coded upward normal, which is not equivalent to a surface hit.
+    local offset = part.Position - origin
+    if offset.Magnitude < 0.001 then
+        return nil
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = { part }
+    params.IgnoreWater = true
+
+    local castLength = offset.Magnitude + part.Size.Magnitude + 1
+    local result = Workspace:Raycast(origin, offset.Unit * castLength, params)
+    if not result or result.Instance ~= part then
+        return nil
+    end
+
+    return {
+        part = part,
+        position = result.Position,
+        normal = result.Normal,
+        material = result.Material,
+        distance = (result.Position - origin).Magnitude,
+    }
+end
+
 local function sendMeleeSweep(entries)
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
         return 0
     end
 
-    -- Equip the one starting weapon (the shovel in hotbar slot 1). Do not gate
-    -- on Tool.Enabled: Last Stop toggles that flag during its own cooldown.
+    -- Slot 1 is the only starting melee tool (the shovel). Keep it equipped,
+    -- but do not treat Tool.Enabled as proof that the server accepts damage.
     if not ensureToolEquipped() then
         setStatus("Waiting for starting shovel in hotbar slot 1")
         return 0
@@ -654,12 +689,52 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    local nearest = getNearestEntry(entries)
-    if not nearest or not nearest.root then
+    -- Build only plausible close-range contacts. The working capture showed
+    -- contact points within about 9 studs; HF2 was reporting parts 17-28 studs
+    -- away while standing under only one alien.
+    local candidates = {}
+    for _, entry in ipairs(entries) do
+        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
+            local part = getClosestHitPart(entry.model, root.Position)
+            if part and part.Parent then
+                local contact = getSurfaceHit(part, root.Position)
+                if contact and contact.distance <= CONFIG.MELEE_HIT_MAX_DISTANCE then
+                    contact.entry = entry
+                    table.insert(candidates, contact)
+                else
+                    recordThrottled(
+                        "melee-out-of-reach:" .. entry.model.Name,
+                        1,
+                        "COMBAT",
+                        "Alien skipped: no valid close surface contact",
+                        entry.variant .. "/" .. entry.model.Name .. " | Part=" .. part.Name
+                    )
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    local maxTargets = math.min(#candidates, CONFIG.MAX_TARGETS_PER_SWEEP)
+    if maxTargets == 0 then
+        recordThrottled(
+            "melee-no-valid-contact",
+            0.75,
+            "COMBAT",
+            "No valid melee contact in reach",
+            "No alien surface contact within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
+        )
         return 0
     end
 
-    local direction = nearest.root.Position - root.Position
+    -- Aim the Attack vector at the nearest actual surface contact, not the
+    -- alien HumanoidRootPart. The captured vector points from player root to
+    -- the first hit position.
+    local nearestContact = candidates[1]
+    local direction = nearestContact.position - root.Position
     if direction.Magnitude < 0.001 then
         direction = root.CFrame.LookVector
     else
@@ -674,66 +749,90 @@ local function sendMeleeSweep(entries)
         recordEvent("ERROR", "Melee Attack call failed locally", diagTraceback(attackError))
         return 0
     end
-    -- The captured working Auto Kill sequence sent its first Hit about 26 ms
-    -- after Attack. HF1 sent them back-to-back, which may miss the game's hit window.
+
     task.wait(CONFIG.MELEE_HIT_DELAY)
-    recordThrottled("melee-attack-dispatched", 0.25, "COMBAT", "Melee Attack request dispatched", string.format(
-        "Target=%s/%s | Tool=%s | ToolEnabled=%s | Interval=%.2fs | Server acceptance unknown",
-        nearest.variant, nearest.model.Name, equippedTool.Name, tostring(equippedTool.Enabled), CONFIG.ATTACK_INTERVAL
-    ))
+    recordThrottled(
+        "melee-attack-dispatched",
+        0.25,
+        "COMBAT",
+        "Melee Attack request dispatched",
+        string.format(
+            "Nearest=%s/%s | ContactPart=%s | ContactDistance=%.2f | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            nearestContact.entry.variant,
+            nearestContact.entry.model.Name,
+            nearestContact.part.Name,
+            nearestContact.distance,
+            equippedTool.Name,
+            tostring(equippedTool.Enabled)
+        )
+    )
 
     local sentHits = 0
-    for _, entry in ipairs(entries) do
+    for targetIndex = 1, maxTargets do
         if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
             break
         end
-        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
-            local targetDistance = (entry.root.Position - root.Position).Magnitude
-            if targetDistance <= CONFIG.ALIEN_ATTACK_RANGE then
-                local hitPart, partDistance = getClosestHitPart(entry.model, root.Position)
-                if hitPart and hitPart.Parent then
-                    local targetHitCount = 0
-                    for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
-                        if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
-                            break
-                        end
-                        if not hitPart.Parent then
-                            break
-                        end
-                        local okHit, hitError = pcall(function()
-                            ReplicaSignal:FireServer(
-                                120,
-                                "Melee",
-                                "Hit",
-                                hitPart,
-                                hitPart.Position,
-                                Vector3.new(0, 1, 0),
-                                hitPart.Material
-                            )
-                        end)
-                        if okHit then
-                            sentHits = sentHits + 1
-                            targetHitCount = targetHitCount + 1
-                        else
-                            remoteErrors = remoteErrors + 1
-                            recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
-                        end
-                    end
-                    if targetHitCount > 0 then
-                        recordThrottled("melee-hit-summary:" .. entry.model.Name, 0.5, "COMBAT", "Melee closest-part hits dispatched", string.format(
-                            "Target=%s/%s | Part=%s | Repeats=%d | PartDistance=%.1f | TargetDistance=%.1f | Local dispatch only; server damage unverified",
-                            entry.variant, entry.model.Name, hitPart.Name, targetHitCount,
-                            tonumber(partDistance) or -1, targetDistance
-                        ))
-                    end
-                else
-                    recordThrottled("no-hit-part:" .. entry.model.Name, 1, "COMBAT", "No valid alien body part found", entry.variant .. "/" .. entry.model.Name)
+
+        local contact = candidates[targetIndex]
+        local entry = contact.entry
+        if contact.part and contact.part.Parent and entry.model and entry.model.Parent then
+            local targetHitCount = 0
+            for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
+                if sentHits >= CONFIG.MAX_HITS_PER_SWEEP or not contact.part.Parent then
+                    break
                 end
+
+                local okHit, hitError = pcall(function()
+                    ReplicaSignal:FireServer(
+                        120,
+                        "Melee",
+                        "Hit",
+                        contact.part,
+                        contact.position,
+                        contact.normal,
+                        contact.material
+                    )
+                end)
+
+                if okHit then
+                    sentHits = sentHits + 1
+                    targetHitCount = targetHitCount + 1
+                else
+                    remoteErrors = remoteErrors + 1
+                    recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
+                end
+            end
+
+            if targetHitCount > 0 then
+                recordThrottled(
+                    "melee-hit-summary:" .. entry.model.Name,
+                    0.5,
+                    "COMBAT",
+                    "Melee surface hits dispatched",
+                    string.format(
+                        "Target=%s/%s | Part=%s | Repeats=%d | SurfaceDistance=%.2f | Normal=(%.2f, %.2f, %.2f) | Material=%s | Server damage unverified",
+                        entry.variant,
+                        entry.model.Name,
+                        contact.part.Name,
+                        targetHitCount,
+                        contact.distance,
+                        contact.normal.X,
+                        contact.normal.Y,
+                        contact.normal.Z,
+                        tostring(contact.material)
+                    )
+                )
             end
         end
     end
 
-    recordThrottled("melee-sweep-summary", 0.5, "COMBAT", "Attack sweep finished", "Closest-part hit requests without local error=" .. tostring(sentHits) .. " | Local call errors=" .. tostring(remoteErrors))
+    recordThrottled(
+        "melee-sweep-summary",
+        0.5,
+        "COMBAT",
+        "Attack sweep finished",
+        "Surface-hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
+    )
     return sentHits
 end
 
