@@ -1,5 +1,5 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF4.1 (OBSERVER COMPLETENESS; FARM BEHAVIOR PRESERVED)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.0 (OBSERVED SHOVEL HIT-SEQUENCE CORRECTION)
 Standalone experimental build for the Last Stop Roblox experience.
 
 Observed game structures used:
@@ -53,8 +53,8 @@ local CONFIG = {
     HOVER_BELOW = 6.5,
     ATTACK_INTERVAL = 0.05,
     MELEE_HIT_DELAY = 0.026, -- observed Attack -> first Hit delay in the working Auto Kill traffic
-    ENGAGE_TIMEOUT = 18,
-    NO_KILL_TIMEOUT = 6,
+    ENGAGE_TIMEOUT = 45,
+    NO_KILL_TIMEOUT = 8,
     MAX_HITS_PER_TARGET = 10,
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 30,
@@ -109,6 +109,7 @@ local alienHealthSourcesFound = 0
 local alienDamageEvents = 0
 local alienDeathEvents = 0
 local alienHealthUiEvents = 0
+local automatedDamageUiEvents = 0
 local monitoredTools = {}
 local nativeToolActivations = 0
 local automatedAttackRequests = 0
@@ -196,6 +197,12 @@ local function buildAlienHealthSnapshot()
             lastHealthDelta = record.lastHealthDelta,
             lastHealthSource = record.lastHealthSource,
             lastHealthAttribution = record.lastHealthAttribution,
+            lastUiDamageAt = record.lastUiDamageAt,
+            lastUiDamageDelta = record.lastUiDamageDelta,
+            lastUiDamageAttribution = record.lastUiDamageAttribution,
+            lastAutoUiDamageAt = record.lastAutoUiDamageAt,
+            lastAutoUiDamageDelta = record.lastAutoUiDamageDelta,
+            lastAutoUiDamageAttribution = record.lastAutoUiDamageAttribution,
             maxHealthSources = record.maxHealthSources or {},
             sources = sources,
         })
@@ -210,7 +217,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF4.1-OBSERVER",
+        "Version: 1.0.1-HF5.0-COMBAT",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -218,7 +225,7 @@ local function buildDiagnosticReport()
         "Alien kill notifications: " .. tostring(alienKills),
         "Alien monitors: " .. tostring(monitoredAlienModelsTotal) .. " | Numeric health sources: " .. tostring(alienHealthSourcesFound),
         "Alien health-source decrease signals: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
-        "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
+        "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Auto-correlated foreground damage events: " .. tostring(automatedDamageUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
         "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
@@ -257,10 +264,11 @@ local function buildDiagnosticReport()
             end
             table.sort(maxParts)
             table.insert(lines, string.format(
-                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | Max=%s | %s",
+                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | AutoUiDelta=%s | AutoUiAttribution=%s | Max=%s | %s",
                 npc.variant, npc.modelName, tostring(npc.inEntityContainer), npc.sourceCount, npc.uiSourceCount,
                 tostring(npc.deadSignal), tostring(npc.removed), tostring(npc.lastHealthValue),
                 tostring(npc.lastHealthDelta), tostring(npc.lastHealthAttribution),
+                tostring(npc.lastAutoUiDamageDelta), tostring(npc.lastAutoUiDamageAttribution),
                 #maxParts > 0 and table.concat(maxParts, "; ") or "unknown",
                 #sourceParts > 0 and table.concat(sourceParts, "; ") or "No numeric health source"
             ))
@@ -702,9 +710,35 @@ local function attachAlienHealthUi(record, instance)
                     local newHeight = newSize.Y.Scale + newSize.Y.Offset / 100000
                     alienHealthUiEvents = alienHealthUiEvents + 1
                     local direction = (newWidth < oldWidth or newHeight < oldHeight) and "shrunk (possible damage indicator)" or "changed"
-                    recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
-                        "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
-                        .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize) .. " | Path=" .. path)
+                    local widthDrop = oldWidth - newWidth
+                    local isForegroundHealthBar = string.lower(instance.Name) == "bar"
+                        and string.find(string.lower(path), "healthbar.frame.bar", 1, true) ~= nil
+
+                    if isForegroundHealthBar and widthDrop > 0.001 then
+                        local attribution = getAlienDamageAttribution(record.model)
+                        record.lastUiDamageAt = os.clock()
+                        record.lastUiDamageDelta = widthDrop
+                        record.lastUiDamageAttribution = attribution
+                        if string.find(attribution, "Farmer sent a Hit request", 1, true) ~= nil then
+                            record.lastAutoUiDamageAt = record.lastUiDamageAt
+                            record.lastAutoUiDamageDelta = widthDrop
+                            record.lastAutoUiDamageAttribution = attribution
+                            automatedDamageUiEvents = automatedDamageUiEvents + 1
+                            recordEvent("DAMAGE_UI", "Alien foreground health bar decreased after farmer Hit request", string.format(
+                                "Variant=%s | Model=%s | WidthDrop=%.5f | OldWidth=%.5f | NewWidth=%.5f | Attribution=%s | Path=%s",
+                                tostring(record.variant), tostring(record.model.Name), widthDrop, oldWidth, newWidth, attribution, path
+                            ))
+                        else
+                            recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
+                                "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
+                                .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize)
+                                .. " | Attribution=" .. attribution .. " | Path=" .. path)
+                        end
+                    else
+                        recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
+                            "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
+                            .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize) .. " | Path=" .. path)
+                    end
                     previousSize = newSize
                 end
             end)
@@ -889,6 +923,12 @@ local function monitorAlienModel(model)
         lastHealthSource = nil,
         lastHealthAttribution = nil,
         lastHealthChangeAt = nil,
+        lastUiDamageAt = nil,
+        lastUiDamageDelta = nil,
+        lastUiDamageAttribution = nil,
+        lastAutoUiDamageAt = nil,
+        lastAutoUiDamageDelta = nil,
+        lastAutoUiDamageAttribution = nil,
     }
     monitoredAliens[model] = record
     monitoredAlienModelsTotal = monitoredAlienModelsTotal + 1
@@ -978,23 +1018,16 @@ local function startAlienHealthMonitoring()
         .. tostring(monitoredAlienModelsTotal) .. " | Mode=Humanoid/attributes/ValueBase/HealthBar UI/despawn observation")
 end
 
-local function getClosestHitPart(model, origin)
+local function getPreferredMeleePart(model, origin)
     if not model or not origin then
         return nil, nil
     end
 
-    -- Match the working Auto Kill's "Closest" body-part selection.
-    -- Valid targets are the rig's standard body parts or geometry under Dress/AlienTypeX.
-    local rigBodyNames = {
-        ["Head"] = true,
-        ["Torso"] = true,
-        ["UpperTorso"] = true,
-        ["LowerTorso"] = true,
-        ["Right Arm"] = true,
-        ["Left Arm"] = true,
-        ["Right Leg"] = true,
-        ["Left Leg"] = true,
-    }
+    -- The working capture hit torso mesh geometry and arms, not the legs.
+    -- Select one plausible shovel contact per alien instead of choosing the
+    -- geometrically closest limb from a player root positioned below it.
+    local bestPart = nil
+    local bestDistance = math.huge
     local blockedNames = {
         ["humanoidrootpart"] = true,
         ["entitydetector"] = true,
@@ -1004,13 +1037,13 @@ local function getClosestHitPart(model, origin)
         ["hitbox"] = true,
     }
 
-    local bestPart = nil
-    local bestDistance = math.huge
     for _, descendant in ipairs(model:GetDescendants()) do
         if descendant:IsA("BasePart") then
             local lowerName = string.lower(descendant.Name)
             local blocked = blockedNames[lowerName] == true
+            local preferredAncestor = false
             local ancestor = descendant.Parent
+
             while ancestor and ancestor ~= model do
                 if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
                     blocked = true
@@ -1021,12 +1054,22 @@ local function getClosestHitPart(model, origin)
                     blocked = true
                     break
                 end
+                if ancestorName == "torso" or ancestorName == "right arm" or ancestorName == "left arm" or ancestorName == "head" or ancestorName == "uppertorso" or ancestorName == "lowertorso" then
+                    preferredAncestor = true
+                end
                 ancestor = ancestor.Parent
             end
 
+            local isRigBody = lowerName == "head"
+                or lowerName == "torso"
+                or lowerName == "uppertorso"
+                or lowerName == "lowertorso"
+                or lowerName == "right arm"
+                or lowerName == "left arm"
             local fullPath = string.lower(descendant:GetFullName())
-            local isRigBody = rigBodyNames[descendant.Name] == true
-            local isAlienDressGeometry = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
+            local isAlienDressGeometry = preferredAncestor
+                and string.find(fullPath, ".dress.alientype", 1, true) ~= nil
+
             if not blocked and (isRigBody or isAlienDressGeometry) then
                 local distance = (descendant.Position - origin).Magnitude
                 if distance < bestDistance then
@@ -1241,47 +1284,14 @@ local function restoreMovement()
     activeHumanoid = nil
 end
 
-local function getSurfaceHit(part, origin)
-    if not part or not part.Parent or not origin then
-        return nil
-    end
-
-    -- The observer captured HitboxCaster sending a real contact position,
-    -- surface normal and material. HF1/HF2 instead sent part.Position and a
-    -- hard-coded upward normal, which is not equivalent to a surface hit.
-    local offset = part.Position - origin
-    if offset.Magnitude < 0.001 then
-        return nil
-    end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Include
-    params.FilterDescendantsInstances = { part }
-    params.IgnoreWater = true
-
-    local castLength = offset.Magnitude + part.Size.Magnitude + 1
-    local result = Workspace:Raycast(origin, offset.Unit * castLength, params)
-    if not result or result.Instance ~= part then
-        return nil
-    end
-
-    return {
-        part = part,
-        position = result.Position,
-        normal = result.Normal,
-        material = result.Material,
-        distance = (result.Position - origin).Magnitude,
-    }
-end
-
 local function sendMeleeSweep(entries)
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
         return 0
     end
 
-    -- Slot 1 is the only starting melee tool (the shovel). Keep it equipped,
-    -- but do not treat Tool.Enabled as proof that the server accepts damage.
+    -- Last Stop's only starting weapon is the shovel in hotbar slot 1.
+    -- Tool.Enabled is recorded for diagnostics but is not used as an attack gate.
     if not ensureToolEquipped() then
         setStatus("Waiting for starting shovel in hotbar slot 1")
         return 0
@@ -1292,27 +1302,27 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    -- Build only plausible close-range contacts. The working capture showed
-    -- contact points within about 9 studs; HF2 was reporting parts 17-28 studs
-    -- away while standing under only one alien.
     local candidates = {}
     for _, entry in ipairs(entries) do
         if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
-            local part = getClosestHitPart(entry.model, root.Position)
-            if part and part.Parent then
-                local contact = getSurfaceHit(part, root.Position)
-                if contact and contact.distance <= CONFIG.MELEE_HIT_MAX_DISTANCE then
-                    contact.entry = entry
-                    table.insert(candidates, contact)
-                else
-                    recordThrottled(
-                        "melee-out-of-reach:" .. entry.model.Name,
-                        1,
-                        "COMBAT",
-                        "Alien skipped: no valid close surface contact",
-                        entry.variant .. "/" .. entry.model.Name .. " | Part=" .. part.Name
-                    )
-                end
+            local part, distance = getPreferredMeleePart(entry.model, root.Position)
+            if part and part.Parent and distance <= CONFIG.MELEE_HIT_MAX_DISTANCE then
+                table.insert(candidates, {
+                    entry = entry,
+                    part = part,
+                    distance = distance,
+                    position = part.Position,
+                    normal = Vector3.new(0, 1, 0),
+                    material = part.Material,
+                })
+            else
+                recordThrottled(
+                    "melee-no-preferred-contact:" .. entry.model.Name,
+                    1,
+                    "COMBAT",
+                    "Alien skipped: no torso/arm shovel contact in reach",
+                    entry.variant .. "/" .. entry.model.Name .. " | Distance=" .. tostring(distance)
+                )
             end
         end
     end
@@ -1327,15 +1337,14 @@ local function sendMeleeSweep(entries)
             "melee-no-valid-contact",
             0.75,
             "COMBAT",
-            "No valid melee contact in reach",
-            "No alien surface contact within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
+            "No valid shovel contact in reach",
+            "No torso/arm/head contact within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
         )
         return 0
     end
 
-    -- Aim the Attack vector at the nearest actual surface contact, not the
-    -- alien HumanoidRootPart. The captured vector points from player root to
-    -- the first hit position.
+    -- Aim at the first selected body contact. The observer capture shows the
+    -- Attack direction leading to the first Hit part, followed by Hit calls.
     local nearestContact = candidates[1]
     local direction = nearestContact.position - root.Position
     if direction.Magnitude < 0.001 then
@@ -1355,6 +1364,8 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
+    -- The captured working sequence had approximately 26 ms between Attack
+    -- and the first Hit event.
     task.wait(CONFIG.MELEE_HIT_DELAY)
     recordThrottled(
         "melee-attack-dispatched",
@@ -1388,14 +1399,16 @@ local function sendMeleeSweep(entries)
                 end
 
                 local okHit, hitError = pcall(function()
+                    -- Match the captured Hit payload: actual body part, its
+                    -- Position, upward normal, and that part's Material.
                     ReplicaSignal:FireServer(
                         120,
                         "Melee",
                         "Hit",
                         contact.part,
-                        contact.position,
-                        contact.normal,
-                        contact.material
+                        contact.part.Position,
+                        Vector3.new(0, 1, 0),
+                        contact.part.Material
                     )
                 end)
 
@@ -1416,18 +1429,17 @@ local function sendMeleeSweep(entries)
                     "melee-hit-summary:" .. entry.model.Name,
                     0.5,
                     "COMBAT",
-                    "Melee surface hits dispatched",
+                    "Melee body hits dispatched",
                     string.format(
-                        "Target=%s/%s | Part=%s | Repeats=%d | SurfaceDistance=%.2f | Normal=(%.2f, %.2f, %.2f) | Material=%s | Server damage unverified",
+                        "Target=%s/%s | Part=%s | Repeats=%d | PartPosition=(%.2f, %.2f, %.2f) | Normal=(0, 1, 0) | Material=%s | Server damage unverified",
                         entry.variant,
                         entry.model.Name,
                         contact.part.Name,
                         targetHitCount,
-                        contact.distance,
-                        contact.normal.X,
-                        contact.normal.Y,
-                        contact.normal.Z,
-                        tostring(contact.material)
+                        contact.part.Position.X,
+                        contact.part.Position.Y,
+                        contact.part.Position.Z,
+                        tostring(contact.part.Material)
                     )
                 )
             end
@@ -1439,7 +1451,7 @@ local function sendMeleeSweep(entries)
         0.5,
         "COMBAT",
         "Attack sweep finished",
-        "Surface-hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
+        "Body-hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
     )
     return sentHits
 end
@@ -1575,7 +1587,7 @@ local function engageAliens(seedEntries)
         moveBelowAlien(nearest)
         local hits = sendMeleeSweep(entries)
         if hits > 0 then
-            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " hit parts")
+            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " Hit requests")
         else
             setStatus("Alien target found; no hit parts available")
         end
@@ -1583,6 +1595,36 @@ local function engageAliens(seedEntries)
         if alienKills > startKillCount then
             lastProgressTime = os.clock()
             startKillCount = alienKills
+        end
+
+        -- Health bars are custom UI in this game. Count a foreground Bar
+        -- decrease as progress only when it follows this farmer's Hit request
+        -- and is not temporally mixed with manual input.
+        local latestAutoUiDamage = nil
+        for _, entry in ipairs(entries) do
+            local healthRecord = monitoredAliens[entry.model]
+            if healthRecord and healthRecord.lastAutoUiDamageAt
+                and healthRecord.lastAutoUiDamageAt > lastProgressTime then
+                if not latestAutoUiDamage or healthRecord.lastAutoUiDamageAt > latestAutoUiDamage.at then
+                    latestAutoUiDamage = {
+                        at = healthRecord.lastAutoUiDamageAt,
+                        model = entry.model,
+                        variant = entry.variant,
+                        delta = healthRecord.lastAutoUiDamageDelta,
+                    }
+                end
+            end
+        end
+        if latestAutoUiDamage then
+            lastProgressTime = latestAutoUiDamage.at
+            recordThrottled(
+                "auto-ui-progress:" .. latestAutoUiDamage.model.Name,
+                0.5,
+                "COMBAT",
+                "Automated health-bar progress observed",
+                string.format("Target=%s/%s | ForegroundWidthDrop=%.5f | ProgressTimerReset=true | Timing correlation, not server-side health proof",
+                    latestAutoUiDamage.variant, latestAutoUiDamage.model.Name, tonumber(latestAutoUiDamage.delta) or 0)
+            )
         end
 
         if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
@@ -1638,8 +1680,9 @@ local function mainLoop()
         scanZ = CONFIG.SCAN_START_Z + math.floor((initialRoot.Position.Z - CONFIG.SCAN_START_Z) / CONFIG.SCAN_STEP) * CONFIG.SCAN_STEP
     end
 
+    local pendingClusterCenter = nil
     setStatus("Automatic farming started")
-    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
+    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_WAIT))
 
     while running do
         waitWhilePaused()
@@ -1657,37 +1700,62 @@ local function mainLoop()
             task.wait(1)
         else
             setupFlight()
-            local scanPosition = getCurrentScanPosition()
-            moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1), "SCAN_POINT")
-            task.wait(0.25)
 
-            local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
-            if #aliens > 0 then
-                local variantCounts = {AlienType1 = 0, AlienType2 = 0, AlienType3 = 0}
-                for _, entry in ipairs(aliens) do
-                    variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
-                end
-                recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
-                setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
-                local clusterCleared = engageAliens(aliens)
-                if running and not paused then
-                    if clusterCleared then
+            if pendingClusterCenter then
+                -- Do not teleport back to the scan waypoint while living
+                -- aliens remain. Resume the same cluster from the current
+                -- safe-hover position and only advance after it is cleared.
+                local pendingAliens = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                if #pendingAliens == 0 then
+                    recordEvent("TARGET", "Pending alien cluster cleared", "No AlienType1/2/3 models remain within the active scan radius")
+                    pendingClusterCenter = nil
+                    advanceScan()
+                else
+                    recordEvent("TARGET", "Retrying active alien cluster in place", "RemainingInScanRadius=" .. tostring(#pendingAliens) .. " | Scan-point teleport suppressed")
+                    local passCleared = engageAliens(pendingAliens)
+                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                    if passCleared and #stillPending == 0 then
+                        pendingClusterCenter = nil
                         advanceScan()
                     else
-                        setStatus("Aliens remain; retrying current cluster")
+                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
                         task.wait(0.5)
                     end
                 end
             else
-                recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
-                local looseTokens = getAlienTokenPrompts(scanPosition, 80)
-                if #looseTokens > 0 then
-                    recordEvent("TOKEN", "Loose Alien Tokens found during scan", "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
-                    setStatus("Loose Alien Tokens detected")
-                    local collected = collectTokensAround(scanPosition, 100)
-                    recordEvent("TOKEN", "Loose-token collection pass finished", "ConfirmedThisPass=" .. tostring(collected))
+                local scanPosition = getCurrentScanPosition()
+                moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1), "SCAN_POINT")
+                task.wait(0.25)
+
+                local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
+                if #aliens > 0 then
+                    local variantCounts = {AlienType1 = 0, AlienType2 = 0, AlienType3 = 0}
+                    for _, entry in ipairs(aliens) do
+                        variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
+                    end
+                    pendingClusterCenter = scanPosition
+                    recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
+                    setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
+                    local passCleared = engageAliens(aliens)
+                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                    if passCleared and #stillPending == 0 then
+                        pendingClusterCenter = nil
+                        advanceScan()
+                    else
+                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
+                        task.wait(0.5)
+                    end
+                else
+                    recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
+                    local looseTokens = getAlienTokenPrompts(scanPosition, 80)
+                    if #looseTokens > 0 then
+                        recordEvent("TOKEN", "Loose Alien Tokens found during scan", "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
+                        setStatus("Loose Alien Tokens detected")
+                        local collected = collectTokensAround(scanPosition, 100)
+                        recordEvent("TOKEN", "Loose-token collection pass finished", "ConfirmedThisPass=" .. tostring(collected))
+                    end
+                    advanceScan()
                 end
-                advanceScan()
             end
         end
 
@@ -2296,7 +2364,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF4.1-OBSERVER",
+            version = "1.0.1-HF5.0-COMBAT",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2306,6 +2374,7 @@ local function exportDiagnostics()
             alienDamageEvents = alienDamageEvents,
             alienDeathEvents = alienDeathEvents,
             alienHealthUiEvents = alienHealthUiEvents,
+            automatedDamageUiEvents = automatedDamageUiEvents,
             nativeToolActivations = nativeToolActivations,
             automatedAttackRequests = automatedAttackRequests,
             automatedHitRequests = automatedHitRequests,
@@ -2502,6 +2571,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF4.1 health/input/movement monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.0 combat/health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
