@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.8 (MEASURED SAFE HOVER + CAPTURED HIT PAYLOAD)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.9 (TORSO-PRIORITY + HORIZONTAL APPROACH)
 Standalone experimental build for the Last Stop Roblox experience.
-HF5.8 uses the measured 9.7-stud physical under-target position, normal character-follow camera, and captured melee Hit payload.
+HF5.9 preserves the measured 9.7-stud vertical offset, approaches the torso anchor from the scan-side horizontally, and prioritizes torso hit parts over legs.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -51,7 +51,9 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50,
-    HOVER_BELOW = 9.7, -- measured player-root vertical offset below alien root in original observer capture
+    HOVER_BELOW = 9.7, -- preserve the measured player-root vertical offset below alien root
+    TORSO_HORIZONTAL_STANDOFF = 4.8, -- horizontal approach distance to the preferred torso anchor
+    MELEE_ATTACK_VERTICAL_BIAS = 0.19, -- small upward component observed in the original attack direction
     ATTACK_INTERVAL = 0.05,
     MELEE_HIT_DELAY = 0.026, -- observed Attack -> first Hit delay in the working Auto Kill traffic
     ENGAGE_TIMEOUT = 45,
@@ -219,7 +221,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF5.8-MEASURED-SAFE-HOVER-CAPTURED-HITS",
+        "Version: 1.0.1-HF5.9-TORSO-PRIORITY-HORIZONTAL-APPROACH",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -1020,25 +1022,12 @@ local function startAlienHealthMonitoring()
         .. tostring(monitoredAlienModelsTotal) .. " | Mode=Humanoid/attributes/ValueBase/HealthBar UI/despawn observation")
 end
 
-local function getClosestMeleeContact(model, origin, maxDistance)
-    if not model or not origin then
+local function classifyAlienHitPart(part, model)
+    if not part or not part:IsA("BasePart") or not model then
         return nil
     end
 
-    -- The supplied working Auto Kill capture sends the BasePart itself,
-    -- part.Position, Vector3.new(0, 1, 0), and part.Material. It hits torso
-    -- meshes (including Cylinder.008), arms, head, and legs. Do not replace
-    -- those captured values with raycast surface points or surface normals.
-    local rigBodyNames = {
-        ["head"] = true,
-        ["torso"] = true,
-        ["uppertorso"] = true,
-        ["lowertorso"] = true,
-        ["right arm"] = true,
-        ["left arm"] = true,
-        ["right leg"] = true,
-        ["left leg"] = true,
-    }
+    local lowerName = string.lower(part.Name)
     local blockedNames = {
         ["humanoidrootpart"] = true,
         ["entitydetector"] = true,
@@ -1047,48 +1036,140 @@ local function getClosestMeleeContact(model, origin, maxDistance)
         ["blade"] = true,
         ["hitbox"] = true,
     }
+    if blockedNames[lowerName] then
+        return nil
+    end
 
-    local bestContact = nil
+    local ancestor = part.Parent
+    while ancestor and ancestor ~= model do
+        if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
+            return nil
+        end
+        local ancestorName = string.lower(ancestor.Name)
+        if ancestorName == "sword" or ancestorName == "blade"
+            or ancestorName == "weapon" or ancestorName == "accessories" then
+            return nil
+        end
+        ancestor = ancestor.Parent
+    end
+
+    local fullPath = string.lower(part:GetFullName())
+    local inAlienDress = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
+    local inTorsoFolder = inAlienDress and string.find(fullPath, ".torso.", 1, true) ~= nil
+
+    -- Exact torso meshes captured by the observer get first priority.
+    if lowerName == "cylinder.008" or lowerName == "alien.008" then
+        return 0, "TORSO_MESH"
+    end
+    if inTorsoFolder or lowerName == "torso" or lowerName == "uppertorso" or lowerName == "lowertorso" then
+        return 1, "TORSO"
+    end
+    if lowerName == "right arm" or lowerName == "left arm"
+        or lowerName == "head" or lowerName == "upperarm" or lowerName == "lowerarm" then
+        return 2, lowerName == "head" and "HEAD" or "ARM"
+    end
+    if lowerName == "right leg" or lowerName == "left leg"
+        or lowerName == "upperleg" or lowerName == "lowerleg" then
+        return 3, "LEG"
+    end
+    return nil
+end
+
+local function getPreferredTorsoAnchor(model)
+    if not model then
+        return nil
+    end
+    local modelRoot = getModelRoot(model)
+    local origin = modelRoot and modelRoot.Position or Vector3.zero
+    local bestPart = nil
+    local bestPriority = math.huge
+    local bestDistance = math.huge
+
     for _, descendant in ipairs(model:GetDescendants()) do
-        if descendant:IsA("BasePart") then
-            local lowerName = string.lower(descendant.Name)
-            local blocked = blockedNames[lowerName] == true
-            local ancestor = descendant.Parent
-            while ancestor and ancestor ~= model do
-                if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
-                    blocked = true
-                    break
+        local priority, partClass = classifyAlienHitPart(descendant, model)
+        if priority ~= nil and priority <= 1 then
+            local distance = (descendant.Position - origin).Magnitude
+            if priority < bestPriority or (priority == bestPriority and distance < bestDistance) then
+                bestPart = descendant
+                bestPriority = priority
+                bestDistance = distance
+            end
+        end
+    end
+    return bestPart
+end
+
+local function getClosestMeleeContact(model, origin, maxDistance)
+    if not model or not origin then
+        return nil
+    end
+
+    -- Select by body-part class first, not just nearest center. The HF5.9
+    -- distance-only selector repeatedly chose a leg while torso meshes existed.
+    -- Priority: captured torso meshes, torso parts, arms/head, then legs.
+    local bestContact = nil
+    local counts = { torso = 0, armHead = 0, leg = 0 }
+    local nearestTorsoDistance = nil
+    local nearestArmHeadDistance = nil
+    local nearestLegDistance = nil
+
+    for _, descendant in ipairs(model:GetDescendants()) do
+        local priority, partClass = classifyAlienHitPart(descendant, model)
+        if priority ~= nil then
+            local partPosition = descendant.Position
+            local distance = (partPosition - origin).Magnitude
+            if priority <= 1 then
+                counts.torso = counts.torso + 1
+                if not nearestTorsoDistance or distance < nearestTorsoDistance then
+                    nearestTorsoDistance = distance
                 end
-                local ancestorName = string.lower(ancestor.Name)
-                if ancestorName == "sword" or ancestorName == "blade"
-                    or ancestorName == "weapon" or ancestorName == "accessories" then
-                    blocked = true
-                    break
+            elseif priority == 2 then
+                counts.armHead = counts.armHead + 1
+                if not nearestArmHeadDistance or distance < nearestArmHeadDistance then
+                    nearestArmHeadDistance = distance
                 end
-                ancestor = ancestor.Parent
+            else
+                counts.leg = counts.leg + 1
+                if not nearestLegDistance or distance < nearestLegDistance then
+                    nearestLegDistance = distance
+                end
             end
 
-            local fullPath = string.lower(descendant:GetFullName())
-            local isRigBody = rigBodyNames[lowerName] == true
-            local isAlienTorsoGeometry = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
-                and string.find(fullPath, ".torso.", 1, true) ~= nil
-            if not blocked and (isRigBody or isAlienTorsoGeometry) then
-                local partPosition = descendant.Position
-                local distance = (partPosition - origin).Magnitude
-                if (maxDistance == nil or distance <= maxDistance)
-                    and (not bestContact or distance < bestContact.distance) then
+            if (maxDistance == nil or distance <= maxDistance) then
+                if not bestContact
+                    or priority < bestContact.priority
+                    or (priority == bestContact.priority and distance < bestContact.distance) then
                     bestContact = {
                         part = descendant,
                         position = partPosition,
                         normal = Vector3.new(0, 1, 0),
                         material = descendant.Material,
                         distance = distance,
+                        priority = priority,
+                        partClass = partClass,
                     }
                 end
             end
         end
     end
 
+    local selected = bestContact and (bestContact.part.Name .. "/" .. bestContact.partClass) or "none"
+    recordThrottled(
+        "melee-hitbox-audit:" .. tostring(model.Name),
+        0.75,
+        "COMBAT",
+        "Alien hitbox priority audit",
+        string.format(
+            "Target=%s | TorsoParts=%d | ArmHeadParts=%d | LegParts=%d | NearestTorso=%s | NearestArmHead=%s | NearestLeg=%s | Selected=%s | SelectedPriority=%s | MaxDistance=%.1f",
+            tostring(model.Name), counts.torso, counts.armHead, counts.leg,
+            nearestTorsoDistance and string.format("%.2f", nearestTorsoDistance) or "none",
+            nearestArmHeadDistance and string.format("%.2f", nearestArmHeadDistance) or "none",
+            nearestLegDistance and string.format("%.2f", nearestLegDistance) or "none",
+            selected,
+            bestContact and tostring(bestContact.priority) or "none",
+            tonumber(maxDistance) or 0
+        )
+    )
     return bestContact
 end
 
@@ -1280,26 +1361,61 @@ local function moveBelowAlien(entry)
     if not entry or not entry.root or not entry.root.Parent then
         return false
     end
-    local targetPosition = entry.root.Position
-    local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
-    currentTarget = entry.variant .. " / " .. entry.model.Name
+
+    local targetRootPosition = entry.root.Position
+    local torsoAnchor = getPreferredTorsoAnchor(entry.model)
+    local anchorPosition = torsoAnchor and torsoAnchor.Position or targetRootPosition
     local _, playerRoot = getCharacter()
-    local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
-    local moved = moveCharacter(hoverPosition, targetPosition, "SAFE_HOVER_BELOW_ALIEN")
+    if not playerRoot then
+        return false
+    end
+
+    -- Approach from the horizontal direction the player was already travelling
+    -- toward the target. This keeps the measured vertical offset while avoiding
+    -- the exact same X/Z line that made the leg centers win every selection.
+    local approachVector = Vector3.new(
+        anchorPosition.X - playerRoot.Position.X,
+        0,
+        anchorPosition.Z - playerRoot.Position.Z
+    )
+    if approachVector.Magnitude < 0.001 then
+        local fallbackLook = entry.root.CFrame.LookVector
+        approachVector = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
+    end
+    if approachVector.Magnitude < 0.001 then
+        approachVector = Vector3.new(0, 0, -1)
+    else
+        approachVector = approachVector.Unit
+    end
+
+    local hoverPosition = Vector3.new(
+        anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
+        targetRootPosition.Y - CONFIG.HOVER_BELOW,
+        anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
+    )
+    local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
+    currentTarget = entry.variant .. " / " .. entry.model.Name
+    local beforeDistance = (playerRoot.Position - anchorPosition).Magnitude
+    local moved = moveCharacter(hoverPosition, horizontalLookAt, "SAFE_HOVER_TORSO_APPROACH")
     local _, actualRoot = getCharacter()
     local actualPosition = actualRoot and actualRoot.Position or hoverPosition
-    local actualOffset = actualPosition.Y - targetPosition.Y
-    local actualDistance = (actualPosition - targetPosition).Magnitude
+    local actualOffset = actualPosition.Y - targetRootPosition.Y
+    local actualRootDistance = (actualPosition - targetRootPosition).Magnitude
+    local actualAnchorDistance = (actualPosition - anchorPosition).Magnitude
     local camera = Workspace.CurrentCamera
     local cameraType = camera and tostring(camera.CameraType) or "unknown"
-    recordEvent("TARGET", "Physical safe-hover positioning requested", string.format(
-        "Variant=%s | Model=%s | TargetRoot=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualVerticalOffset=%.2f | ActualRootDistance=%.2f | HoverBelow=%.2f | PreviousDistance=%.2f | CharacterMove=%s | CameraType=%s | Camera=normal character-follow",
+
+    recordEvent("TARGET", "Torso-relative safe-hover positioning requested", string.format(
+        "Variant=%s | Model=%s | TargetRoot=(%.2f, %.2f, %.2f) | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelow=%.2f | PreviousAnchorDistance=%.2f | CharacterMove=%s | CameraType=%s",
         entry.variant, entry.model.Name,
-        targetPosition.X, targetPosition.Y, targetPosition.Z,
+        targetRootPosition.X, targetRootPosition.Y, targetRootPosition.Z,
+        torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
+        anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
         hoverPosition.X, hoverPosition.Y, hoverPosition.Z,
         actualPosition.X, actualPosition.Y, actualPosition.Z,
-        actualOffset, actualDistance, CONFIG.HOVER_BELOW, beforeDistance,
-        tostring(moved), cameraType
+        actualOffset, actualRootDistance, actualAnchorDistance,
+        CONFIG.TORSO_HORIZONTAL_STANDOFF, approachVector.X, approachVector.Z,
+        CONFIG.HOVER_BELOW, beforeDistance, tostring(moved), cameraType
     ))
     return moved
 end
@@ -1348,6 +1464,9 @@ local function sendMeleeSweep(entries)
         setStatus("Starting shovel is not equipped")
         return 0
     end
+    if not equippedTool.Enabled then
+        recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF5.9 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
+    end
 
     local candidates = {}
     for _, entry in ipairs(entries) do
@@ -1369,6 +1488,9 @@ local function sendMeleeSweep(entries)
     end
 
     table.sort(candidates, function(a, b)
+        if a.priority ~= b.priority then
+            return a.priority < b.priority
+        end
         return a.distance < b.distance
     end)
 
@@ -1387,12 +1509,22 @@ local function sendMeleeSweep(entries)
     -- Aim at the first selected body contact. The observer capture shows the
     -- Attack direction leading to the first Hit part, followed by Hit calls.
     local nearestContact = candidates[1]
-    local direction = nearestContact.position - root.Position
-    if direction.Magnitude < 0.001 then
-        direction = root.CFrame.LookVector
-    else
-        direction = direction.Unit
+    local contactDelta = nearestContact.position - root.Position
+    local horizontalDirection = Vector3.new(contactDelta.X, 0, contactDelta.Z)
+    if horizontalDirection.Magnitude < 0.001 then
+        local fallbackLook = root.CFrame.LookVector
+        horizontalDirection = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
     end
+    if horizontalDirection.Magnitude < 0.001 then
+        horizontalDirection = Vector3.new(0, 0, -1)
+    else
+        horizontalDirection = horizontalDirection.Unit
+    end
+    local direction = Vector3.new(
+        horizontalDirection.X,
+        CONFIG.MELEE_ATTACK_VERTICAL_BIAS,
+        horizontalDirection.Z
+    ).Unit
 
     lastAutoAttackAt = os.clock()
     automatedAttackRequests = automatedAttackRequests + 1
@@ -1414,13 +1546,16 @@ local function sendMeleeSweep(entries)
         "COMBAT",
         "Melee Attack request dispatched",
         string.format(
-            "Nearest=%s/%s | HitPart=%s | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | Direction=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | SwingDirection=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
             nearestContact.entry.variant,
             nearestContact.entry.model.Name,
             nearestContact.part.Name,
+            nearestContact.partClass or "UNKNOWN",
+            nearestContact.priority or 99,
             nearestContact.part:GetFullName(),
             nearestContact.distance,
             nearestContact.position.X, nearestContact.position.Y, nearestContact.position.Z,
+            contactDelta.X, contactDelta.Y, contactDelta.Z,
             tostring(nearestContact.material),
             root.Position.X, root.Position.Y, root.Position.Z,
             direction.X, direction.Y, direction.Z,
@@ -1477,10 +1612,12 @@ local function sendMeleeSweep(entries)
                     "COMBAT",
                     "Melee part hits dispatched",
                     string.format(
-                        "Target=%s/%s | Part=%s | Repeats=%d | PartPosition=(%.2f, %.2f, %.2f) | Normal=(0, 1, 0) | Material=%s | Server damage unverified",
+                        "Target=%s/%s | Part=%s | PartClass=%s | Priority=%d | Repeats=%d | PartPosition=(%.2f, %.2f, %.2f) | Normal=(0, 1, 0) | Material=%s | Server damage unverified",
                         entry.variant,
                         entry.model.Name,
                         contact.part.Name,
+                        contact.partClass or "UNKNOWN",
+                        contact.priority or 99,
                         targetHitCount,
                         contact.part.Position.X,
                         contact.part.Position.Y,
@@ -2410,7 +2547,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF5.8-MEASURED-SAFE-HOVER-CAPTURED-HITS",
+            version = "1.0.1-HF5.9-TORSO-PRIORITY-HORIZONTAL-APPROACH",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2617,6 +2754,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.8 measured-9.7-stud-under-target-hover/normal-camera/captured-hit-payload/health/input/movement monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.9 measured-9.7-stud-vertical-hover/torso-priority/horizontal-approach/captured-hit-payload/health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
