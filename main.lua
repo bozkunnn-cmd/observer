@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.5 (CAMERA-SPLIT SAFE HOVER + TORSO/ARM CONTACT)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.6 (PHYSICAL SAFE HOVER + CAPTURED HIT PAYLOAD)
 Standalone experimental build for the Last Stop Roblox experience.
-HF5.5 separates the under-alien camera position from the character melee position.
+HF5.6 restores physical under-alien hover and reproduces the captured melee Hit payload.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -51,17 +51,15 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50,
-    HOVER_BELOW = 6.5, -- camera-only safe view offset below the alien root
-    MELEE_STANDOFF = 4.8, -- based on the captured working side/front attack position
-    MELEE_ROOT_BELOW_CONTACT = 0.9, -- captured player-root to hit-contact vertical offset
+    HOVER_BELOW = 6.5, -- physical character hover below the alien root
     ATTACK_INTERVAL = 0.05,
     MELEE_HIT_DELAY = 0.026, -- observed Attack -> first Hit delay in the working Auto Kill traffic
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
     MAX_HITS_PER_TARGET = 10,
-    MAX_TARGETS_PER_SWEEP = 3,
-    MAX_HITS_PER_SWEEP = 30,
-    MELEE_HIT_MAX_DISTANCE = 10.5,
+    MAX_TARGETS_PER_SWEEP = 5,
+    MAX_HITS_PER_SWEEP = 50,
+    MELEE_HIT_MAX_DISTANCE = 50, -- matches the observed 50-stud attack radius
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -221,7 +219,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF5.5-CAMERA-SPLIT",
+        "Version: 1.0.1-HF5.6-PHYSICAL-HOVER-CAPTURED-HITS",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -233,7 +231,7 @@ local function buildDiagnosticReport()
         "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
-        "Camera/root offset is informational only; under-alien safety camera positioning is intentional and is not classified as an error.",
+        "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
         "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
@@ -1022,51 +1020,24 @@ local function startAlienHealthMonitoring()
         .. tostring(monitoredAlienModelsTotal) .. " | Mode=Humanoid/attributes/ValueBase/HealthBar UI/despawn observation")
 end
 
-local function getSurfaceHit(part, origin)
-    if not part or not part.Parent or not origin then
-        return nil
-    end
-
-    local offset = part.Position - origin
-    if offset.Magnitude < 0.001 then
-        return nil
-    end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Include
-    params.FilterDescendantsInstances = { part }
-    params.IgnoreWater = true
-
-    local castLength = offset.Magnitude + part.Size.Magnitude + 1
-    local result = Workspace:Raycast(origin, offset.Unit * castLength, params)
-    if not result or result.Instance ~= part then
-        return nil
-    end
-
-    return {
-        part = part,
-        position = result.Position,
-        normal = result.Normal,
-        material = result.Material,
-        distance = (result.Position - origin).Magnitude,
-    }
-end
-
 local function getClosestMeleeContact(model, origin, maxDistance)
     if not model or not origin then
         return nil
     end
 
-    -- The working external Auto Kill capture hit Cylinder.008 and arm parts.
-    -- Do not select legs: when the player is underneath, the nearest raycast
-    -- surface is usually the underside of a leg, which is not the captured hit
-    -- geometry. Keep torso meshes and arms as the valid melee candidates.
+    -- The supplied working Auto Kill capture sends the BasePart itself,
+    -- part.Position, Vector3.new(0, 1, 0), and part.Material. It hits torso
+    -- meshes (including Cylinder.008), arms, head, and legs. Do not replace
+    -- those captured values with raycast surface points or surface normals.
     local rigBodyNames = {
+        ["head"] = true,
         ["torso"] = true,
         ["uppertorso"] = true,
         ["lowertorso"] = true,
         ["right arm"] = true,
         ["left arm"] = true,
+        ["right leg"] = true,
+        ["left leg"] = true,
     }
     local blockedNames = {
         ["humanoidrootpart"] = true,
@@ -1102,11 +1073,17 @@ local function getClosestMeleeContact(model, origin, maxDistance)
             local isAlienTorsoGeometry = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
                 and string.find(fullPath, ".torso.", 1, true) ~= nil
             if not blocked and (isRigBody or isAlienTorsoGeometry) then
-                local contact = getSurfaceHit(descendant, origin)
-                if contact and (maxDistance == nil or contact.distance <= maxDistance) then
-                    if not bestContact or contact.distance < bestContact.distance then
-                        bestContact = contact
-                    end
+                local partPosition = descendant.Position
+                local distance = (partPosition - origin).Magnitude
+                if (maxDistance == nil or distance <= maxDistance)
+                    and (not bestContact or distance < bestContact.distance) then
+                    bestContact = {
+                        part = descendant,
+                        position = partPosition,
+                        normal = Vector3.new(0, 1, 0),
+                        material = descendant.Material,
+                        distance = distance,
+                    }
                 end
             end
         end
@@ -1257,53 +1234,10 @@ local function restoreSafeCamera()
     end
 end
 
-local function setSafeCameraBelowAlien(entry)
-    if not entry or not entry.root or not entry.root.Parent then
-        return false
-    end
-    local camera = Workspace.CurrentCamera
-    if not camera then
-        return false
-    end
-    if not safeCameraState or safeCameraState.camera ~= camera then
-        safeCameraState = {
-            camera = camera,
-            cameraType = camera.CameraType,
-            cameraSubject = camera.CameraSubject,
-            cframe = camera.CFrame,
-            focus = camera.Focus,
-        }
-    end
-    local targetPosition = entry.root.Position
-    local cameraPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
-    local ok, cameraError = pcall(function()
-        camera.CameraType = Enum.CameraType.Scriptable
-        camera.CFrame = CFrame.lookAt(cameraPosition, targetPosition)
-        camera.Focus = CFrame.new(targetPosition)
-    end)
-    if not ok then
-        recordEvent("ERROR", "Safe camera positioning failed", diagTraceback(cameraError))
-        return false
-    end
-    recordThrottled(
-        "safe-camera-below:" .. entry.model.Name,
-        0.35,
-        "CAMERA",
-        "Safe camera positioned below alien",
-        string.format("Target=%s/%s | Camera=(%.1f, %.1f, %.1f) | Target=(%.1f, %.1f, %.1f) | Depth=%.1f | CharacterRoot unchanged by camera positioning",
-            entry.variant, entry.model.Name,
-            cameraPosition.X, cameraPosition.Y, cameraPosition.Z,
-            targetPosition.X, targetPosition.Y, targetPosition.Z,
-            CONFIG.HOVER_BELOW)
-    )
-    return true
-end
 
 local function moveCharacter(position, lookAtPosition, moveReason)
-    -- Any non-combat movement returns the camera to normal Roblox control.
-    if tostring(moveReason or "") ~= "MELEE_SIDE_FRONT_POSITION" then
-        restoreSafeCamera()
-    end
+    -- Keep the normal Roblox camera attached to the character, including during safe hover.
+    restoreSafeCamera()
     if not setupFlight() then
         return false
     end
@@ -1342,99 +1276,24 @@ local function moveCharacter(position, lookAtPosition, moveReason)
     return true
 end
 
-local function getPreferredMeleeAnchor(model)
-    if not model then
-        return nil
-    end
-    local bestPart = nil
-    local bestPriority = math.huge
-    local bestDistance = math.huge
-    local modelRoot = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-    for _, descendant in ipairs(model:GetDescendants()) do
-        if descendant:IsA("BasePart") then
-            local lowerName = string.lower(descendant.Name)
-            local fullPath = string.lower(descendant:GetFullName())
-            local blocked = lowerName == "humanoidrootpart" or lowerName == "entitydetector"
-                or lowerName == "handle" or lowerName == "hitbox" or lowerName == "sword" or lowerName == "blade"
-            local ancestor = descendant.Parent
-            while ancestor and ancestor ~= model do
-                if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
-                    blocked = true
-                    break
-                end
-                local ancestorName = string.lower(ancestor.Name)
-                if ancestorName == "sword" or ancestorName == "blade" or ancestorName == "weapon" or ancestorName == "accessories" then
-                    blocked = true
-                    break
-                end
-                ancestor = ancestor.Parent
-            end
-            if not blocked then
-                local priority = nil
-                if lowerName == "cylinder.008" then
-                    priority = 1
-                elseif lowerName == "right arm" or lowerName == "left arm" then
-                    priority = 2
-                elseif lowerName == "torso" or lowerName == "uppertorso" or lowerName == "lowertorso" then
-                    priority = 3
-                elseif string.find(fullPath, ".dress.alientype", 1, true) ~= nil
-                    and string.find(fullPath, ".torso.", 1, true) ~= nil then
-                    priority = 4
-                end
-                if priority then
-                    local distance = modelRoot and (descendant.Position - modelRoot.Position).Magnitude or 0
-                    if priority < bestPriority or (priority == bestPriority and distance < bestDistance) then
-                        bestPart = descendant
-                        bestPriority = priority
-                        bestDistance = distance
-                    end
-                end
-            end
-        end
-    end
-    return bestPart
-end
-
-local function positionForMeleeAndSafeCamera(entry)
+local function moveBelowAlien(entry)
     if not entry or not entry.root or not entry.root.Parent then
         return false
     end
-    local _, playerRoot = getCharacter()
-    if not playerRoot then
-        return false
-    end
-    local anchorPart = getPreferredMeleeAnchor(entry.model)
-    if not anchorPart or not anchorPart.Parent then
-        recordThrottled("melee-anchor-missing:" .. entry.model.Name, 1, "COMBAT", "No captured torso/arm anchor found", entry.variant .. "/" .. entry.model.Name)
-        return false
-    end
-
-    -- Keep the character at the captured side/front attack geometry. The safe
-    -- underneath view is a CAMERA offset only; it must not drag the character
-    -- six-and-a-half studs below the alien root.
-    local approach = Vector3.new(playerRoot.Position.X - anchorPart.Position.X, 0, playerRoot.Position.Z - anchorPart.Position.Z)
-    if approach.Magnitude < 0.001 then
-        approach = Vector3.new(-entry.root.CFrame.LookVector.X, 0, -entry.root.CFrame.LookVector.Z)
-    end
-    if approach.Magnitude < 0.001 then
-        approach = Vector3.new(0, 0, 1)
-    end
-    approach = approach.Unit
-
-    local attackPosition = anchorPart.Position
-        + approach * CONFIG.MELEE_STANDOFF
-        + Vector3.new(0, -CONFIG.MELEE_ROOT_BELOW_CONTACT, 0)
+    local targetPosition = entry.root.Position
+    local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
     currentTarget = entry.variant .. " / " .. entry.model.Name
-    local beforeDistance = (playerRoot.Position - anchorPart.Position).Magnitude
-    local moved = moveCharacter(attackPosition, anchorPart.Position, "MELEE_SIDE_FRONT_POSITION")
-    local cameraMoved = setSafeCameraBelowAlien(entry)
-    recordEvent("TARGET", "Side/front melee positioning requested", string.format("Variant=%s | Model=%s | Anchor=%s | AnchorPath=%s | Anchor=(%.2f, %.2f, %.2f) | PlayerPosition=(%.2f, %.2f, %.2f) | Standoff=%.2f | RootBelowContact=%.2f | PreviousDistance=%.2f | CharacterMove=%s | CameraBelow=%s",
-        entry.variant, entry.model.Name, anchorPart.Name, anchorPart:GetFullName(),
-        anchorPart.Position.X, anchorPart.Position.Y, anchorPart.Position.Z,
-        attackPosition.X, attackPosition.Y, attackPosition.Z,
-        CONFIG.MELEE_STANDOFF, CONFIG.MELEE_ROOT_BELOW_CONTACT, beforeDistance,
-        tostring(moved), tostring(cameraMoved)))
-    return moved and cameraMoved
+    local _, playerRoot = getCharacter()
+    local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
+    local moved = moveCharacter(hoverPosition, targetPosition, "SAFE_HOVER_BELOW_ALIEN")
+    recordEvent("TARGET", "Physical safe-hover positioning requested", string.format(
+        "Variant=%s | Model=%s | TargetRoot=(%.2f, %.2f, %.2f) | PlayerHover=(%.2f, %.2f, %.2f) | HoverBelow=%.2f | PreviousDistance=%.2f | CharacterMove=%s | Camera=normal character-follow",
+        entry.variant, entry.model.Name,
+        targetPosition.X, targetPosition.Y, targetPosition.Z,
+        hoverPosition.X, hoverPosition.Y, hoverPosition.Z,
+        CONFIG.HOVER_BELOW, beforeDistance, tostring(moved)
+    ))
+    return moved
 end
 
 local function restoreMovement()
@@ -1491,11 +1350,11 @@ local function sendMeleeSweep(entries)
                 table.insert(candidates, contact)
             else
                 recordThrottled(
-                    "melee-no-surface-contact:" .. entry.model.Name,
+                    "melee-no-part-in-range:" .. entry.model.Name,
                     1,
                     "COMBAT",
-                    "Alien skipped: no raycast surface contact in reach",
-                    entry.variant .. "/" .. entry.model.Name .. " | MaxSurfaceDistance=" .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE)
+                    "Alien skipped: no body-part center in attack radius",
+                    entry.variant .. "/" .. entry.model.Name .. " | MaxPartCenterDistance=" .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE)
                 )
             end
         end
@@ -1511,8 +1370,8 @@ local function sendMeleeSweep(entries)
             "melee-no-valid-contact",
             0.75,
             "COMBAT",
-            "No valid shovel contact in reach",
-            "No valid body-part surface contact within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
+            "No valid alien body part in attack radius",
+            "No eligible body-part center within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
         )
         return 0
     end
@@ -1547,14 +1406,14 @@ local function sendMeleeSweep(entries)
         "COMBAT",
         "Melee Attack request dispatched",
         string.format(
-            "Nearest=%s/%s | ContactPart=%s | ContactPath=%s | SurfaceDistance=%.2f | SurfacePosition=(%.2f, %.2f, %.2f) | SurfaceNormal=(%.2f, %.2f, %.2f) | Root=(%.2f, %.2f, %.2f) | Direction=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            "Nearest=%s/%s | HitPart=%s | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | Direction=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
             nearestContact.entry.variant,
             nearestContact.entry.model.Name,
             nearestContact.part.Name,
             nearestContact.part:GetFullName(),
             nearestContact.distance,
             nearestContact.position.X, nearestContact.position.Y, nearestContact.position.Z,
-            nearestContact.normal.X, nearestContact.normal.Y, nearestContact.normal.Z,
+            tostring(nearestContact.material),
             root.Position.X, root.Position.Y, root.Position.Z,
             direction.X, direction.Y, direction.Z,
             equippedTool.Name,
@@ -1578,16 +1437,16 @@ local function sendMeleeSweep(entries)
                 end
 
                 local okHit, hitError = pcall(function()
-                    -- Send the raycast's actual contact point, surface normal,
-                    -- and material instead of the part center and a guessed normal.
+                    -- Match the captured working payload exactly: part center,
+                    -- upward normal, and the part's actual material.
                     ReplicaSignal:FireServer(
                         120,
                         "Melee",
                         "Hit",
                         contact.part,
-                        contact.position,
-                        contact.normal,
-                        contact.material
+                        contact.part.Position,
+                        Vector3.new(0, 1, 0),
+                        contact.part.Material
                     )
                 end)
 
@@ -1608,20 +1467,17 @@ local function sendMeleeSweep(entries)
                     "melee-hit-summary:" .. entry.model.Name,
                     0.5,
                     "COMBAT",
-                    "Melee surface hits dispatched",
+                    "Melee part hits dispatched",
                     string.format(
-                        "Target=%s/%s | Part=%s | Repeats=%d | SurfacePosition=(%.2f, %.2f, %.2f) | Normal=(%.2f, %.2f, %.2f) | Material=%s | Server damage unverified",
+                        "Target=%s/%s | Part=%s | Repeats=%d | PartPosition=(%.2f, %.2f, %.2f) | Normal=(0, 1, 0) | Material=%s | Server damage unverified",
                         entry.variant,
                         entry.model.Name,
                         contact.part.Name,
                         targetHitCount,
-                        contact.position.X,
-                        contact.position.Y,
-                        contact.position.Z,
-                        contact.normal.X,
-                        contact.normal.Y,
-                        contact.normal.Z,
-                        tostring(contact.material)
+                        contact.part.Position.X,
+                        contact.part.Position.Y,
+                        contact.part.Position.Z,
+                        tostring(contact.part.Material)
                     )
                 )
             end
@@ -1633,7 +1489,7 @@ local function sendMeleeSweep(entries)
         0.5,
         "COMBAT",
         "Attack sweep finished",
-        "Surface-hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
+        "Captured-payload Hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
     )
     return sentHits
 end
@@ -1766,10 +1622,10 @@ local function engageAliens(seedEntries)
         end
 
         recordThrottled("target-selection", 0.75, "TARGET", "Alien target selected", "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name .. " | ClusterTargets=" .. tostring(#entries))
-        positionForMeleeAndSafeCamera(nearest)
+        moveBelowAlien(nearest)
         local hits = sendMeleeSweep(entries)
         if hits > 0 then
-            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " surface hits")
+            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " captured Hit requests")
         else
             setStatus("Alien target found; no hit parts available")
         end
@@ -2546,7 +2402,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF5.5-CAMERA-SPLIT",
+            version = "1.0.1-HF5.6-PHYSICAL-HOVER-CAPTURED-HITS",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2753,6 +2609,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.5 camera-split safe-hover/torso-arm-contact/health/input/movement monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.6 physical-under-alien-hover/captured-hit-payload/health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
