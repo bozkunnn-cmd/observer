@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF5.9 (TORSO-PRIORITY + HORIZONTAL APPROACH)
+LAST STOP - ALIEN TOKEN FARMER V1.0.1-HF6.0 (HIERARCHY-AWARE + SINGLE-TARGET DIAGNOSTIC)
 Standalone experimental build for the Last Stop Roblox experience.
-HF5.9 preserves the measured 9.7-stud vertical offset, approaches the torso anchor from the scan-side horizontally, and prioritizes torso hit parts over legs.
+HF6.0 preserves the measured hover geometry, classifies hit parts by actual body-part ancestry, and tests one target with one Hit request per Attack. Server-side damage remains unverified.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -54,14 +54,14 @@ local CONFIG = {
     HOVER_BELOW = 9.7, -- preserve the measured player-root vertical offset below alien root
     TORSO_HORIZONTAL_STANDOFF = 4.8, -- horizontal approach distance to the preferred torso anchor
     MELEE_ATTACK_VERTICAL_BIAS = 0.19, -- small upward component observed in the original attack direction
-    ATTACK_INTERVAL = 0.05,
+    ATTACK_INTERVAL = 0.35, -- conservative diagnostic cadence; not an asserted game cooldown
     MELEE_HIT_DELAY = 0.026, -- observed Attack -> first Hit delay in the working Auto Kill traffic
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
-    MAX_HITS_PER_TARGET = 10,
-    MAX_TARGETS_PER_SWEEP = 3,
-    MAX_HITS_PER_SWEEP = 30,
-    MELEE_HIT_MAX_DISTANCE = 50, -- matches the observed 50-stud attack radius
+    MAX_HITS_PER_TARGET = 1, -- one Hit request per Attack while validating server acceptance
+    MAX_TARGETS_PER_SWEEP = 1, -- isolate the approached target
+    MAX_HITS_PER_SWEEP = 1, -- controlled single-target diagnostic
+    MELEE_HIT_MAX_DISTANCE = 50, -- local candidate-center limit only; server melee range is unknown
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -221,7 +221,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF5.9-TORSO-PRIORITY-HORIZONTAL-APPROACH",
+        "Version: 1.0.1-HF6.0-HIERARCHY-AWARE-SINGLE-TARGET",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -1028,6 +1028,7 @@ local function classifyAlienHitPart(part, model)
     end
 
     local lowerName = string.lower(part.Name)
+    local normalizedPartName = string.gsub(lowerName, "[%s_%-]", "")
     local blockedNames = {
         ["humanoidrootpart"] = true,
         ["entitydetector"] = true,
@@ -1040,38 +1041,73 @@ local function classifyAlienHitPart(part, model)
         return nil
     end
 
+    -- Determine the anatomical region from the part's real ancestor chain.
+    -- Mesh names such as alien.008 are reused on different limbs, so their
+    -- names alone must never promote an arm mesh to torso priority.
+    local bodyRegion = nil
     local ancestor = part.Parent
     while ancestor and ancestor ~= model do
         if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
             return nil
         end
-        local ancestorName = string.lower(ancestor.Name)
-        if ancestorName == "sword" or ancestorName == "blade"
-            or ancestorName == "weapon" or ancestorName == "accessories" then
+
+        local ancestorName = string.lower(tostring(ancestor.Name or ""))
+        local normalizedAncestorName = string.gsub(ancestorName, "[%s_%-]", "")
+        if normalizedAncestorName == "sword" or normalizedAncestorName == "blade"
+            or normalizedAncestorName == "weapon" or normalizedAncestorName == "accessories" then
             return nil
+        end
+
+        if normalizedAncestorName == "torso" or normalizedAncestorName == "uppertorso"
+            or normalizedAncestorName == "lowertorso" or normalizedAncestorName == "chest" then
+            bodyRegion = "TORSO"
+            break
+        elseif normalizedAncestorName == "leftarm" or normalizedAncestorName == "rightarm"
+            or normalizedAncestorName == "upperarm" or normalizedAncestorName == "lowerarm"
+            or normalizedAncestorName == "arm" then
+            bodyRegion = "ARM"
+            break
+        elseif normalizedAncestorName == "head" then
+            bodyRegion = "HEAD"
+            break
+        elseif normalizedAncestorName == "leftleg" or normalizedAncestorName == "rightleg"
+            or normalizedAncestorName == "upperleg" or normalizedAncestorName == "lowerleg"
+            or normalizedAncestorName == "leg" then
+            bodyRegion = "LEG"
+            break
         end
         ancestor = ancestor.Parent
     end
 
-    local fullPath = string.lower(part:GetFullName())
-    local inAlienDress = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
-    local inTorsoFolder = inAlienDress and string.find(fullPath, ".torso.", 1, true) ~= nil
-
-    -- Exact torso meshes captured by the observer get first priority.
-    if lowerName == "cylinder.008" or lowerName == "alien.008" then
-        return 0, "TORSO_MESH"
-    end
-    if inTorsoFolder or lowerName == "torso" or lowerName == "uppertorso" or lowerName == "lowertorso" then
+    -- Exact captured meshes receive top priority only when they are actually
+    -- descendants of the torso hierarchy.
+    if bodyRegion == "TORSO" then
+        if lowerName == "cylinder.008" or lowerName == "alien.008" then
+            return 0, "TORSO_MESH"
+        end
         return 1, "TORSO"
-    end
-    if lowerName == "right arm" or lowerName == "left arm"
-        or lowerName == "head" or lowerName == "upperarm" or lowerName == "lowerarm" then
-        return 2, lowerName == "head" and "HEAD" or "ARM"
-    end
-    if lowerName == "right leg" or lowerName == "left leg"
-        or lowerName == "upperleg" or lowerName == "lowerleg" then
+    elseif bodyRegion == "ARM" then
+        return 2, "ARM"
+    elseif bodyRegion == "HEAD" then
+        return 2, "HEAD"
+    elseif bodyRegion == "LEG" then
         return 3, "LEG"
     end
+
+    -- Some variants expose body parts directly without a named body folder.
+    if normalizedPartName == "torso" or normalizedPartName == "uppertorso"
+        or normalizedPartName == "lowertorso" or normalizedPartName == "chest" then
+        return 1, "TORSO"
+    elseif normalizedPartName == "leftarm" or normalizedPartName == "rightarm"
+        or normalizedPartName == "upperarm" or normalizedPartName == "lowerarm" then
+        return 2, "ARM"
+    elseif normalizedPartName == "head" then
+        return 2, "HEAD"
+    elseif normalizedPartName == "leftleg" or normalizedPartName == "rightleg"
+        or normalizedPartName == "upperleg" or normalizedPartName == "lowerleg" then
+        return 3, "LEG"
+    end
+
     return nil
 end
 
@@ -1104,7 +1140,7 @@ local function getClosestMeleeContact(model, origin, maxDistance)
         return nil
     end
 
-    -- Select by body-part class first, not just nearest center. The HF5.9
+    -- Select by body-part class first, not just nearest center. The earlier
     -- distance-only selector repeatedly chose a leg while torso meshes existed.
     -- Priority: captured torso meshes, torso parts, arms/head, then legs.
     local bestContact = nil
@@ -1465,7 +1501,7 @@ local function sendMeleeSweep(entries)
         return 0
     end
     if not equippedTool.Enabled then
-        recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF5.9 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
+        recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF6.0 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
     end
 
     local candidates = {}
@@ -1540,13 +1576,17 @@ local function sendMeleeSweep(entries)
     -- The captured working sequence had approximately 26 ms between Attack
     -- and the first Hit event.
     task.wait(CONFIG.MELEE_HIT_DELAY)
+    local toolHandle = equippedTool:FindFirstChild("Handle", true)
+    local toolHandleDistance = toolHandle and toolHandle:IsA("BasePart")
+        and (toolHandle.Position - nearestContact.position).Magnitude or nil
+
     recordThrottled(
         "melee-attack-dispatched",
         0.25,
         "COMBAT",
         "Melee Attack request dispatched",
         string.format(
-            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | SwingDirection=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | ToolHandleDistance=%s | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | SwingDirection=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
             nearestContact.entry.variant,
             nearestContact.entry.model.Name,
             nearestContact.part.Name,
@@ -1554,6 +1594,7 @@ local function sendMeleeSweep(entries)
             nearestContact.priority or 99,
             nearestContact.part:GetFullName(),
             nearestContact.distance,
+            toolHandleDistance and string.format("%.2f", toolHandleDistance) or "unknown",
             nearestContact.position.X, nearestContact.position.Y, nearestContact.position.Z,
             contactDelta.X, contactDelta.Y, contactDelta.Z,
             tostring(nearestContact.material),
@@ -1768,9 +1809,11 @@ local function engageAliens(seedEntries)
 
         recordThrottled("target-selection", 0.75, "TARGET", "Alien target selected", "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name .. " | ClusterTargets=" .. tostring(#entries))
         moveBelowAlien(nearest)
-        local hits = sendMeleeSweep(entries)
+        -- HF6.0 deliberately attacks only the alien we just approached.
+        -- This keeps Attack direction and Hit target on the same model.
+        local hits = sendMeleeSweep({ nearest })
         if hits > 0 then
-            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " captured Hit requests")
+            setStatus("Testing " .. nearest.variant .. " / " .. nearest.model.Name .. " | Hit requests=" .. tostring(hits))
         else
             setStatus("Alien target found; no hit parts available")
         end
@@ -2547,7 +2590,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF5.9-TORSO-PRIORITY-HORIZONTAL-APPROACH",
+            version = "1.0.1-HF6.0-HIERARCHY-AWARE-SINGLE-TARGET",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2754,6 +2797,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.9 measured-9.7-stud-vertical-hover/torso-priority/horizontal-approach/captured-hit-payload/health/input/movement monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF6.0 hierarchy-aware-hitboxes/single-target-one-hit-per-attack/conservative-cadence/measured-hover/health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
