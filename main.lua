@@ -1,20 +1,21 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.5 (OBSERVED AURA SEQUENCE + HF5.9 SCANNER)
+LAST STOP - ALIEN TOKEN FARMER HF8.6 (LIVE REPLICA REGISTRY + OBSERVED AURA + HF5.9 SCANNER)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.5 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat now follows the measured successful-aura pattern: camera-look Attack direction, approximately 32 ms Attack-to-Hit delay, one Hit per selected target, up to three targets, and approximately 65 ms attack cadence. Classic Shovel replica ID 120 remains an explicitly unverified fallback unless a live ReplicaCreate event maps the equipped tool GUID.
+HF8.6 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
   Workspace.ITEM_CONTAINER.<GUID>.Main.CollectAlienTokenPrompt
   ReplicatedStorage.ClientSource.ReplicaRemoteEvents.Replica_ReplicaSignal
+  ReplicatedStorage.ClientSource.*.ReplicaController (discovered by ModuleScript name)
 
-Observed melee signal shape from the supplied V1.2 diagnostics:
-  FireServer(120, "Melee", "Attack", direction, 1)
-  FireServer(120, "Melee", "Hit", part, hitPosition, normal, material)
+Observed melee signal shape from captured traffic:
+  FireServer(liveEquippedItemReplicaId, "Melee", "Attack", direction, 1)
+  FireServer(liveEquippedItemReplicaId, "Melee", "Hit", part, hitPosition, normal, material)
 
 No external loaders, no global metamethod hooks, no input interception.
 Passive UserInputService event listeners are used for diagnostics; no synthetic input is sent.
-The Classic Shovel replica ID 120 is retained only as a legacy fallback. A passive ReplicaCreate listener attempts to map the equipped Shovel GUID to its live replica ID. Attack direction follows CurrentCamera.CFrame.LookVector, matching the direction variation in the observed working traffic. Server damage confirmation is monitored separately.
+Attack direction follows CurrentCamera.CFrame.LookVector. Server damage confirmation is monitored separately.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -62,7 +63,6 @@ local CONFIG = {
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
     MELEE_HIT_MAX_DISTANCE = 50, -- original Classic Shovel hit-part distance from main.lua
-    CLASSIC_SHOVEL_REPLICA_ID = 120, -- legacy fallback only; dynamic GUID mapping takes priority
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -82,6 +82,9 @@ local lastServerDamageAt = nil
 local serverMonitorConnections = {}
 local itemReplicaIdsByGuid = {}
 local itemReplicaResolverConnection = nil
+local replicaController = nil
+local replicaControllerPath = "not found"
+local replicaRegistryIndexed = 0
 local lastResolvedMeleeReplicaId = nil
 local lastReplicaIdSource = "not resolved"
 local tokenAttempts = 0
@@ -265,9 +268,177 @@ end
 
 attachServerCombatMonitors()
 
--- Resolve the equipped item's live replica ID when ReplicaCreate metadata exposes
--- the same GUID used as the Tool.Name. This does not hook or intercept outgoing calls.
-do
+-- Resolve the equipped item's replica ID from the game's already-loaded
+-- ReplicaController registry. HF8.5 only listened for future ReplicaCreate
+-- events; if the starting Shovel already existed, it silently fell back to 120.
+-- ReplicaService exposes the loaded registry as ReplicaController._replicas.
+local function discoverReplicaController()
+    if replicaController and type(replicaController._replicas) == "table" then
+        return replicaController
+    end
+
+    local roots = { ClientSource, ReplicatedStorage }
+    local visited = {}
+    for _, root in ipairs(roots) do
+        if root and not visited[root] then
+            visited[root] = true
+            local descendants = root:GetDescendants()
+            for _, object in ipairs(descendants) do
+                if object:IsA("ModuleScript") and object.Name == "ReplicaController" then
+                    local ok, candidate = pcall(require, object)
+                    if ok and type(candidate) == "table"
+                        and type(candidate.GetReplicaById) == "function"
+                        and type(candidate._replicas) == "table" then
+                        replicaController = candidate
+                        replicaControllerPath = object:GetFullName()
+                        local existingCount = 0
+                        for _ in pairs(candidate._replicas) do
+                            existingCount = existingCount + 1
+                        end
+                        recordEvent("SYSTEM", "ReplicaController registry found",
+                            replicaControllerPath .. " | Existing replicas=" .. tostring(existingCount))
+                        return replicaController
+                    elseif not ok then
+                        recordThrottled("replica-controller-require:" .. object:GetFullName(), 5,
+                            "DIAGNOSTICS", "ReplicaController require failed",
+                            object:GetFullName() .. " | " .. tostring(candidate))
+                    end
+                end
+            end
+        end
+    end
+
+    replicaControllerPath = "ModuleScript named ReplicaController not found or incompatible API"
+    return nil
+end
+
+local function normalizeReplicaGuid(value)
+    if value == nil then
+        return nil
+    end
+    local guid = tostring(value)
+    if string.sub(string.upper(guid), 1, 5) == "ITEM|" then
+        guid = string.sub(guid, 6)
+    end
+    return guid
+end
+
+local function getReplicaGuid(replica)
+    if type(replica) ~= "table" then
+        return nil
+    end
+
+    local containers = { replica.Tags, replica.Data }
+    local keys = { "Id", "id", "Guid", "GUID", "ItemGuid", "ItemGUID", "GuidString" }
+    for _, container in ipairs(containers) do
+        if type(container) == "table" then
+            for _, key in ipairs(keys) do
+                local value = container[key]
+                if type(value) == "string" and value ~= "" then
+                    return normalizeReplicaGuid(value)
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function indexReplica(replica, fallbackId)
+    if type(replica) ~= "table" then
+        return false
+    end
+
+    local guid = getReplicaGuid(replica)
+    local replicaId = tonumber(replica.Id) or tonumber(fallbackId)
+    if not guid or not replicaId then
+        return false
+    end
+
+    itemReplicaIdsByGuid[guid] = replicaId
+    return true
+end
+
+local function indexExistingReplicaRegistry()
+    local controller = discoverReplicaController()
+    if not controller then
+        return false
+    end
+
+    local registry = controller._replicas
+    if type(registry) ~= "table" then
+        return false
+    end
+
+    local indexed = 0
+    for id, replica in pairs(registry) do
+        if indexReplica(replica, id) then
+            indexed = indexed + 1
+        end
+    end
+    replicaRegistryIndexed = indexed
+
+    recordThrottled("replica-registry-indexed", 2, "SYSTEM",
+        "Existing replica registry indexed",
+        "Controller=" .. tostring(replicaControllerPath)
+            .. " | Live replicas=" .. tostring((function()
+                local count = 0
+                for _ in pairs(registry) do count = count + 1 end
+                return count
+            end)())
+            .. " | GUID-tagged replicas=" .. tostring(indexed))
+
+    return true
+end
+
+local function attachReplicaRegistryListeners()
+    local controller = discoverReplicaController()
+    if not controller then
+        recordEvent("DIAGNOSTICS", "Live replica registry unavailable",
+            "No compatible ReplicaController._replicas table found; no hardcoded replica ID will be used")
+        return
+    end
+
+    -- Connect first, then index the current registry, so a replica created
+    -- during the initial scan cannot be missed.
+    local newSignal = controller.NewReplicaSignal
+    if newSignal and type(newSignal.Connect) == "function" then
+        local ok, connection = pcall(function()
+            return newSignal:Connect(function(replica)
+                indexReplica(replica)
+            end)
+        end)
+        if ok and connection then
+            table.insert(serverMonitorConnections, connection)
+            itemReplicaResolverConnection = connection
+            recordEvent("SYSTEM", "ReplicaController.NewReplicaSignal listener attached",
+                tostring(replicaControllerPath))
+        else
+            recordEvent("DIAGNOSTICS", "ReplicaController.NewReplicaSignal listener unavailable",
+                tostring(connection))
+        end
+    end
+
+    local initialSignal = controller.InitialDataReceivedSignal
+    if controller.InitialDataReceived == false and initialSignal
+        and type(initialSignal.Connect) == "function" then
+        local ok, connection = pcall(function()
+            return initialSignal:Connect(function()
+                indexExistingReplicaRegistry()
+            end)
+        end)
+        if ok and connection then
+            table.insert(serverMonitorConnections, connection)
+            recordEvent("SYSTEM", "Replica initial-data listener attached",
+                "Will index existing replicas when initial replication completes")
+        end
+    end
+
+    indexExistingReplicaRegistry()
+
+    -- Keep a passive event listener as a secondary cache source. This is not
+    -- the primary resolver because it cannot replay ReplicaCreate events that
+    -- occurred before this farmer was executed.
     local createRemote = ReplicaRemoteEvents and ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaCreate")
     if createRemote and createRemote:IsA("RemoteEvent") then
         local ok, connection = pcall(function()
@@ -276,52 +447,64 @@ do
                 local metadata = type(payload[2]) == "table" and payload[2] or payload
                 if type(metadata) ~= "table" then return end
                 local guid = metadata.Id or metadata.id or metadata.Guid or metadata.GUID
-                if guid ~= nil then
-                    itemReplicaIdsByGuid[tostring(guid)] = tonumber(replicaId) or replicaId
-                    local character = LocalPlayer.Character
-                    local equipped = character and character:FindFirstChildOfClass("Tool")
-                    if equipped and tostring(equipped.Name) == tostring(guid) then
-                        recordEvent("WEAPON", "Equipped Shovel replica dynamically mapped",
-                            "ToolGuid=" .. tostring(guid) .. " | ReplicaId=" .. tostring(replicaId))
-                    end
+                local numericId = tonumber(replicaId)
+                if guid ~= nil and numericId then
+                    itemReplicaIdsByGuid[normalizeReplicaGuid(guid)] = numericId
                 end
             end)
         end)
         if ok and connection then
-            itemReplicaResolverConnection = connection
             table.insert(serverMonitorConnections, connection)
-            recordEvent("SYSTEM", "Dynamic item replica resolver attached", createRemote:GetFullName())
-        else
-            recordEvent("DIAGNOSTICS", "Dynamic item replica resolver unavailable", tostring(connection))
+            recordEvent("SYSTEM", "ReplicaCreate backup listener attached", createRemote:GetFullName())
         end
-    else
-        recordEvent("DIAGNOSTICS", "Dynamic item replica resolver unavailable", "Replica_ReplicaCreate was not found")
     end
 end
 
+attachReplicaRegistryListeners()
+
 local function resolveMeleeReplicaId(tool)
-    local resolved, source
-    if tool then
-        local guid = tostring(tool.Name)
+    if not tool then
+        lastResolvedMeleeReplicaId = nil
+        lastReplicaIdSource = "no equipped Tool"
+        return nil, lastReplicaIdSource, nil
+    end
+
+    local guid = normalizeReplicaGuid(tool.Name)
+    local controller = discoverReplicaController()
+    if controller then
         local mapped = itemReplicaIdsByGuid[guid]
         if mapped ~= nil then
-            resolved, source = mapped, "dynamic Tool GUID match"
-        else
-            for _, attributeName in ipairs({"ReplicaId", "ReplicaID", "Replica"}) do
-                local value = tool:GetAttribute(attributeName)
-                if type(value) == "number" then
-                    resolved, source = value, "Tool attribute " .. attributeName
-                    break
-                end
+            local ok, replica = pcall(function()
+                return controller.GetReplicaById(mapped)
+            end)
+            if ok and replica and getReplicaGuid(replica) == guid then
+                lastResolvedMeleeReplicaId = tonumber(replica.Id) or mapped
+                lastReplicaIdSource = "ReplicaController registry cache; equipped Tool GUID verified"
+                return lastResolvedMeleeReplicaId, lastReplicaIdSource, replica
             end
+            itemReplicaIdsByGuid[guid] = nil
+        end
+
+        -- Re-scan the live registry on a cache miss. This handles tools whose
+        -- ReplicaCreate event happened before HF8.6 was executed.
+        indexExistingReplicaRegistry()
+        mapped = itemReplicaIdsByGuid[guid]
+        if mapped ~= nil then
+            local ok, replica = pcall(function()
+                return controller.GetReplicaById(mapped)
+            end)
+            if ok and replica and getReplicaGuid(replica) == guid then
+                lastResolvedMeleeReplicaId = tonumber(replica.Id) or mapped
+                lastReplicaIdSource = "ReplicaController._replicas live GUID match"
+                return lastResolvedMeleeReplicaId, lastReplicaIdSource, replica
+            end
+            itemReplicaIdsByGuid[guid] = nil
         end
     end
-    if resolved == nil then
-        resolved, source = CONFIG.CLASSIC_SHOVEL_REPLICA_ID, "legacy fallback; not dynamically verified"
-    end
-    lastResolvedMeleeReplicaId = resolved
-    lastReplicaIdSource = source
-    return resolved, source
+
+    lastResolvedMeleeReplicaId = nil
+    lastReplicaIdSource = "UNRESOLVED: equipped Tool GUID not present in live ReplicaController registry"
+    return nil, lastReplicaIdSource, nil
 end
 
 local function buildAlienHealthSnapshot()
@@ -368,7 +551,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.5-OBSERVED-AURA-SEQUENCE-HF5.9-BASE",
+        "Version: HF8.6-LIVE-REPLICA-REGISTRY-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -380,6 +563,7 @@ local function buildDiagnosticReport()
         "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Auto-correlated foreground damage events: " .. tostring(automatedDamageUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
         "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
         "Melee replica mapping: ID=" .. tostring(lastResolvedMeleeReplicaId) .. " | Source=" .. tostring(lastReplicaIdSource),
+        "ReplicaController: " .. tostring(replicaControllerPath) .. " | GUID-tagged replicas indexed=" .. tostring(replicaRegistryIndexed),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
         "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
@@ -455,7 +639,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.5 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId) .. " | ClassicShovelReplicaIdFallback=" .. tostring(CONFIG.CLASSIC_SHOVEL_REPLICA_ID) .. " (dynamic Tool GUID mapping preferred)")
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.6 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1602,20 +1786,31 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    -- Last Stop's only starting weapon is the shovel in hotbar slot 1.
+    -- Preserve the Classic starting Shovel when no tool is equipped, but use
+    -- whichever melee Tool is currently equipped once the player changes it.
     -- Tool.Enabled is recorded for diagnostics but is not used as an attack gate.
     if not ensureToolEquipped() then
-        setStatus("Waiting for starting shovel in hotbar slot 1")
+        setStatus("Waiting for starting melee tool in hotbar slot 1")
         return 0
     end
     local equippedTool = character:FindFirstChildOfClass("Tool")
     if not equippedTool then
-        setStatus("Starting shovel is not equipped")
+        setStatus("Melee tool is not equipped")
         return 0
     end
-    local signalId, signalIdSource = resolveMeleeReplicaId(equippedTool)
+    local signalId, signalIdSource, meleeReplica = resolveMeleeReplicaId(equippedTool)
+    if signalId == nil or not meleeReplica or type(meleeReplica.FireServer) ~= "function" then
+        setStatus("Waiting for live melee replica mapping")
+        recordThrottled("melee-replica-unresolved:" .. tostring(equippedTool.Name), 1.5,
+            "WEAPON", "Combat paused: equipped melee replica could not be resolved",
+            "ToolGuid=" .. tostring(equippedTool.Name)
+                .. " | Controller=" .. tostring(replicaControllerPath)
+                .. " | IndexedGUIDReplicas=" .. tostring(replicaRegistryIndexed)
+                .. " | No guessed replica ID was sent")
+        return 0
+    end
     if not equippedTool.Enabled then
-        recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF5.9 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
+        recordThrottled("melee-disabled-state", 2, "WEAPON", "Equipped melee Tool has Tool.Enabled=false", "Property is left game-controlled; it is not used as an attack gate")
     end
 
     local candidates = {}
@@ -1679,7 +1874,7 @@ local function sendMeleeSweep(entries)
     lastAutoAttackAt = os.clock()
     automatedAttackRequests = automatedAttackRequests + 1
     local okAttack, attackError = pcall(function()
-        ReplicaSignal:FireServer(signalId, "Melee", "Attack", direction, 1)
+        meleeReplica:FireServer("Melee", "Attack", direction, 1)
     end)
     if not okAttack then
         remoteErrors = remoteErrors + 1
@@ -1734,8 +1929,7 @@ local function sendMeleeSweep(entries)
                 local okHit, hitError = pcall(function()
                     -- Match the captured working payload exactly: part center,
                     -- upward normal, and the part's actual material.
-                    ReplicaSignal:FireServer(
-                        signalId,
+                    meleeReplica:FireServer(
                         "Melee",
                         "Hit",
                         contact.part,
@@ -2710,7 +2904,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.5-OBSERVED-AURA-SEQUENCE-HF5.9-BASE",
+            version = "HF8.6-LIVE-REPLICA-REGISTRY-HF5.9-BASE",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2729,6 +2923,8 @@ local function exportDiagnostics()
             automatedHitRequests = automatedHitRequests,
             meleeReplicaId = lastResolvedMeleeReplicaId,
             meleeReplicaIdSource = lastReplicaIdSource,
+            replicaControllerPath = replicaControllerPath,
+            replicaRegistryIndexed = replicaRegistryIndexed,
             manualMouseDownCount = manualMouseDownCount,
             manualMouseUpCount = manualMouseUpCount,
             manualTouchCount = manualTouchCount,
