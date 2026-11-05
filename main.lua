@@ -1,30 +1,24 @@
 --[[
-LAST STOP ALIEN TOKEN FARMER HF8.0
-Classic alien scanning + token collection, using the server-confirmed melee sequence
-validated in the supplied stationary-aura diagnostics.
+LAST STOP ALIEN TOKEN FARMER HF8.1 - CLASSIC ONLY
 
-Production (Classic) behavior:
-  - Retains the original HF5.9 scan route, flight/collision handling, AlienType1/2/3
-    detection, torso-aware approach, alien engagement, and CollectAlienTokenPrompt flow.
-  - Uses the Classic starting Shovel. Its runtime Tool name may be a GUID.
-  - Resolves the melee replica from MethodCalled/ReplicaCreate when available; the
-    original Classic source's replica ID 120 is retained only as a Shovel fallback.
-  - Approaches an alien/cluster when needed, then holds position during each local
-    proximity sweep. It does not chase every hit or move on every attack tick.
+Production target: normal Classic Last Stop gameplay.
+Bus Rush is not supported as a runtime mode and is not used for mode detection.
 
-Test-only behavior:
-  - If a Bus/Zombie test environment is detected and no Classic alien models are
-    present, it runs the stationary hostile aura so Bus Rush can be used to test
-    combat quickly. The production scan/collection path does not depend on Bus Rush.
-  - The Bus Rush Bat ID 58 is only a test fallback after the server identifies Bat.
+Classic systems retained from the original HF5.9 scanner/collector:
+  - Workspace.ENTITY_CONTAINER alien hierarchy detection (AlienType1/2/3)
+  - Original scan route, flight controllers, collision handling and safe-hover approach
+  - Torso-priority alien hitbox selection
+  - Workspace.ITEM_CONTAINER token prompt discovery and pickup confirmation
 
-Combat:
-  - Attack -> short delay -> up to three distinct Hit targets per sweep.
-  - Tool.Enabled is observed but never forced; Tool.Activated is not required.
-  - DamageDealt, replica Health, OnDied, and the kill counter are used for verification.
+Combat integration:
+  - Classic starting Shovel only (runtime Tool name may be a GUID)
+  - Dynamic Shovel replica mapping where available; Classic source fallback ID 120
+  - Attack -> short delay -> up to three distinct alien Hit targets per sweep
+  - Tool.Enabled is observed but never forced; native Tool.Activated is not required
+  - Server DamageDealt, replica health, OnDied and kill counter diagnostics
 
-No global metamethod hooks, outgoing-call interception, external loaders, or synthetic
-mouse/touch input are installed.
+No Bus Rush mode switching, Bat fallback, global metamethod hooks, outgoing-call
+interception, external loaders, or synthetic mouse/touch input.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -76,11 +70,8 @@ local CONFIG = {
     MAX_HITS_PER_SWEEP = 3,
     MAX_HITS_PER_TARGET = 1,
 
-    -- Replica IDs are dynamically resolved from the equipped item's server metadata.
-    -- These are name-gated fallbacks only: 120 from the original Classic Shovel source,
-    -- 58 from the separate Bus Rush Bat test capture.
+    -- Dynamic Shovel mapping is preferred; 120 is the original Classic fallback.
     CLASSIC_SHOVEL_REPLICA_FALLBACK = 120,
-    BUS_RUSH_BAT_TEST_REPLICA_FALLBACK = 58,
 
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
@@ -156,7 +147,7 @@ local movementSamples = 0
 local movementMonitorCharacters = setmetatable({}, { __mode = "k" })
 local expectedCharacterMove = nil
 
--- HF8.0 replica/combat state. No global hooks are installed.
+-- HF8.1 replica/combat state. No global hooks are installed.
 local replicaStates = {}
 local replicaGuidToId = {}
 local replicaIdToGuid = {}
@@ -166,12 +157,11 @@ local meleeItemGuid = nil
 local meleeReplicaId = nil
 local meleeReplicaIdSource = "unresolved"
 local meleeEquipRefreshAttempted = false
-local currentMode = "Detecting game mode"
+local currentMode = "Classic production - alien scan + token collection"
 local serverDamageEvents = 0
 local serverConfirmedKills = 0
 local lastServerDamageAt = nil
 local lastServerDamageAmount = nil
-local hostileCountInRange = 0
 
 local function diagTraceback(err)
     local message = tostring(err)
@@ -260,7 +250,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF8.0-CLASSIC-SCAN-MELEE",
+        "Version: 1.0.1-HF8.1-CLASSIC-ONLY",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Mode: " .. tostring(currentMode),
@@ -392,8 +382,7 @@ local function ensureToolEquipped()
         return false
     end
 
-    -- Classic starts with the Shovel in slot 1. In the separate Bus Rush test,
-    -- the first available melee Tool is the Bat. Runtime Tool names are GUIDs.
+    -- Classic starts with the Shovel in slot 1. Runtime Tool names are GUIDs.
     local equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
         if meleeItemGuid and equipped.Name ~= meleeItemGuid then
@@ -435,8 +424,7 @@ local function ensureToolEquipped()
         return false
     end
 
-    -- The Classic starting Shovel is slot 1. The Bus Rush test loadout also
-    -- exposes its test Bat as the first available Tool.
+    -- The Classic starting Shovel is slot 1; its runtime Tool name is a GUID.
     local candidate = nil
     for _, child in ipairs(backpack:GetChildren()) do
         if child:IsA("Tool") then
@@ -566,7 +554,7 @@ local function getAliensNear(position, radius)
     return results
 end
 
--- HF8.0: map replica IDs to entity GUIDs and retain state after ReplicaDestroy.
+-- HF8.1: map replica IDs to entity GUIDs and retain state after ReplicaDestroy.
 local function replicaPathKey(value)
     if type(value) == "table" then
         local parts = {}
@@ -613,8 +601,7 @@ local function bindReplicaRemote(remote, callback)
 end
 
 local function isSupportedMeleeItemName(name)
-    local lower = string.lower(tostring(name or ""))
-    return lower == "shovel" or lower == "bat"
+    return string.lower(tostring(name or "")) == "shovel"
 end
 
 local function getMeleeSignalId()
@@ -625,11 +612,9 @@ local function getMeleeSignalId()
     local lower = string.lower(tostring(meleeItemName or ""))
     if lower == "shovel" then
         return CONFIG.CLASSIC_SHOVEL_REPLICA_FALLBACK, "Classic Shovel fallback from original scanner source"
-    elseif lower == "bat" then
-        return CONFIG.BUS_RUSH_BAT_TEST_REPLICA_FALLBACK, "Bus Rush test-only Bat fallback"
     end
 
-    return nil, "waiting for server item identity"
+    return nil, "waiting for Classic Shovel server identity"
 end
 
 local function startReplicaMonitoring()
@@ -677,7 +662,7 @@ local function startReplicaMonitoring()
                 "Melee item replica discovered; waiting for equip identity",
                 "Item=" .. tostring(state.Name) .. " | ReplicaId=" .. tostring(replicaId)
                 .. " | Guid=" .. tostring(state.Id))
-        elseif state.Name == "Zombie" or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
+        elseif string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
             recordThrottled("hostile-replica-create:" .. tostring(replicaId), 0.2, "REPLICA", "Hostile replica created", "ReplicaId=" .. tostring(replicaId) .. " | Name=" .. tostring(state.Name) .. " | Guid=" .. tostring(state.Id))
         end
     end)
@@ -692,7 +677,7 @@ local function startReplicaMonitoring()
             alienKills = value
             recordEvent("KILL", "Server kill counter updated", "ReplicaId=" .. tostring(replicaId) .. " | ConfirmedKills=" .. tostring(value))
         elseif key == "Health" and type(value) == "number" and value <= 0 then
-            if state.Friendly == false or state.Name == "Zombie" or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
+            if state.Friendly == false or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
                 recordThrottled("replica-health-zero:" .. tostring(replicaId), 0.1, "KILL", "Hostile replica health reached zero", "ReplicaId=" .. tostring(replicaId) .. " | Guid=" .. tostring(state.Id) .. " | Name=" .. tostring(state.Name))
             end
         end
@@ -715,7 +700,7 @@ local function startReplicaMonitoring()
             local wasDead = state.Dead == true
             state.Dead = true
             replicaStates[replicaId] = state
-            if not wasDead and (state.Friendly == false or state.Name == "Zombie" or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true)) then
+            if not wasDead and (state.Friendly == false or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true)) then
                 serverConfirmedKills = serverConfirmedKills + 1
                 recordEvent("KILL", "Hostile OnDied signal confirmed", "ReplicaId=" .. tostring(replicaId) .. " | Guid=" .. tostring(state.Id) .. " | Name=" .. tostring(state.Name) .. " | OnDiedCount=" .. tostring(serverConfirmedKills))
             end
@@ -751,9 +736,6 @@ local function startReplicaMonitoring()
                 elseif string.lower(meleeItemName) == "shovel" then
                     meleeReplicaId = CONFIG.CLASSIC_SHOVEL_REPLICA_FALLBACK
                     meleeReplicaIdSource = "Classic Shovel fallback from original scanner source"
-                elseif string.lower(meleeItemName) == "bat" then
-                    meleeReplicaId = CONFIG.BUS_RUSH_BAT_TEST_REPLICA_FALLBACK
-                    meleeReplicaIdSource = "Bus Rush test-only Bat fallback"
                 else
                     meleeReplicaIdSource = "unresolved"
                 end
@@ -797,121 +779,10 @@ local function startReplicaMonitoring()
         end
     end)
 
-    recordEvent("SYSTEM", "Passive replica/combat monitoring active", "ReplicaCreate/SetValue/SetValues/Signal/Destroy + Shovel/Bat equip mapping + DamageDealt + EntityKilled + Melee Hit effects | No hooks installed")
+    recordEvent("SYSTEM", "Passive replica/combat monitoring active", "Classic Shovel mapping + alien replica health/death + DamageDealt + EntityKilled + Melee Hit effects | No hooks installed")
 end
 
-local function getHostileEntitiesNear(position, radius)
-    local results = {}
-    if not ENTITY_CONTAINER or not position then
-        return results
-    end
-
-    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-        if model:IsA("Model") and model.Parent == ENTITY_CONTAINER then
-            local guid = tostring(model:GetAttribute("Id") or model.Name)
-            local replicaId = replicaGuidToId[guid]
-            local state = replicaId and replicaStates[replicaId] or nil
-            local typeName = tostring(model:GetAttribute("Type") or (state and state.Name) or "")
-            local lowerType = string.lower(typeName)
-            local alienVariant = isAlienModel(model)
-            local explicitHostile = lowerType == "zombie"
-                or lowerType == "alien"
-                or lowerType == "alientype1"
-                or lowerType == "alientype2"
-                or lowerType == "alientype3"
-                or alienVariant ~= nil
-            local hostile = (state and state.Friendly == false) or explicitHostile
-
-            if hostile
-                and not (state and state.Friendly == true)
-                and not (state and state.Active == false)
-                and not (state and state.Targetable == false)
-                and not (state and type(state.Health) == "number" and state.Health <= 0)
-                and not (model:GetAttribute("Active") == false)
-                and not (model:GetAttribute("Targetable") == false)
-                and not (type(model:GetAttribute("Health")) == "number" and model:GetAttribute("Health") <= 0)
-                and not (state and state.Dead == true) then
-
-                local healthBar = model:FindFirstChild("HealthBar", true)
-                local backBar = healthBar and healthBar:FindFirstChild("BackBar", true)
-                local barEmpty = backBar and backBar:IsA("GuiObject") and backBar.Size.X.Scale <= 0
-                local root = not barEmpty and getModelRoot(model) or nil
-                if root then
-                    local distance = (root.Position - position).Magnitude
-                    if distance <= radius then
-                        table.insert(results, {
-                            model = model,
-                            root = root,
-                            variant = typeName ~= "" and typeName or (alienVariant or "Hostile"),
-                            distance = distance,
-                            replicaId = replicaId,
-                            replicaState = state,
-                        })
-                    end
-                end
-            end
-        end
-    end
-
-    table.sort(results, function(a, b)
-        return a.distance < b.distance
-    end)
-    return results
-end
-
-local function getClosestEntityContact(model, origin, maxDistance)
-    if not model or not origin then
-        return nil
-    end
-
-    local excluded = {
-        humanoidrootpart = true,
-        entitydetector = true,
-        handle = true,
-        hitbox = true,
-        main = true,
-        root = true,
-    }
-    local best = nil
-
-    for _, part in ipairs(model:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local normalized = string.gsub(string.lower(part.Name), "[%s_%-]", "")
-            local blocked = excluded[normalized] == true
-            local ancestor = part.Parent
-            while ancestor and ancestor ~= model do
-                if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
-                    blocked = true
-                    break
-                end
-                local ancestorName = string.gsub(string.lower(tostring(ancestor.Name or "")), "[%s_%-]", "")
-                if ancestorName == "weapon" or ancestorName == "weapons" or ancestorName == "accessories" then
-                    blocked = true
-                    break
-                end
-                ancestor = ancestor.Parent
-            end
-
-            if not blocked then
-                local distance = (part.Position - origin).Magnitude
-                if (maxDistance == nil or distance <= maxDistance)
-                    and (not best or distance < best.distance) then
-                    best = {
-                        part = part,
-                        position = part.Position,
-                        distance = distance,
-                        material = part.Material,
-                        normal = Vector3.new(0, 1, 0),
-                    }
-                end
-            end
-        end
-    end
-
-    return best
-end
-
--- HF4: observe client-visible alien health without changing game state.
+-- HF4: observe client-visible alien health-- HF4: observe client-visible alien health without changing game state.
 local function isHealthValueName(name)
     local lower = string.lower(tostring(name or ""))
     local normalized = string.gsub(lower, "[%s_%-]", "")
@@ -1922,7 +1793,7 @@ local function sendMeleeSweep(entries)
     if not equippedTool.Enabled then
         recordThrottled("melee-tool-disabled", 3, "WEAPON",
             "Melee Tool is equipped but Tool.Enabled is false",
-            "The game controls this property; HF8.0 does not force it and does not require Tool.Activated")
+            "The game controls this property; HF8.1 does not force it and does not require Tool.Activated")
     end
 
     local signalId, signalIdSource = getMeleeSignalId()
@@ -1930,7 +1801,7 @@ local function sendMeleeSweep(entries)
         recordThrottled("melee-replica-id-wait", 1.5, "WEAPON",
             "Waiting for equipped melee replica ID",
             "ServerItem=" .. tostring(meleeItemName) .. " | ItemGuid=" .. tostring(meleeItemGuid)
-            .. " | No Bat/Shovel ID will be guessed before the server identifies the item")
+            .. " | No Shovel ID will be guessed before the server identifies the item")
         return 0
     end
 
@@ -1945,14 +1816,7 @@ local function sendMeleeSweep(entries)
     local candidates = {}
     for _, entry in ipairs(entries) do
         if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
-            local contact
-            if isAlienModel(entry.model) then
-                -- Classic aliens use the original hierarchy-aware torso/arm/leg classifier.
-                contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_RADIUS)
-            else
-                -- Generic hostile fallback is used only for the fast Bus Rush test environment.
-                contact = getClosestEntityContact(entry.model, root.Position, CONFIG.MELEE_RADIUS)
-            end
+            local contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_RADIUS)
 
             if contact and contact.part and contact.part.Parent then
                 contact.entry = entry
@@ -2056,7 +1920,7 @@ local function sendMeleeSweep(entries)
     end
 
     currentTarget = table.concat(targetNames, " | ")
-    recordThrottled("hf8-melee-sweep", 0.35, "COMBAT", "Melee proximity sweep dispatched",
+    recordThrottled("hf81-classic-melee-sweep", 0.35, "COMBAT", "Melee proximity sweep dispatched",
         string.format("Item=%s | ItemGuid=%s | ReplicaId=%s | IDSource=%s | AttackDirection=(%.3f, %.3f, %.3f) | Targets=%d | HitRequests=%d | Radius=%.1f | Tool=%s | ToolEnabled=%s | DamageEvents=%d | ConfirmedDeaths=%d",
             tostring(meleeItemName), tostring(meleeItemGuid), tostring(signalId), tostring(signalIdSource),
             direction.X, direction.Y, direction.Z, maxTargets, sentHits, CONFIG.MELEE_RADIUS,
@@ -2338,86 +2202,6 @@ local function waitWhilePaused()
     end
 end
 
-local function hasClassicAlienModels()
-    if not ENTITY_CONTAINER then return false end
-    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-        if isAlienModel(model) then
-            return true
-        end
-    end
-    return false
-end
-
-local function isBusRushTestEnvironment()
-    -- This is only a fast test-mode detector. Classic alien farming never
-    -- requires a Bus object or zombie model.
-    if hasClassicAlienModels() then
-        return false
-    end
-
-    if ITEM_CONTAINER and ITEM_CONTAINER:FindFirstChild("Bus") then
-        return true
-    end
-
-    if ENTITY_CONTAINER then
-        for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-            local typeName = string.lower(tostring(model:GetAttribute("Type") or ""))
-            if typeName == "zombie" then
-                return true
-            end
-        end
-    end
-
-    for _, state in pairs(replicaStates) do
-        if string.lower(tostring(state.Name or "")) == "zombie" then
-            return true
-        end
-    end
-
-    return false
-end
-
-local function runBusRushTestAura()
-    currentMode = "Bus Rush test only - stationary hostile aura"
-    restoreMovement()
-    recordEvent("SYSTEM", "Fast hostile test mode selected",
-        "Bus/Zombie test environment detected | Movement disabled | Production Classic scan/collection remains separate")
-
-    while running do
-        waitWhilePaused()
-        if not running then break end
-
-        local character, root, humanoid = getCharacter()
-        if not character or not root or not humanoid then
-            currentTarget = "None"
-            setStatus("Waiting for character in test mode")
-            task.wait(0.5)
-        elseif humanoid.Health <= 0 then
-            currentTarget = "None"
-            setStatus("Player down; waiting for respawn")
-            task.wait(0.75)
-        else
-            ensureToolEquipped()
-            local hostiles = getHostileEntitiesNear(root.Position, CONFIG.MELEE_RADIUS)
-            hostileCountInRange = #hostiles
-
-            if #hostiles > 0 then
-                local sent = sendMeleeSweep(hostiles)
-                if sent > 0 then
-                    setStatus("Test aura active | Nearby hostiles=" .. tostring(#hostiles) .. " | Hits=" .. tostring(sent))
-                else
-                    setStatus("Test hostiles nearby | Waiting for melee replica/hitbox")
-                end
-            else
-                currentTarget = "None"
-                setStatus("Test aura active | Waiting for zombies")
-            end
-
-            task.wait(CONFIG.ATTACK_INTERVAL)
-        end
-    end
-end
-
 local function runClassicAlienScanAndCollection()
     currentMode = "Classic production - alien scan + token collection"
     -- Equip/map the Classic starting Shovel before entering PlatformStand flight.
@@ -2439,16 +2223,6 @@ local function runClassicAlienScanAndCollection()
     while running do
         waitWhilePaused()
         if not running then break end
-
-        -- If the player later enters the separate Bus/Zombie test environment,
-        -- switch safely to the stationary test branch instead of scanning it.
-        if isBusRushTestEnvironment() then
-            recordEvent("SYSTEM", "Zombie test environment detected during scan",
-                "Restoring scan movement and switching to stationary test aura")
-            restoreMovement()
-            runBusRushTestAura()
-            break
-        end
 
         local character, root, humanoid = getCharacter()
         if not character or not root or not humanoid then
@@ -2534,20 +2308,8 @@ end
 
 local function mainLoop()
     applyFullbright()
-
-    -- Allow replicated mode markers a short moment to arrive before selecting
-    -- the production scanner or the optional stationary zombie test branch.
-    local detectUntil = os.clock() + 4
-    while running and os.clock() < detectUntil and not isBusRushTestEnvironment() do
-        task.wait(0.2)
-    end
-
-    if isBusRushTestEnvironment() then
-        runBusRushTestAura()
-    else
-        runClassicAlienScanAndCollection()
-    end
-
+    recordEvent("SYSTEM", "Classic-only mode locked", "Bus Rush detection and stationary test branch are disabled")
+    runClassicAlienScanAndCollection()
     restoreMovement()
     restoreFullbright()
     setStatus("Stopped")
@@ -2921,7 +2683,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -16, 0, 28)
 title.Position = UDim2.new(0, 8, 0, 6)
 title.BackgroundTransparency = 1
-title.Text = "LAST STOP - ALIEN TOKEN FARMER HF8.0"
+title.Text = "LAST STOP - ALIEN TOKEN FARMER HF8.1"
 title.TextColor3 = Color3.fromRGB(115, 235, 150)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 14
@@ -3148,7 +2910,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF8.0-CLASSIC-SCAN-MELEE",
+            version = "1.0.1-HF8.1-CLASSIC-ONLY",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -3159,7 +2921,6 @@ local function exportDiagnostics()
             meleeReplicaIdSource = meleeReplicaIdSource,
             serverDamageEvents = serverDamageEvents,
             serverConfirmedKills = serverConfirmedKills,
-            hostileCountInRange = hostileCountInRange,
             alienKills = alienKills,
             monitoredAlienModels = monitoredAlienModelsTotal,
             alienHealthSourcesFound = alienHealthSourcesFound,
@@ -3221,7 +2982,7 @@ local function refreshGui()
             .. " | Replica ID: " .. tostring(meleeReplicaId)
             .. " (" .. tostring(meleeReplicaIdSource) .. ")"
             .. "\nTool: " .. tostring(equippedToolName)
-            .. " | Hostiles in range: " .. tostring(hostileCountInRange)
+            .. " | Scan Z: " .. tostring(scanZ) .. " | Lap: " .. tostring(lap)
             .. "\nAttack requests: " .. tostring(automatedAttackRequests)
             .. " | Hit requests: " .. tostring(automatedHitRequests)
             .. "\nLocal call errors: " .. tostring(remoteErrors)
@@ -3344,7 +3105,7 @@ local function startFarm()
     end
     running = true
     paused = false
-    recordEvent("SYSTEM", "Alien Token Farmer started", "Auto-detecting Classic alien scan/collection or optional stationary zombie test mode; melee item is server-mapped")
+    recordEvent("SYSTEM", "Classic Alien Token Farmer started", "Classic scan/approach/kill/token-collection loop; Shovel is the only supported melee item")
     applyFullbright()
     if mainLoopThread then
         mainLoopThread = nil
@@ -3371,6 +3132,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "HF8.0 initialization complete", "Automatic start scheduled | Classic alien scan + token collection | Starting Shovel dynamically mapped | Bus Rush is optional test mode only | No global hooks")
+recordEvent("SYSTEM", "HF8.1 initialization complete", "Automatic start scheduled | Classic-only alien scan + token collection | Starting Shovel dynamically mapped | No mode detection or Bus Rush branch | No global hooks")
 refreshDiagPanel()
-log("HF8.0 loaded. Classic alien scan and token collection scheduled; Bus Rush stationary aura is test-only.")
+log("HF8.1 loaded. Classic-only alien scan and token collection scheduled.")
