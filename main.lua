@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF9.6 (CLOSE TORSO + 3-TARGET SWEEP + FULL CLEAR + TOKEN RECOVERY + ANTI-AFK)
+LAST STOP - ALIEN TOKEN FARMER HF9.7 (CLOSE TORSO + 3-TARGET SWEEP + FULL CLEAR + TOKEN RECOVERY + ANTI-AFK)
 Standalone experimental build for the Last Stop Roblox experience.
-HF9.6 keeps HF9.5's unlimited cluster clearing, death-position token recovery, anti-AFK, corrected hit-part hierarchy, collateral protection, and original ReplicaSignal transport. It restores HF9.0's close torso-relative approach (4.5 studs below the selected torso anchor with 1.25-stud horizontal standoff) and 10-stud melee contact limit while retaining up to three nearby alien hits per sweep.
+HF9.7 keeps HF9.5's unlimited cluster clearing, death-position token recovery, anti-AFK, corrected hit-part hierarchy, collateral protection, and original ReplicaSignal transport. It uses an 8-stud torso-relative attack hover with 0.5-stud horizontal standoff (inside the 10-stud melee contact limit), debounces shovel re-equips, and retreats to a 20-stud hover while the shovel is unavailable.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -54,11 +54,13 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
-    HOVER_BELOW = 4.5, -- measured from the selected torso anchor, HF9.0 close-range profile
+    HOVER_BELOW = 8.0, -- torso-relative spacing; keeps selected torso contact inside the 10-stud hit limit
     HOVER_REPOSITION_THRESHOLD = 0.75,
-    TORSO_HORIZONTAL_STANDOFF = 1.25, -- small horizontal standoff from the selected torso anchor
+    TORSO_HORIZONTAL_STANDOFF = 0.5, -- remain almost directly underneath the selected torso anchor
     ATTACK_INTERVAL = 0.0655, -- measured median from the working outgoing capture
     MELEE_HIT_DELAY = 0.0323, -- measured median Attack -> first Hit delay
+    TOOL_EQUIP_RETRY_INTERVAL = 0.35, -- prevent rapid EquipTool/Unequipped cycling
+    COOLDOWN_HOVER_BELOW = 20.0, -- temporary retreat while the shovel is not equipped
 
     NO_KILL_TIMEOUT = 15, -- ends one failed attack attempt; the active cluster remains locked
     MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- triggers a close re-approach; never releases the cluster
@@ -123,6 +125,13 @@ local rewardToastEstimate = 0
 local remoteErrors = 0
 local currentTarget = "None"
 local equippedToolName = "None"
+local lastToolEquipAttemptAt = -math.huge
+local toolEquipAttempts = 0
+local toolEquippedEvents = 0
+local toolUnequippedEvents = 0
+local playerHealthCurrent = nil
+local playerHealthMax = nil
+local playerDeathEvents = 0
 local currentStatus = "Initializing"
 local lastAlienKillAt = os.clock()
 local lastLabelText = {}
@@ -141,7 +150,7 @@ local mainLoopThread = nil
 local diagEvents = {}
 local diagCounts = {}
 local diagLastByKey = {}
-local diagMaxEvents = 1800
+local diagMaxEvents = 5000
 local diagErrorCount = 0
 local diagPanel = nil
 local diagText = nil
@@ -733,10 +742,12 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF9.6-CLOSE-TORSO-10-STUD-FULL-CLEAR-TOKEN-RECOVERY-ANTIAFK",
+        "Version: HF9.7-SAFER-TORSO-HOVER-TOOL-RETRY-ANTIAFK",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
+        "Player health: " .. tostring(playerHealthCurrent) .. "/" .. tostring(playerHealthMax) .. " | Death events=" .. tostring(playerDeathEvents),
+        "Tool cycle: EquipAttempts=" .. tostring(toolEquipAttempts) .. " | EquippedEvents=" .. tostring(toolEquippedEvents) .. " | UnequippedEvents=" .. tostring(toolUnequippedEvents),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
         "Alien kill notifications: " .. tostring(alienKills),
         "Server confirmations: DamageDealt=" .. tostring(serverDamageEvents) .. " | OnDied=" .. tostring(serverOnDiedEvents) .. " | MeleeEffects=" .. tostring(serverMeleeEffects),
@@ -884,7 +895,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.6 | Base=HF9.5 full-clear/token/anti-AFK systems | CombatProfile=HF9.0 close torso-relative hover, 10-stud contact, up to 3 alien targets, corrected part hierarchy and collateral guard | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.7 | Base=HF9.5 full-clear/token/anti-AFK systems | CombatProfile=HF9.0 close torso-relative hover, 10-stud contact, up to 3 alien targets, corrected part hierarchy and collateral guard | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -927,8 +938,8 @@ local function ensureToolEquipped()
         return false
     end
 
-    -- Last Stop gives the player one starting melee tool: the shovel in hotbar slot 1.
-    -- Its runtime name may be a GUID, so do not depend on Name/ToolTip keywords.
+    -- If the game has the shovel equipped already, do not fight its Enabled state.
+    -- The captured game transport can still accept a melee request while Enabled=false.
     local equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
         if equippedToolName ~= equipped.Name then
@@ -958,7 +969,18 @@ local function ensureToolEquipped()
         return false
     end
 
-    recordEvent("WEAPON", "Equipping starting shovel", candidate.Name .. " | Source=Backpack first Tool | HotbarSlot=1")
+    local now = os.clock()
+    if now - lastToolEquipAttemptAt < CONFIG.TOOL_EQUIP_RETRY_INTERVAL then
+        recordThrottled("tool-equip-retry-throttled", 1, "WEAPON", "Shovel equip retry throttled",
+            "Previous attempt was " .. string.format("%.3f", now - lastToolEquipAttemptAt)
+                .. "s ago | RetryInterval=" .. tostring(CONFIG.TOOL_EQUIP_RETRY_INTERVAL))
+        return false
+    end
+
+    lastToolEquipAttemptAt = now
+    toolEquipAttempts = toolEquipAttempts + 1
+    recordThrottled("tool-equip-attempt", 0.15, "WEAPON", "Equipping starting shovel",
+        candidate.Name .. " | Source=Backpack first Tool | HotbarSlot=1 | Attempt=" .. tostring(toolEquipAttempts))
     local ok, equipError = pcall(function()
         humanoid:EquipTool(candidate)
     end)
@@ -967,15 +989,19 @@ local function ensureToolEquipped()
         return false
     end
 
-    task.wait(0.12)
+    -- HF9.6 waited 120 ms, longer than the ~90-110 ms equipped window in this run.
+    -- Verify quickly so the captured Attack -> Hit sequence can use the live Tool.
+    task.wait(0.025)
     equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
         equippedToolName = equipped.Name
-        recordEvent("WEAPON", "Starting shovel equipped", equippedToolName .. " | Slot=1 | ToolEnabled=" .. tostring(equipped.Enabled))
+        recordEvent("WEAPON", "Starting shovel equip verified",
+            equippedToolName .. " | Slot=1 | ToolEnabled=" .. tostring(equipped.Enabled)
+                .. " | VerificationDelay=0.025s")
         return true
     end
 
-    recordThrottled("equip-not-confirmed", 2, "WEAPON", "Starting shovel equip not confirmed", candidate.Name)
+    recordThrottled("equip-not-confirmed", 0.5, "WEAPON", "Starting shovel equip not confirmed", candidate.Name)
     return false
 end
 
@@ -2105,7 +2131,7 @@ local function moveCharacter(position, lookAtPosition, moveReason)
     return true
 end
 
-local function moveBelowAlien(entry)
+local function moveBelowAlien(entry, hoverBelowOverride)
     if not entry or not entry.root or not entry.root.Parent then return false end
 
     local targetRootPosition = entry.root.Position
@@ -2127,9 +2153,10 @@ local function moveBelowAlien(entry)
 
     -- Measure the hover gap from the torso anchor. The old build measured from
     -- the lower model root, leaving the torso about 12.2 studs vertically away.
+    local hoverBelow = tonumber(hoverBelowOverride) or CONFIG.HOVER_BELOW
     local hoverPosition = Vector3.new(
         anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
-        anchorPosition.Y - CONFIG.HOVER_BELOW,
+        anchorPosition.Y - hoverBelow,
         anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
     )
     local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
@@ -2139,7 +2166,10 @@ local function moveBelowAlien(entry)
     local requestedDelta = (playerRoot.Position - hoverPosition).Magnitude
     local moved = true
     if requestedDelta > CONFIG.HOVER_REPOSITION_THRESHOLD then
-        moved = moveCharacter(hoverPosition, horizontalLookAt, "SAFE_HOVER_CLOSE_TORSO_APPROACH")
+        local moveReason = hoverBelow > CONFIG.HOVER_BELOW
+            and "TOOL_COOLDOWN_SAFE_HOVER"
+            or "SAFE_HOVER_CLOSE_TORSO_APPROACH"
+        moved = moveCharacter(hoverPosition, horizontalLookAt, moveReason)
     end
 
     local _, actualRoot = getCharacter()
@@ -2151,7 +2181,7 @@ local function moveBelowAlien(entry)
     local camera = Workspace.CurrentCamera
     local cameraType = camera and tostring(camera.CameraType) or "unknown"
 
-    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Close torso-relative hover maintained", string.format(
+    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Torso-relative hover maintained", string.format(
         "Variant=%s | Model=%s | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualTorsoVerticalOffset=%.2f | ActualRootVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelowTorso=%.2f | PreviousAnchorDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
         entry.variant, entry.model.Name, torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
         anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
@@ -2159,7 +2189,7 @@ local function moveBelowAlien(entry)
         actualPosition.X, actualPosition.Y, actualPosition.Z,
         actualTorsoOffset, actualRootOffset, actualRootDistance, actualAnchorDistance,
         CONFIG.TORSO_HORIZONTAL_STANDOFF, approachVector.X, approachVector.Z,
-        CONFIG.HOVER_BELOW, beforeDistance, requestedDelta, tostring(moved), cameraType
+        hoverBelow, beforeDistance, requestedDelta, tostring(moved), cameraType
     ))
     return moved
 end
@@ -2191,7 +2221,7 @@ local function restoreMovement()
     activeHumanoid = nil
 end
 
-local function sendMeleeSweep(entries)
+local function sendMeleeSweep(entries, toolAlreadyReady)
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
         return 0
@@ -2200,7 +2230,7 @@ local function sendMeleeSweep(entries)
     -- Preserve the Classic starting Shovel when no tool is equipped, but use
     -- whichever melee Tool is currently equipped once the player changes it.
     -- Tool.Enabled is recorded for diagnostics but is not used as an attack gate.
-    if not ensureToolEquipped() then
+    if toolAlreadyReady ~= true and not ensureToolEquipped() then
         setStatus("Waiting for starting melee tool in hotbar slot 1")
         return 0
     end
@@ -2751,10 +2781,17 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
         recordThrottled("target-selection", 0.75, "TARGET", "Alien target locked",
             "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name
                 .. " | ClusterTargets=" .. tostring(#entries) .. " | TargetLockUntilDeathOrRemoval=true | RemovalDoesNotClearCluster")
-        moveBelowAlien(nearest)
+        -- Do not keep the player at attack distance while the game has the shovel unequipped.
+        -- Equip is debounced and verified quickly; when unavailable, hold farther below the torso.
+        local toolReady = ensureToolEquipped()
+        if toolReady then
+            moveBelowAlien(nearest, CONFIG.HOVER_BELOW)
+        else
+            moveBelowAlien(nearest, CONFIG.COOLDOWN_HOVER_BELOW)
+        end
         local targetRecordBefore = monitoredAliens[nearest.model]
         local targetHitCountBefore = targetRecordBefore and (targetRecordBefore.serverHitCount or 0) or 0
-        local hits = sendMeleeSweep(entries)
+        local hits = toolReady and sendMeleeSweep(entries, true) or 0
         if hits > 0 then
             setStatus("Locked " .. tostring(nearest.variant) .. " / " .. tostring(nearest.model.Name) .. " | " .. tostring(hits) .. " nearby Hit requests")
         else
@@ -3323,18 +3360,29 @@ local function monitorCharacter(character)
         return
     end
     monitoredHumanoids[humanoid] = true
+    playerHealthCurrent = humanoid.Health
+    playerHealthMax = humanoid.MaxHealth
     recordEvent("PLAYER", "Character monitor attached", "Health=" .. tostring(humanoid.Health) .. "/" .. tostring(humanoid.MaxHealth))
     local previousHealth = humanoid.Health
     humanoid.HealthChanged:Connect(function(newHealth)
+        playerHealthCurrent = newHealth
+        playerHealthMax = humanoid.MaxHealth
         if newHealth < previousHealth then
-            recordEvent("PLAYER", "Player health decreased", string.format("Health=%.1f->%.1f", previousHealth, newHealth))
+            recordEvent("PLAYER", "Player health decreased", string.format("Health=%.1f->%.1f | MaxHealth=%.1f", previousHealth, newHealth, humanoid.MaxHealth))
         elseif newHealth > previousHealth then
             recordThrottled("health-heal", 0.5, "PLAYER", "Player health increased", string.format("Health=%.1f->%.1f", previousHealth, newHealth))
         end
         previousHealth = newHealth
     end)
+    humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+        playerHealthMax = humanoid.MaxHealth
+        recordThrottled("player-max-health", 1, "PLAYER", "Player MaxHealth changed", "MaxHealth=" .. tostring(playerHealthMax))
+    end)
     humanoid.Died:Connect(function()
-        recordEvent("PLAYER", "Player humanoid died", "Health=" .. tostring(humanoid.Health))
+        playerHealthCurrent = 0
+        playerDeathEvents = playerDeathEvents + 1
+        recordEvent("PLAYER", "Player humanoid died", "Health=" .. tostring(humanoid.Health)
+            .. " | DeathEvents=" .. tostring(playerDeathEvents))
     end)
 end
 
@@ -3372,14 +3420,18 @@ local function monitorTool(tool)
 
     local equippedOk, equippedConnection = pcall(function()
         return tool.Equipped:Connect(function()
-            recordEvent("WEAPON", "Tool Equipped event observed", "Tool=" .. tostring(tool.Name)
-                .. " | Parent=" .. tostring(tool.Parent and tool.Parent.Name))
+            toolEquippedEvents = toolEquippedEvents + 1
+            recordThrottled("tool-equipped:" .. tostring(tool.Name), 0.75, "WEAPON", "Tool Equipped event observed",
+                "Tool=" .. tostring(tool.Name) .. " | Parent=" .. tostring(tool.Parent and tool.Parent.Name)
+                    .. " | TotalEquippedEvents=" .. tostring(toolEquippedEvents))
         end)
     end)
     if equippedOk and equippedConnection then table.insert(monitoredTools[tool].connections, equippedConnection) end
     local unequippedOk, unequippedConnection = pcall(function()
         return tool.Unequipped:Connect(function()
-            recordEvent("WEAPON", "Tool Unequipped event observed", "Tool=" .. tostring(tool.Name))
+            toolUnequippedEvents = toolUnequippedEvents + 1
+            recordThrottled("tool-unequipped:" .. tostring(tool.Name), 0.75, "WEAPON", "Tool Unequipped event observed",
+                "Tool=" .. tostring(tool.Name) .. " | TotalUnequippedEvents=" .. tostring(toolUnequippedEvents))
         end)
     end)
     if unequippedOk and unequippedConnection then table.insert(monitoredTools[tool].connections, unequippedConnection) end
@@ -3748,7 +3800,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF9.6-CLOSE-TORSO-10-STUD-FULL-CLEAR-TOKEN-RECOVERY-ANTIAFK",
+            version = "HF9.7-SAFER-TORSO-HOVER-TOOL-RETRY-ANTIAFK",
             scanAdvanceCount = scanAdvanceCount,
             deferredAlienGuidCount = deferredAlienGuidCount,
             gameId = game.GameId,
@@ -3771,6 +3823,12 @@ local function exportDiagnostics()
             nativeToolActivations = nativeToolActivations,
             automatedAttackRequests = automatedAttackRequests,
             automatedHitRequests = automatedHitRequests,
+            toolEquipAttempts = toolEquipAttempts,
+            toolEquippedEvents = toolEquippedEvents,
+            toolUnequippedEvents = toolUnequippedEvents,
+            playerHealthCurrent = playerHealthCurrent,
+            playerHealthMax = playerHealthMax,
+            playerDeathEvents = playerDeathEvents,
             meleeReplicaId = lastResolvedMeleeReplicaId,
             meleeReplicaIdSource = lastReplicaIdSource,
             replicaControllerPath = replicaControllerPath,
@@ -3984,6 +4042,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target allowlist=AlienType1/2/3 | Zombie/Parasite marker exclusion + 10-stud non-alien collateral guard | MeleeContactRange=10 (hard ceiling 80) | ClusterPolicy=UNLIMITED; no survivor deferral | TokenCollection=death-position centered with retries | AntiAFK=" .. tostring(antiAfkAvailable) .. " | AttackDirection=nearest valid alien contact | Diagnostics=HF9.6 | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target allowlist=AlienType1/2/3 | Zombie/Parasite marker exclusion + 10-stud non-alien collateral guard | MeleeContactRange=10 (hard ceiling 80) | ClusterPolicy=UNLIMITED; no survivor deferral | TokenCollection=death-position centered with retries | AntiAFK=" .. tostring(antiAfkAvailable) .. " | AttackDirection=nearest valid alien contact | Diagnostics=HF9.7 | Hooks=none")
 refreshDiagPanel()
-log("Loaded HF9.6. Automatic start scheduled. Close torso-relative combat, 10-stud contact, 3-target sweeps, full-cluster clearing, death-position token collection/retries, and anti-AFK enabled.")
+log("Loaded HF9.7. Automatic start scheduled. Close torso-relative combat, 10-stud contact, 3-target sweeps, full-cluster clearing, death-position token collection/retries, and anti-AFK enabled.")
