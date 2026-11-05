@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.3 (CLASSIC SHOVEL AURA + HF5.9 SCANNER)
+LAST STOP - ALIEN TOKEN FARMER HF8.4 (CLASSIC SHOVEL PROFILE + HF5.9 SCANNER)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.3 preserves the original HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry while using a three-target melee aura.
+HF8.4 preserves the original HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Its Shovel Attack/Hit timing, direction bias, hit radius, and repeat count are restored from the original main.lua Classic profile; Bus Rush Bat values are not reused.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -14,7 +14,7 @@ Observed melee signal shape from the supplied V1.2 diagnostics:
 
 No external loaders, no global metamethod hooks, no input interception.
 Passive UserInputService event listeners are used for diagnostics; no synthetic input is sent.
-The Classic Shovel replica ID is retained from the original Classic diagnostics; server damage confirmation is monitored separately.
+The Classic Shovel replica ID remains the original source fallback (120), not dynamically verified. Classic-specific combat settings are restored from main.lua; server damage confirmation is monitored separately.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -50,18 +50,18 @@ local CONFIG = {
     SCAN_MIN_Z = -100000,
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
-    ALIEN_ATTACK_RANGE = 120,
+    ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
     HOVER_BELOW = 9.7,
     TORSO_HORIZONTAL_STANDOFF = 4.8,
-    MELEE_ATTACK_VERTICAL_BIAS = 0.39,
-    ATTACK_INTERVAL = 0.065, -- total Attack-to-next-Attack cycle from the successful aura capture
-    MELEE_HIT_DELAY = 0.032, -- Attack -> first Hit delay from the successful aura capture
+    MELEE_ATTACK_VERTICAL_BIAS = 0.19, -- original Classic Shovel profile from main.lua
+    ATTACK_INTERVAL = 0.05, -- original Classic Shovel interval from main.lua
+    MELEE_HIT_DELAY = 0.026, -- original Classic Shovel Attack -> Hit delay from main.lua
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
-    MAX_HITS_PER_TARGET = 10, -- candidate inspection cap; one Hit request per selected target
+    MAX_HITS_PER_TARGET = 10, -- original Classic Shovel repeat count per selected target
     MAX_TARGETS_PER_SWEEP = 3,
-    MAX_HITS_PER_SWEEP = 3,
-    MELEE_HIT_MAX_DISTANCE = 16,
+    MAX_HITS_PER_SWEEP = 30, -- original Classic Shovel cap: up to 10 hits on each of 3 targets
+    MELEE_HIT_MAX_DISTANCE = 50, -- original Classic Shovel hit-part distance from main.lua
     CLASSIC_SHOVEL_REPLICA_ID = 120, -- original Classic source ID; not the Bus Rush Bat ID
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
@@ -305,7 +305,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.3-CLASSIC-SHOVEL-AURA-HF5.9-BASE",
+        "Version: HF8.4-CLASSIC-SHOVEL-MAIN-LUA-PROFILE-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -391,7 +391,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.3 | Base=HF5.9 scanner/collector | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId) .. " | ClassicShovelReplicaId=" .. tostring(CONFIG.CLASSIC_SHOVEL_REPLICA_ID) .. " (source fallback, not dynamically resolved)")
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.4 | Base=HF5.9 scanner/collector | CombatProfile=original Classic Shovel main.lua | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId) .. " | ClassicShovelReplicaId=" .. tostring(CONFIG.CLASSIC_SHOVEL_REPLICA_ID) .. " (source fallback, not dynamically resolved)")
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1533,26 +1533,25 @@ local function restoreMovement()
 end
 
 local function sendMeleeSweep(entries)
+    local signalId = CONFIG.CLASSIC_SHOVEL_REPLICA_ID
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
         return 0
     end
 
+    -- Last Stop's only starting weapon is the shovel in hotbar slot 1.
+    -- Tool.Enabled is recorded for diagnostics but is not used as an attack gate.
     if not ensureToolEquipped() then
-        setStatus("Waiting for the starting Shovel")
+        setStatus("Waiting for starting shovel in hotbar slot 1")
         return 0
     end
-
     local equippedTool = character:FindFirstChildOfClass("Tool")
     if not equippedTool then
-        setStatus("Starting Shovel is not equipped")
+        setStatus("Starting shovel is not equipped")
         return 0
     end
-
     if not equippedTool.Enabled then
-        recordThrottled("shovel-disabled-state", 2, "WEAPON",
-            "Shovel equipped but Tool.Enabled is false",
-            "Observed only; the Bus Rush Bat was also disabled during successful damage capture")
+        recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF5.9 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
     end
 
     local candidates = {}
@@ -1562,6 +1561,14 @@ local function sendMeleeSweep(entries)
             if contact and contact.part and contact.part.Parent then
                 contact.entry = entry
                 table.insert(candidates, contact)
+            else
+                recordThrottled(
+                    "melee-no-part-in-range:" .. entry.model.Name,
+                    1,
+                    "COMBAT",
+                    "Alien skipped: no body-part center in attack radius",
+                    entry.variant .. "/" .. entry.model.Name .. " | MaxPartCenterDistance=" .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE)
+                )
             end
         end
     end
@@ -1575,32 +1582,36 @@ local function sendMeleeSweep(entries)
 
     local maxTargets = math.min(#candidates, CONFIG.MAX_TARGETS_PER_SWEEP)
     if maxTargets == 0 then
-        recordThrottled("melee-no-valid-contact", 0.75, "COMBAT",
-            "No eligible torso/arm/head/leg hitbox inside aura radius",
-            "Radius=" .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " | Alien entries=" .. tostring(#entries))
+        recordThrottled(
+            "melee-no-valid-contact",
+            0.75,
+            "COMBAT",
+            "No valid alien body part in attack radius",
+            "No eligible body-part center within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
+        )
         return 0
     end
 
-    local first = candidates[1]
-    local delta = first.position - root.Position
-    local horizontal = Vector3.new(delta.X, 0, delta.Z)
-    if horizontal.Magnitude < 0.001 then
-        local look = root.CFrame.LookVector
-        horizontal = Vector3.new(look.X, 0, look.Z)
+    -- Aim at the first selected body contact. The observer capture shows the
+    -- Attack direction leading to the first Hit part, followed by Hit calls.
+    local nearestContact = candidates[1]
+    local contactDelta = nearestContact.position - root.Position
+    local horizontalDirection = Vector3.new(contactDelta.X, 0, contactDelta.Z)
+    if horizontalDirection.Magnitude < 0.001 then
+        local fallbackLook = root.CFrame.LookVector
+        horizontalDirection = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
     end
-    if horizontal.Magnitude < 0.001 then
-        horizontal = Vector3.new(0, 0, -1)
+    if horizontalDirection.Magnitude < 0.001 then
+        horizontalDirection = Vector3.new(0, 0, -1)
     else
-        horizontal = horizontal.Unit
+        horizontalDirection = horizontalDirection.Unit
     end
-
     local direction = Vector3.new(
-        horizontal.X,
+        horizontalDirection.X,
         CONFIG.MELEE_ATTACK_VERTICAL_BIAS,
-        horizontal.Z
+        horizontalDirection.Z
     ).Unit
 
-    local signalId = CONFIG.CLASSIC_SHOVEL_REPLICA_ID
     lastAutoAttackAt = os.clock()
     automatedAttackRequests = automatedAttackRequests + 1
     local okAttack, attackError = pcall(function()
@@ -1612,59 +1623,110 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
+    -- The captured working sequence had approximately 26 ms between Attack
+    -- and the first Hit event.
     task.wait(CONFIG.MELEE_HIT_DELAY)
+    recordThrottled(
+        "melee-attack-dispatched",
+        0.25,
+        "COMBAT",
+        "Melee Attack request dispatched",
+        string.format(
+            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | SwingDirection=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            nearestContact.entry.variant,
+            nearestContact.entry.model.Name,
+            nearestContact.part.Name,
+            nearestContact.partClass or "UNKNOWN",
+            nearestContact.priority or 99,
+            nearestContact.part:GetFullName(),
+            nearestContact.distance,
+            nearestContact.position.X, nearestContact.position.Y, nearestContact.position.Z,
+            contactDelta.X, contactDelta.Y, contactDelta.Z,
+            tostring(nearestContact.material),
+            root.Position.X, root.Position.Y, root.Position.Z,
+            direction.X, direction.Y, direction.Z,
+            equippedTool.Name,
+            tostring(equippedTool.Enabled)
+        )
+    )
 
     local sentHits = 0
-    local selected = {}
-    for index = 1, maxTargets do
+    for targetIndex = 1, maxTargets do
         if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
             break
         end
 
-        local contact = candidates[index]
+        local contact = candidates[targetIndex]
         local entry = contact.entry
-        local part = contact.part
-        if part and part.Parent and entry and entry.model and entry.model.Parent then
-            local okHit, hitError = pcall(function()
-                ReplicaSignal:FireServer(
-                    signalId,
-                    "Melee",
-                    "Hit",
-                    part,
-                    part.Position,
-                    contact.normal or Vector3.new(0, 1, 0),
-                    contact.material or part.Material
-                )
-            end)
+        if contact.part and contact.part.Parent and entry.model and entry.model.Parent then
+            local targetHitCount = 0
+            for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
+                if sentHits >= CONFIG.MAX_HITS_PER_SWEEP or not contact.part.Parent then
+                    break
+                end
 
-            if okHit then
-                sentHits = sentHits + 1
-                automatedHitRequests = automatedHitRequests + 1
-                lastAutoHitAt = os.clock()
-                lastAutoHitByModel[entry.model] = lastAutoHitAt
-                table.insert(selected, string.format(
-                    "%s/%s:%s[%s,p%d]@%.1f",
-                    tostring(entry.variant), tostring(entry.model.Name),
-                    tostring(part.Name), tostring(contact.partClass),
-                    tonumber(contact.priority) or 99, tonumber(contact.distance) or -1
-                ))
-            else
-                remoteErrors = remoteErrors + 1
-                recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
+                local okHit, hitError = pcall(function()
+                    -- Match the captured working payload exactly: part center,
+                    -- upward normal, and the part's actual material.
+                    ReplicaSignal:FireServer(
+                        signalId,
+                        "Melee",
+                        "Hit",
+                        contact.part,
+                        contact.part.Position,
+                        Vector3.new(0, 1, 0),
+                        contact.part.Material
+                    )
+                end)
+
+                if okHit then
+                    sentHits = sentHits + 1
+                    targetHitCount = targetHitCount + 1
+                    lastAutoHitAt = os.clock()
+                    automatedHitRequests = automatedHitRequests + 1
+                    lastAutoHitByModel[entry.model] = lastAutoHitAt
+                else
+                    remoteErrors = remoteErrors + 1
+                    recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
+                end
+            end
+
+            if targetHitCount > 0 then
+                recordThrottled(
+                    "melee-hit-summary:" .. entry.model.Name,
+                    0.5,
+                    "COMBAT",
+                    "Melee part hits dispatched",
+                    string.format(
+                        "Target=%s/%s | Part=%s | PartClass=%s | Priority=%d | Repeats=%d | PartPosition=(%.2f, %.2f, %.2f) | Normal=(0, 1, 0) | Material=%s | Server damage unverified",
+                        entry.variant,
+                        entry.model.Name,
+                        contact.part.Name,
+                        contact.partClass or "UNKNOWN",
+                        contact.priority or 99,
+                        targetHitCount,
+                        contact.part.Position.X,
+                        contact.part.Position.Y,
+                        contact.part.Position.Z,
+                        tostring(contact.part.Material)
+                    )
+                )
             end
         end
     end
 
-    recordEvent("COMBAT", "Classic Shovel aura sweep dispatched",
-        string.format(
-            "ItemGuid=%s | ReplicaId=%d (Classic source ID; Bus Rush Bat ID 58 is not reused) | AttackDirection=(%.3f, %.3f, %.3f) | Targets=%d | HitRequests=%d | Radius=%.1f | ToolEnabled=%s | ServerDamage=%d | ServerOnDied=%d | ServerMeleeEffects=%d | Selected=%s",
-            tostring(equippedTool.Name), signalId,
-            direction.X, direction.Y, direction.Z,
-            maxTargets, sentHits, CONFIG.MELEE_HIT_MAX_DISTANCE,
-            tostring(equippedTool.Enabled), serverDamageEvents,
-            serverOnDiedEvents, serverMeleeEffects, table.concat(selected, " ; ")
-        ))
-
+    recordThrottled(
+        "melee-sweep-summary",
+        0.5,
+        "COMBAT",
+        "Attack sweep finished",
+        "Captured-payload Hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
+    )
+    recordEvent("COMBAT", "Classic Shovel sweep summary", string.format(
+        "ReplicaId=%d | Targets=%d | HitRequests=%d | HitsPerTargetCap=%d | ServerDamageEvents=%d | ServerMeleeEffects=%d | ServerDeaths=%d | Server acceptance remains determined only by confirmations",
+        signalId, maxTargets, sentHits, CONFIG.MAX_HITS_PER_TARGET,
+        serverDamageEvents, serverMeleeEffects, serverOnDiedEvents
+    ))
     return sentHits
 end
 
@@ -2582,7 +2644,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.3-CLASSIC-SHOVEL-AURA-HF5.9-BASE",
+            version = "HF8.4-CLASSIC-SHOVEL-MAIN-LUA-PROFILE-HF5.9-BASE",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
