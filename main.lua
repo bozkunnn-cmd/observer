@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.8 (TARGETED ALIEN AIM + ENTITY-ATTRIBUTED COMBAT)
+LAST STOP - ALIEN TOKEN FARMER HF8.9 (BOUNDED CLUSTER RETRY + SCAN RESUME)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.8 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
+HF8.9 preserves the HF8.8 combat, HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. It fixes a scan-state deadlock: a cluster that produces no server-confirmed progress is retried a bounded number of times, then deferred only across overlapping scan points so the route resumes. Deferred aliens become eligible again after the scan has moved beyond their detection radius.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -15,7 +15,7 @@ Observed melee signal shape from captured traffic:
 
 No external loaders, no global metamethod hooks, no input interception.
 Passive UserInputService event listeners are used for diagnostics; no synthetic input is sent.
-Attack direction follows CurrentCamera.CFrame.LookVector. Server damage confirmation is monitored separately.
+Attack direction follows the selected alien-contact centroid, with nearest-contact fallback. Server damage confirmation is monitored separately.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -59,6 +59,9 @@ local CONFIG = {
 
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
+    MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- after two full no-progress passes, resume route
+    MAX_CLUSTER_TOTAL_SECONDS = 90, -- hard ceiling even if sporadic impacts never finish a cluster
+    CLUSTER_RETRY_DELAY = 0.25,
     MAX_HITS_PER_TARGET = 1, -- observed working aura: one Hit per selected target
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
@@ -74,6 +77,8 @@ local running = false
 local paused = false
 local scanZ = CONFIG.SCAN_START_Z
 local lap = 1
+local scanAdvanceCount = 0
+local deferredAlienGuids = {} -- GUID -> scan advance count through which it is skipped
 local alienKills = 0
 local serverDamageEvents = 0
 local serverOnDiedEvents = 0
@@ -679,7 +684,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.8-TARGETED-ALIEN-AURA-HF5.9-BASE",
+        "Version: HF8.9-BOUNDED-RETRY-RESUME-SCAN-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -768,7 +773,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.8 | Base=HF5.9 scanner/collector | CombatProfile=alien-cluster-directed 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.9 | Base=HF5.9 scanner/collector | CombatProfile=alien-cluster-directed 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -955,7 +960,14 @@ local function getAliensNear(position, radius)
     end
     for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
         local variant = isAlienModel(model)
-        if variant and not hasZombieMarker(model) and isModelAlive(model) then
+        local guidKey = tostring(model.Name)
+        local deferUntil = deferredAlienGuids[guidKey]
+        local isDeferred = deferUntil ~= nil and scanAdvanceCount <= deferUntil
+        if deferUntil ~= nil and scanAdvanceCount > deferUntil then
+            deferredAlienGuids[guidKey] = nil
+        end
+
+        if variant and not isDeferred and not hasZombieMarker(model) and isModelAlive(model) then
             local root = getModelRoot(model)
             if root then
                 local distance = (root.Position - position).Magnitude
@@ -2255,18 +2267,20 @@ end
 
 local function engageAliens(seedEntries)
     if not seedEntries or #seedEntries == 0 then
-        return
+        return true, false
     end
 
     local firstTarget = seedEntries[1]
     if not firstTarget.root or not firstTarget.root.Parent then
-        return
+        return false, false
     end
 
     local clusterCenter = firstTarget.root.Position
     local startTime = os.clock()
     local initialKillCount = alienKills
     local startKillCount = initialKillCount
+    local initialAlienImpactCount = serverConfirmedAlienHitEvents
+    local initialAlienDeathCount = serverAlienDeathEvents
     recordEvent("TARGET", "Alien cluster engagement started", string.format("InitialTarget=%s/%s | Count=%d | Center=(%.1f, %.1f, %.1f)", firstTarget.variant, firstTarget.model.Name, #seedEntries, clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
     local lastProgressTime = os.clock()
     local lastKnownAlienImpacts = serverConfirmedAlienHitEvents
@@ -2302,28 +2316,34 @@ local function engageAliens(seedEntries)
             lastKnownAlienDeaths = serverAlienDeathEvents
         end
 
-        -- Health-bar width changes are retained for diagnostics only. The previous build
-        -- treated tiny animation deltas as progress even when the server had
-        -- stopped confirming hits on the selected alien. They no longer reset
-        -- the engagement timeout.
-
+        -- UI animation deltas are diagnostic only; only server-confirmed alien
+        -- impacts/deaths reset this no-progress timer.
         if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
-            setStatus("No new alien kill confirmation; ending this engagement")
+            setStatus("No new server-confirmed alien progress; ending this engagement pass")
             break
         end
 
         task.wait(math.max(0, CONFIG.ATTACK_INTERVAL - CONFIG.MELEE_HIT_DELAY))
     end
 
-    setStatus("Collecting drops from cleared alien area")
-    recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime) .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount) .. " | CurrentKillNotifications=" .. tostring(alienKills))
+    setStatus("Collecting drops from alien area")
     local collected = collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
-    recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
     local remaining = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
     local clusterCleared = (#remaining == 0)
+    local madeProgress = serverConfirmedAlienHitEvents > initialAlienImpactCount
+        or serverAlienDeathEvents > initialAlienDeathCount
+        or alienKills > initialKillCount
+
+    recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime)
+        .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount)
+        .. " | AlienImpactDelta=" .. tostring(serverConfirmedAlienHitEvents - initialAlienImpactCount)
+        .. " | AlienDeathDelta=" .. tostring(serverAlienDeathEvents - initialAlienDeathCount)
+        .. " | RemainingInAttackRadius=" .. tostring(#remaining)
+        .. " | Progress=" .. tostring(madeProgress))
+    recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
     recordEvent("TARGET", "Cluster clearance check", "RemainingAliens=" .. tostring(#remaining) .. " | Cleared=" .. tostring(clusterCleared))
     currentTarget = "None"
-    return clusterCleared
+    return clusterCleared, madeProgress
 end
 
 local function getCurrentScanPosition()
@@ -2333,6 +2353,7 @@ end
 local function advanceScan()
     local oldZ = scanZ
     local oldLap = lap
+    scanAdvanceCount = scanAdvanceCount + 1
     scanZ = scanZ - CONFIG.SCAN_STEP
     if scanZ < CONFIG.SCAN_MIN_Z then
         lap = lap + 1
@@ -2361,8 +2382,36 @@ local function mainLoop()
     end
 
     local pendingClusterCenter = nil
+    local pendingClusterNoProgressPasses = 0
+    local pendingClusterStartedAt = nil
+
+    local function deferStalledClusterAndResume(stillPending, reason)
+        local deferredCount = 0
+        -- SCAN_DETECT_RADIUS is wider than SCAN_STEP. Skip the stalled GUIDs
+        -- until the route has moved far enough that the old cluster cannot be
+        -- rediscovered by an overlapping waypoint.
+        local overlapAdvances = math.floor((2 * CONFIG.SCAN_DETECT_RADIUS) / CONFIG.SCAN_STEP)
+        local deferThroughScanAdvance = scanAdvanceCount + overlapAdvances
+        for _, entry in ipairs(stillPending or {}) do
+            if entry.model then
+                deferredAlienGuids[tostring(entry.model.Name)] = deferThroughScanAdvance
+                deferredCount = deferredCount + 1
+            end
+        end
+        recordEvent("SCAN", "Stalled alien cluster deferred; resuming scan route",
+            "DeferredEntities=" .. tostring(deferredCount)
+                .. " | NoProgressPasses=" .. tostring(pendingClusterNoProgressPasses)
+                .. " | DeferredThroughScanAdvance=" .. tostring(deferThroughScanAdvance)
+                .. " | Reason=" .. tostring(reason or "No server-confirmed alien progress across bounded retries"))
+        pendingClusterCenter = nil
+        pendingClusterNoProgressPasses = 0
+        pendingClusterStartedAt = nil
+        setStatus("Cluster stalled; resuming scan route")
+        advanceScan()
+    end
+
     setStatus("Automatic farming started")
-    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
+    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | MaxNoProgressPasses=%d | MaxClusterSeconds=%d", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT, CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES, CONFIG.MAX_CLUSTER_TOTAL_SECONDS))
 
     while running do
         waitWhilePaused()
@@ -2382,24 +2431,47 @@ local function mainLoop()
             setupFlight()
 
             if pendingClusterCenter then
-                -- Do not teleport back to the scan waypoint while living
-                -- aliens remain. Resume the same cluster from the current
-                -- safe-hover position and only advance after it is cleared.
+                pendingClusterStartedAt = pendingClusterStartedAt or os.clock()
                 local pendingAliens = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
                 if #pendingAliens == 0 then
-                    recordEvent("TARGET", "Pending alien cluster cleared", "No AlienType1/2/3 models remain within the active scan radius")
+                    recordEvent("TARGET", "Pending alien cluster cleared", "No living AlienType1/2/3 models remain within the active scan radius")
                     pendingClusterCenter = nil
+                    pendingClusterNoProgressPasses = 0
+                    pendingClusterStartedAt = nil
                     advanceScan()
                 else
-                    recordEvent("TARGET", "Retrying active alien cluster in place", "RemainingInScanRadius=" .. tostring(#pendingAliens) .. " | Scan-point teleport suppressed")
-                    local passCleared = engageAliens(pendingAliens)
+                    recordEvent("TARGET", "Continuing active alien cluster", "RemainingInScanRadius=" .. tostring(#pendingAliens) .. " | NoProgressPasses=" .. tostring(pendingClusterNoProgressPasses))
+                    local passCleared, passMadeProgress = engageAliens(pendingAliens)
                     local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
-                    if passCleared and #stillPending == 0 then
+                    local clusterAge = os.clock() - (pendingClusterStartedAt or os.clock())
+
+                    if #stillPending == 0 then
+                        recordEvent("TARGET", "Alien cluster fully cleared", "All living aliens in the scan radius are gone; advancing scan")
                         pendingClusterCenter = nil
+                        pendingClusterNoProgressPasses = 0
+                        pendingClusterStartedAt = nil
                         advanceScan()
+                    elseif clusterAge >= CONFIG.MAX_CLUSTER_TOTAL_SECONDS then
+                        deferStalledClusterAndResume(stillPending, "Maximum cluster time budget reached (" .. tostring(CONFIG.MAX_CLUSTER_TOTAL_SECONDS) .. "s)")
+                    elseif passCleared then
+                        -- This local engagement group is cleared; other aliens
+                        -- remain farther out inside the wider scan radius.
+                        pendingClusterNoProgressPasses = 0
+                        setStatus("Local alien group cleared; sweeping remaining cluster")
+                        task.wait(0.15)
+                    elseif passMadeProgress then
+                        pendingClusterNoProgressPasses = 0
+                        setStatus("Alien damage confirmed; continuing remaining targets")
+                        task.wait(0.2)
                     else
-                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
-                        task.wait(0.5)
+                        pendingClusterNoProgressPasses = pendingClusterNoProgressPasses + 1
+                        recordEvent("TARGET", "Alien cluster made no confirmed progress", "Pass=" .. tostring(pendingClusterNoProgressPasses) .. "/" .. tostring(CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES) .. " | Remaining=" .. tostring(#stillPending))
+                        if pendingClusterNoProgressPasses >= CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES then
+                            deferStalledClusterAndResume(stillPending, "No server-confirmed alien progress across bounded retries")
+                        else
+                            setStatus("No confirmed progress; one controlled retry remains")
+                            task.wait(CONFIG.CLUSTER_RETRY_DELAY)
+                        end
                     end
                 end
             else
@@ -2414,16 +2486,39 @@ local function mainLoop()
                         variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
                     end
                     pendingClusterCenter = scanPosition
+                    pendingClusterNoProgressPasses = 0
+                    pendingClusterStartedAt = os.clock()
                     recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
                     setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
-                    local passCleared = engageAliens(aliens)
+                    local passCleared, passMadeProgress = engageAliens(aliens)
                     local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
-                    if passCleared and #stillPending == 0 then
+                    local clusterAge = os.clock() - (pendingClusterStartedAt or os.clock())
+
+                    if #stillPending == 0 then
+                        recordEvent("TARGET", "Alien cluster fully cleared", "All living aliens in the scan radius are gone; advancing scan")
                         pendingClusterCenter = nil
+                        pendingClusterNoProgressPasses = 0
+                        pendingClusterStartedAt = nil
                         advanceScan()
+                    elseif clusterAge >= CONFIG.MAX_CLUSTER_TOTAL_SECONDS then
+                        deferStalledClusterAndResume(stillPending, "Maximum cluster time budget reached (" .. tostring(CONFIG.MAX_CLUSTER_TOTAL_SECONDS) .. "s)")
+                    elseif passCleared then
+                        pendingClusterNoProgressPasses = 0
+                        setStatus("Local alien group cleared; sweeping remaining cluster")
+                        task.wait(0.15)
+                    elseif passMadeProgress then
+                        pendingClusterNoProgressPasses = 0
+                        setStatus("Alien damage confirmed; continuing remaining targets")
+                        task.wait(0.2)
                     else
-                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
-                        task.wait(0.5)
+                        pendingClusterNoProgressPasses = 1
+                        recordEvent("TARGET", "Alien cluster made no confirmed progress", "Pass=1/" .. tostring(CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES) .. " | Remaining=" .. tostring(#stillPending))
+                        if pendingClusterNoProgressPasses >= CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES then
+                            deferStalledClusterAndResume(stillPending, "No server-confirmed alien progress across bounded retries")
+                        else
+                            setStatus("No confirmed progress; one controlled retry remains")
+                            task.wait(CONFIG.CLUSTER_RETRY_DELAY)
+                        end
                     end
                 else
                     recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
@@ -3044,7 +3139,9 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.8-TARGETED-ALIEN-AURA-HF5.9-BASE",
+            version = "HF8.9-BOUNDED-RETRY-RESUME-SCAN-HF5.9-BASE",
+            scanAdvanceCount = scanAdvanceCount,
+            deferredAlienGuidCount = (function() local n = 0 for _ in pairs(deferredAlienGuids) do n = n + 1 end return n end)(),
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
