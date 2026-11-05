@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF9.0 (CLOSE-RANGE ENGAGEMENT + CONFIRMED CLUSTER CLEAR)
+LAST STOP - ALIEN TOKEN FARMER HF9.1 (SAFE ROOT-RELATIVE HOVER + MELEE REACH)
 Standalone experimental build for the Last Stop Roblox experience.
-HF9.0 preserves the HF5.9 scanner/collector and the working remote transport, but closes the melee gap, aims at the nearest valid alien contact, revalidates close hits, and holds a cluster until its tracked members have death/health confirmation. Token collection is postponed until a death/clear event so pickup travel cannot interrupt combat.
+HF9.1 preserves the HF5.9 scanner/collector and the working remote transport. It restores vertical positioning relative to the alien model root (not an offset torso mesh), uses the original 9.7-stud vertical hover and 4.8-stud horizontal standoff, and expands the validated melee contact limit to 14.5 studs so offset torso hitboxes remain reachable. It keeps nearest-contact aiming, send-time hit validation, confirmed cluster holding, and token collection after confirmed deaths.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -52,9 +52,9 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
-    HOVER_BELOW = 4.5, -- measured from the selected torso anchor
+    HOVER_BELOW = 9.7, -- measured from the alien model root, matching original HF5.9 safe hover
     HOVER_REPOSITION_THRESHOLD = 0.75,
-    TORSO_HORIZONTAL_STANDOFF = 1.25,
+    TORSO_HORIZONTAL_STANDOFF = 4.8, -- original HF5.9 horizontal standoff from preferred torso anchor
     ATTACK_INTERVAL = 0.0655, -- measured median from the working outgoing capture
     MELEE_HIT_DELAY = 0.0323, -- measured median Attack -> first Hit delay
 
@@ -65,7 +65,7 @@ local CONFIG = {
     MAX_HITS_PER_TARGET = 1, -- observed working aura: one Hit per selected target
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
-    MELEE_HIT_MAX_DISTANCE = 10.0, -- practical close-range melee contact limit
+    MELEE_HIT_MAX_DISTANCE = 14.5, -- covers offset torso anchors at the restored safe hover position
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -683,7 +683,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF9.0-CLOSE-RANGE-HOLD-CLUSTER-HF5.9-BASE",
+        "Version: HF9.1-SAFE-ROOT-HOVER-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -772,7 +772,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.0 | Base=HF5.9 scanner/collector | CombatProfile=close-range nearest-contact 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.1 | Base=HF5.9 scanner/collector | CombatProfile=close-range nearest-contact 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1875,11 +1875,12 @@ local function moveBelowAlien(entry)
     end
     if approachVector.Magnitude < 0.001 then approachVector = Vector3.new(0, 0, -1) else approachVector = approachVector.Unit end
 
-    -- Measure the hover gap from the torso anchor. The old build measured from
-    -- the lower model root, leaving the torso about 12.2 studs vertically away.
+    -- Keep the vertical offset relative to the alien model root, as in HF5.9.
+    -- Some variants have torso anchors offset above that root; measuring from
+    -- those anchors placed the player inside the enemy's melee range.
     local hoverPosition = Vector3.new(
         anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
-        anchorPosition.Y - CONFIG.HOVER_BELOW,
+        targetRootPosition.Y - CONFIG.HOVER_BELOW,
         anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
     )
     local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
@@ -1901,7 +1902,7 @@ local function moveBelowAlien(entry)
     local camera = Workspace.CurrentCamera
     local cameraType = camera and tostring(camera.CameraType) or "unknown"
 
-    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Close torso-relative hover maintained", string.format(
+    recordThrottled("safe-root-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Safe root-relative hover maintained", string.format(
         "Variant=%s | Model=%s | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualTorsoVerticalOffset=%.2f | ActualRootVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelowTorso=%.2f | PreviousAnchorDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
         entry.variant, entry.model.Name, torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
         anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
@@ -2430,7 +2431,7 @@ local function mainLoop()
 
     setStatus("Automatic farming started")
     recordEvent("SCAN", "Initial scan route ready", string.format(
-        "Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | CloseHover=%.1f below torso / %.1f standoff | MeleePartRange=%.1f | StalledClusters=held until death confirmation",
+        "Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | SafeHover=%.1f below alien root / %.1f standoff | MeleePartRange=%.1f | StalledClusters=held until death confirmation",
         CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS,
         CONFIG.SCAN_WAIT, CONFIG.HOVER_BELOW, CONFIG.TORSO_HORIZONTAL_STANDOFF, CONFIG.MELEE_HIT_MAX_DISTANCE
     ))
@@ -3166,7 +3167,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF9.0-CLOSE-RANGE-HOLD-CLUSTER-HF5.9-BASE",
+            version = "HF9.1-SAFE-ROOT-HOVER-HF5.9-BASE",
             scanAdvanceCount = scanAdvanceCount,
             deferredAlienGuidCount = 0,
             gameId = game.GameId,
@@ -3391,6 +3392,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only; explicit Zombie exclusion | AttackDirection=nearest valid alien contact | Server hit/death attribution=entity-specific | Diagnostics=HF9.0 close torso-anchor hover/short standoff/near-contact range/confirmed cluster hold | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only; explicit Zombie exclusion | AttackDirection=nearest valid alien contact | Server hit/death attribution=entity-specific | Diagnostics=HF9.1 root-relative safe hover/original standoff/extended torso contact/confirmed cluster hold | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
