@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.6 (LIVE REPLICA REGISTRY + OBSERVED AURA + HF5.9 SCANNER)
+LAST STOP - ALIEN TOKEN FARMER HF8.7 (LIVE REPLICA ID + ORIGINAL REMOTE + HF5.9 SCANNER)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.6 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
+HF8.7 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -486,7 +486,7 @@ local function resolveMeleeReplicaId(tool)
         end
 
         -- Re-scan the live registry on a cache miss. This handles tools whose
-        -- ReplicaCreate event happened before HF8.6 was executed.
+        -- ReplicaCreate event happened before HF8.7 was executed.
         indexExistingReplicaRegistry()
         mapped = itemReplicaIdsByGuid[guid]
         if mapped ~= nil then
@@ -551,7 +551,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.6-LIVE-REPLICA-REGISTRY-HF5.9-BASE",
+        "Version: HF8.7-LIVE-REPLICA-ID-ORIGINAL-REMOTE-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -639,7 +639,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.6 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.7 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1799,7 +1799,7 @@ local function sendMeleeSweep(entries)
         return 0
     end
     local signalId, signalIdSource, meleeReplica = resolveMeleeReplicaId(equippedTool)
-    if signalId == nil or not meleeReplica or type(meleeReplica.FireServer) ~= "function" then
+    if signalId == nil or not meleeReplica then
         setStatus("Waiting for live melee replica mapping")
         recordThrottled("melee-replica-unresolved:" .. tostring(equippedTool.Name), 1.5,
             "WEAPON", "Combat paused: equipped melee replica could not be resolved",
@@ -1873,8 +1873,10 @@ local function sendMeleeSweep(entries)
 
     lastAutoAttackAt = os.clock()
     automatedAttackRequests = automatedAttackRequests + 1
+    -- Match the original HF5.9 source and the observed working aura exactly:
+    -- call the game's ReplicaSignal RemoteEvent with the resolved live ID.
     local okAttack, attackError = pcall(function()
-        meleeReplica:FireServer("Melee", "Attack", direction, 1)
+        ReplicaSignal:FireServer(signalId, "Melee", "Attack", direction, 1)
     end)
     if not okAttack then
         remoteErrors = remoteErrors + 1
@@ -1890,7 +1892,7 @@ local function sendMeleeSweep(entries)
         "COMBAT",
         "Melee Attack request dispatched",
         string.format(
-            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | AttackDirection=(%.3f, %.3f, %.3f) | DirectionSource=%s | ReplicaId=%s | ReplicaIdSource=%s | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | AttackDirection=(%.3f, %.3f, %.3f) | DirectionSource=%s | ReplicaId=%s | ReplicaIdSource=%s | Transport=ReplicaSignal:FireServer | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
             nearestContact.entry.variant,
             nearestContact.entry.model.Name,
             nearestContact.part.Name,
@@ -1929,7 +1931,8 @@ local function sendMeleeSweep(entries)
                 local okHit, hitError = pcall(function()
                     -- Match the captured working payload exactly: part center,
                     -- upward normal, and the part's actual material.
-                    meleeReplica:FireServer(
+                    ReplicaSignal:FireServer(
+                        signalId,
                         "Melee",
                         "Hit",
                         contact.part,
@@ -2904,7 +2907,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.6-LIVE-REPLICA-REGISTRY-HF5.9-BASE",
+            version = "HF8.7-LIVE-REPLICA-ID-ORIGINAL-REMOTE-HF5.9-BASE",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
