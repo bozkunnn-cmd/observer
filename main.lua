@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.7 (LIVE REPLICA ID + ORIGINAL REMOTE + HF5.9 SCANNER)
+LAST STOP - ALIEN TOKEN FARMER HF8.8 (TARGETED ALIEN AIM + ENTITY-ATTRIBUTED COMBAT)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.7 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
+HF8.8 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat follows the observed three-target melee sequence. The important correction is replica identity: resolve the currently equipped Tool GUID against the already-loaded ReplicaController registry, then keep that mapping updated from NewReplicaSignal. No fixed Shovel/Bat replica ID is assumed; if the live mapping cannot be proven, combat pauses instead of sending requests with a guessed ID.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -78,7 +78,13 @@ local alienKills = 0
 local serverDamageEvents = 0
 local serverOnDiedEvents = 0
 local serverMeleeEffects = 0
+local serverAlienDeathEvents = 0
+local serverNonAlienDeathEvents = 0
+local serverConfirmedAlienHitEvents = 0
+local serverNonAlienMeleeEffects = 0
 local lastServerDamageAt = nil
+local serverDeadAlienModels = setmetatable({}, { __mode = "k" })
+local replicaGuidsById = {}
 local serverMonitorConnections = {}
 local itemReplicaIdsByGuid = {}
 local itemReplicaResolverConnection = nil
@@ -190,14 +196,106 @@ local function recordThrottled(key, interval, category, message, details)
     return nil
 end
 
+local function getReplicaGuidForDeath(replicaId)
+    local numericId = tonumber(replicaId)
+    local guid = replicaGuidsById[numericId] or replicaGuidsById[tostring(replicaId)]
+    if guid then
+        return tostring(guid)
+    end
+
+    local controller = replicaController
+    if controller and type(controller.GetReplicaById) == "function" then
+        local ok, replica = pcall(function()
+            return controller.GetReplicaById(numericId or replicaId)
+        end)
+        if ok and type(replica) == "table" then
+            local containers = {}
+            if type(replica.Tags) == "table" then table.insert(containers, replica.Tags) end
+            if type(replica.Data) == "table" then table.insert(containers, replica.Data) end
+            for _, container in ipairs(containers) do
+                for _, key in ipairs({ "Id", "id", "Guid", "GUID", "ItemGuid", "ItemGUID", "GuidString" }) do
+                    local value = container[key]
+                    if type(value) == "string" and value ~= "" then
+                        guid = value
+                        if string.sub(string.upper(guid), 1, 5) == "ITEM|" then
+                            guid = string.sub(guid, 6)
+                        end
+                        return guid
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function findEntityModelForPart(part)
+    if typeof(part) ~= "Instance" then
+        return nil
+    end
+
+    -- Prefer the already-monitored model table; this also works if an entity
+    -- has just been reparented out of ENTITY_CONTAINER after dying.
+    for model in pairs(monitoredAliens) do
+        local ok, inside = pcall(function()
+            return part:IsDescendantOf(model)
+        end)
+        if ok and inside then
+            return model
+        end
+    end
+
+    local current = part
+    while current and current.Parent and current.Parent ~= ENTITY_CONTAINER do
+        current = current.Parent
+    end
+    if current and current.Parent == ENTITY_CONTAINER and current:IsA("Model") then
+        return current
+    end
+    return nil
+end
+
+local function findAlienModelForReplicaDeath(replicaId, guid)
+    if guid then
+        local direct = ENTITY_CONTAINER and ENTITY_CONTAINER:FindFirstChild(guid)
+        if direct and monitoredAliens[direct] then
+            return direct
+        end
+        for model in pairs(monitoredAliens) do
+            if tostring(model.Name) == tostring(guid) then
+                return model
+            end
+        end
+    end
+    return nil
+end
+
 local function attachServerCombatMonitors()
     if ReplicaSignal and ReplicaSignal:IsA("RemoteEvent") then
         local ok, connection = pcall(function()
             return ReplicaSignal.OnClientEvent:Connect(function(replicaId, signalName, ...)
                 if signalName == "OnDied" then
                     serverOnDiedEvents = serverOnDiedEvents + 1
-                    recordEvent("KILL", "Server OnDied signal observed",
-                        "ReplicaId=" .. tostring(replicaId) .. " | TotalOnDied=" .. tostring(serverOnDiedEvents))
+                    local guid = getReplicaGuidForDeath(replicaId)
+                    local model = findAlienModelForReplicaDeath(replicaId, guid)
+                    local alienRecord = model and monitoredAliens[model]
+                    if alienRecord then
+                        if not alienRecord.serverDead then
+                            alienRecord.serverDead = true
+                            serverDeadAlienModels[model] = true
+                            serverAlienDeathEvents = serverAlienDeathEvents + 1
+                        end
+                        recordEvent("KILL", "Server-confirmed alien death",
+                            "ReplicaId=" .. tostring(replicaId) .. " | GUID=" .. tostring(guid)
+                                .. " | Variant=" .. tostring(alienRecord.variant)
+                                .. " | Model=" .. tostring(model.Name)
+                                .. " | AlienDeaths=" .. tostring(serverAlienDeathEvents))
+                    else
+                        serverNonAlienDeathEvents = serverNonAlienDeathEvents + 1
+                        recordEvent("KILL", "Server death signal for non-alien/unknown entity",
+                            "ReplicaId=" .. tostring(replicaId) .. " | GUID=" .. tostring(guid)
+                                .. " | NonAlienOrUnknownDeaths=" .. tostring(serverNonAlienDeathEvents))
+                    end
                 end
             end)
         end)
@@ -247,9 +345,35 @@ local function attachServerCombatMonitors()
                 return effectRemote.OnClientEvent:Connect(function(effectType, actionName, ...)
                     if effectType == "Melee" and actionName == "Hit" then
                         serverMeleeEffects = serverMeleeEffects + 1
-                        recordThrottled("server-melee-effect", 0.25, "COMBAT",
-                            "Server melee impact effect observed",
-                            "TotalEffects=" .. tostring(serverMeleeEffects))
+                        local packed = table.pack(...)
+                        local payload = packed[2]
+                        local hitInstance = type(payload) == "table" and payload.Instance or nil
+                        local source = type(payload) == "table" and payload.Source or nil
+                        local targetModel = findEntityModelForPart(hitInstance)
+                        local alienRecord = targetModel and monitoredAliens[targetModel]
+                        local sourceIsLocal = source == nil or source == LocalPlayer
+
+                        if alienRecord and sourceIsLocal then
+                            serverConfirmedAlienHitEvents = serverConfirmedAlienHitEvents + 1
+                            alienRecord.serverHitCount = (alienRecord.serverHitCount or 0) + 1
+                            alienRecord.lastServerHitAt = os.clock()
+                            alienRecord.lastServerHitPart = hitInstance and hitInstance.Name or "unknown"
+                            recordEvent("COMBAT", "Server-confirmed alien impact",
+                                "Target=" .. tostring(alienRecord.variant) .. "/" .. tostring(targetModel.Name)
+                                    .. " | Part=" .. tostring(alienRecord.lastServerHitPart)
+                                    .. " | Source=" .. tostring(source and source.Name or "unspecified")
+                                    .. " | AlienImpactCount=" .. tostring(serverConfirmedAlienHitEvents))
+                        else
+                            serverNonAlienMeleeEffects = serverNonAlienMeleeEffects + 1
+                            local instancePath = "unavailable"
+                            if typeof(hitInstance) == "Instance" then
+                                pcall(function() instancePath = hitInstance:GetFullName() end)
+                            end
+                            recordEvent("COMBAT", "Server melee impact was not attributed to our alien target",
+                                "Instance=" .. instancePath
+                                    .. " | Source=" .. tostring(source and source.Name or "unspecified")
+                                    .. " | NonAlienOrUnknownEffects=" .. tostring(serverNonAlienMeleeEffects))
+                        end
                     end
                 end)
             end)
@@ -328,15 +452,15 @@ local function getReplicaGuid(replica)
         return nil
     end
 
-    local containers = { replica.Tags, replica.Data }
+    local containers = {}
+    if type(replica.Tags) == "table" then table.insert(containers, replica.Tags) end
+    if type(replica.Data) == "table" then table.insert(containers, replica.Data) end
     local keys = { "Id", "id", "Guid", "GUID", "ItemGuid", "ItemGUID", "GuidString" }
     for _, container in ipairs(containers) do
-        if type(container) == "table" then
-            for _, key in ipairs(keys) do
-                local value = container[key]
-                if type(value) == "string" and value ~= "" then
-                    return normalizeReplicaGuid(value)
-                end
+        for _, key in ipairs(keys) do
+            local value = container[key]
+            if type(value) == "string" and value ~= "" then
+                return normalizeReplicaGuid(value)
             end
         end
     end
@@ -356,6 +480,8 @@ local function indexReplica(replica, fallbackId)
     end
 
     itemReplicaIdsByGuid[guid] = replicaId
+    replicaGuidsById[replicaId] = guid
+    replicaGuidsById[tostring(replicaId)] = guid
     return true
 end
 
@@ -486,7 +612,7 @@ local function resolveMeleeReplicaId(tool)
         end
 
         -- Re-scan the live registry on a cache miss. This handles tools whose
-        -- ReplicaCreate event happened before HF8.7 was executed.
+        -- ReplicaCreate event happened before the farmer was executed.
         indexExistingReplicaRegistry()
         mapped = itemReplicaIdsByGuid[guid]
         if mapped ~= nil then
@@ -520,6 +646,8 @@ local function buildAlienHealthSnapshot()
             modelName = tostring(model.Name),
             inEntityContainer = model.Parent == ENTITY_CONTAINER,
             deadSignal = record.dead == true,
+            serverDead = record.serverDead == true,
+            serverHitCount = tonumber(record.serverHitCount) or 0,
             removed = record.removed == true,
             sourceCount = tonumber(record.sourceCount) or 0,
             uiSourceCount = (function()
@@ -551,13 +679,14 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.7-LIVE-REPLICA-ID-ORIGINAL-REMOTE-HF5.9-BASE",
+        "Version: HF8.8-TARGETED-ALIEN-AURA-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
         "Alien kill notifications: " .. tostring(alienKills),
         "Server confirmations: DamageDealt=" .. tostring(serverDamageEvents) .. " | OnDied=" .. tostring(serverOnDiedEvents) .. " | MeleeEffects=" .. tostring(serverMeleeEffects),
+        "Entity attribution: AlienImpacts=" .. tostring(serverConfirmedAlienHitEvents) .. " | NonAlienOrUnknownImpacts=" .. tostring(serverNonAlienMeleeEffects) .. " | AlienDeaths=" .. tostring(serverAlienDeathEvents) .. " | NonAlienOrUnknownDeaths=" .. tostring(serverNonAlienDeathEvents),
         "Alien monitors: " .. tostring(monitoredAlienModelsTotal) .. " | Numeric health sources: " .. tostring(alienHealthSourcesFound),
         "Alien health-source decrease signals: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
         "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Auto-correlated foreground damage events: " .. tostring(automatedDamageUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
@@ -601,9 +730,9 @@ local function buildDiagnosticReport()
             end
             table.sort(maxParts)
             table.insert(lines, string.format(
-                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | AutoUiDelta=%s | AutoUiAttribution=%s | Max=%s | %s",
+                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | ServerDead=%s | ServerHits=%d | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | AutoUiDelta=%s | AutoUiAttribution=%s | Max=%s | %s",
                 npc.variant, npc.modelName, tostring(npc.inEntityContainer), npc.sourceCount, npc.uiSourceCount,
-                tostring(npc.deadSignal), tostring(npc.removed), tostring(npc.lastHealthValue),
+                tostring(npc.deadSignal), tostring(npc.serverDead), tonumber(npc.serverHitCount) or 0, tostring(npc.removed), tostring(npc.lastHealthValue),
                 tostring(npc.lastHealthDelta), tostring(npc.lastHealthAttribution),
                 tostring(npc.lastAutoUiDamageDelta), tostring(npc.lastAutoUiDamageAttribution),
                 #maxParts > 0 and table.concat(maxParts, "; ") or "unknown",
@@ -639,7 +768,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.7 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.8 | Base=HF5.9 scanner/collector | CombatProfile=alien-cluster-directed 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -752,8 +881,26 @@ local function getPromptPosition(prompt)
     return nil
 end
 
-local function isAlienModel(model)
+local function hasZombieMarker(model)
     if not model or not model:IsA("Model") then
+        return false
+    end
+    if string.find(string.lower(tostring(model.Name)), "zombie", 1, true) then
+        return true
+    end
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("Model") or descendant:IsA("Folder") then
+            local name = string.lower(tostring(descendant.Name))
+            if name == "zombie" or name == "zombietype" or string.find(name, "zombie", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isAlienModel(model)
+    if not model or not model:IsA("Model") or hasZombieMarker(model) then
         return nil
     end
     local variantNames = {
@@ -783,7 +930,11 @@ local function getModelRoot(model)
 end
 
 local function isModelAlive(model)
-    if not model or not model.Parent then
+    if not model or not model.Parent or serverDeadAlienModels[model] then
+        return false
+    end
+    local monitoredRecord = monitoredAliens[model]
+    if monitoredRecord and (monitoredRecord.dead or monitoredRecord.serverDead) then
         return false
     end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
@@ -804,7 +955,7 @@ local function getAliensNear(position, radius)
     end
     for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
         local variant = isAlienModel(model)
-        if variant and isModelAlive(model) then
+        if variant and not hasZombieMarker(model) and isModelAlive(model) then
             local root = getModelRoot(model)
             if root then
                 local distance = (root.Position - position).Magnitude
@@ -1815,7 +1966,10 @@ local function sendMeleeSweep(entries)
 
     local candidates = {}
     for _, entry in ipairs(entries) do
-        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
+        if entry.model and entry.model.Parent == ENTITY_CONTAINER and entry.root and entry.root.Parent
+            and isAlienModel(entry.model) == entry.variant
+            and not hasZombieMarker(entry.model)
+            and not serverDeadAlienModels[entry.model] then
             local contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_HIT_MAX_DISTANCE)
             if contact and contact.part and contact.part.Parent then
                 contact.entry = entry
@@ -1851,19 +2005,23 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    -- The successful outgoing capture's Attack vector varied with the camera
-    -- direction. Use the live camera look vector instead of a fixed vertical bias.
+    -- Aim the Attack signal at the actual selected alien contacts, not at the
+    -- user's free-look camera. The previous build's camera vector frequently pointed away
+    -- from the alien cluster, allowing the melee cone to hit nearby zombies.
+    -- Averaging the selected alien contact positions keeps one Attack aligned
+    -- with the same alien targets that receive the following Hit requests.
     local nearestContact = candidates[1]
     local contactDelta = nearestContact.position - root.Position
-    local camera = Workspace.CurrentCamera
-    local direction
-    local directionSource = "camera look vector"
-    if camera then
-        direction = camera.CFrame.LookVector
+    local aimPosition = Vector3.zero
+    for targetIndex = 1, maxTargets do
+        aimPosition = aimPosition + candidates[targetIndex].position
     end
-    if not direction or direction.Magnitude < 0.001 then
+    aimPosition = aimPosition / maxTargets
+    local direction = aimPosition - root.Position
+    local directionSource = "selected alien cluster centroid"
+    if direction.Magnitude < 0.001 then
         direction = contactDelta
-        directionSource = "target contact fallback"
+        directionSource = "nearest alien contact fallback"
     end
     if direction.Magnitude < 0.001 then
         direction = root.CFrame.LookVector
@@ -1921,7 +2079,11 @@ local function sendMeleeSweep(entries)
 
         local contact = candidates[targetIndex]
         local entry = contact.entry
-        if contact.part and contact.part.Parent and entry.model and entry.model.Parent then
+        if contact.part and contact.part.Parent and entry.model and entry.model.Parent == ENTITY_CONTAINER
+            and contact.part:IsDescendantOf(entry.model)
+            and isAlienModel(entry.model) == entry.variant
+            and not hasZombieMarker(entry.model)
+            and not serverDeadAlienModels[entry.model] then
             local targetHitCount = 0
             for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
                 if sentHits >= CONFIG.MAX_HITS_PER_SWEEP or not contact.part.Parent then
@@ -2107,8 +2269,8 @@ local function engageAliens(seedEntries)
     local startKillCount = initialKillCount
     recordEvent("TARGET", "Alien cluster engagement started", string.format("InitialTarget=%s/%s | Count=%d | Center=(%.1f, %.1f, %.1f)", firstTarget.variant, firstTarget.model.Name, #seedEntries, clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
     local lastProgressTime = os.clock()
-    local lastKnownServerDamage = serverDamageEvents
-    local lastKnownServerDeaths = serverOnDiedEvents
+    local lastKnownAlienImpacts = serverConfirmedAlienHitEvents
+    local lastKnownAlienDeaths = serverAlienDeathEvents
     setStatus("Engaging alien cluster")
 
     while running and not paused and (os.clock() - startTime) < CONFIG.ENGAGE_TIMEOUT do
@@ -2132,43 +2294,18 @@ local function engageAliens(seedEntries)
         end
 
         if alienKills > startKillCount
-            or serverDamageEvents > lastKnownServerDamage
-            or serverOnDiedEvents > lastKnownServerDeaths then
+            or serverConfirmedAlienHitEvents > lastKnownAlienImpacts
+            or serverAlienDeathEvents > lastKnownAlienDeaths then
             lastProgressTime = os.clock()
             startKillCount = alienKills
-            lastKnownServerDamage = serverDamageEvents
-            lastKnownServerDeaths = serverOnDiedEvents
+            lastKnownAlienImpacts = serverConfirmedAlienHitEvents
+            lastKnownAlienDeaths = serverAlienDeathEvents
         end
 
-        -- Health bars are custom UI in this game. Count a foreground Bar
-        -- decrease as progress only when it follows this farmer's Hit request
-        -- and is not temporally mixed with manual input.
-        local latestAutoUiDamage = nil
-        for _, entry in ipairs(entries) do
-            local healthRecord = monitoredAliens[entry.model]
-            if healthRecord and healthRecord.lastAutoUiDamageAt
-                and healthRecord.lastAutoUiDamageAt > lastProgressTime then
-                if not latestAutoUiDamage or healthRecord.lastAutoUiDamageAt > latestAutoUiDamage.at then
-                    latestAutoUiDamage = {
-                        at = healthRecord.lastAutoUiDamageAt,
-                        model = entry.model,
-                        variant = entry.variant,
-                        delta = healthRecord.lastAutoUiDamageDelta,
-                    }
-                end
-            end
-        end
-        if latestAutoUiDamage then
-            lastProgressTime = latestAutoUiDamage.at
-            recordThrottled(
-                "auto-ui-progress:" .. latestAutoUiDamage.model.Name,
-                0.5,
-                "COMBAT",
-                "Automated health-bar progress observed",
-                string.format("Target=%s/%s | ForegroundWidthDrop=%.5f | ProgressTimerReset=true | Timing correlation, not server-side health proof",
-                    latestAutoUiDamage.variant, latestAutoUiDamage.model.Name, tonumber(latestAutoUiDamage.delta) or 0)
-            )
-        end
+        -- Health-bar width changes are retained for diagnostics only. The previous build
+        -- treated tiny animation deltas as progress even when the server had
+        -- stopped confirming hits on the selected alien. They no longer reset
+        -- the engagement timeout.
 
         if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
             setStatus("No new alien kill confirmation; ending this engagement")
@@ -2907,7 +3044,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.7-LIVE-REPLICA-ID-ORIGINAL-REMOTE-HF5.9-BASE",
+            version = "HF8.8-TARGETED-ALIEN-AURA-HF5.9-BASE",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2915,6 +3052,10 @@ local function exportDiagnostics()
             serverDamageEvents = serverDamageEvents,
             serverOnDiedEvents = serverOnDiedEvents,
             serverMeleeEffects = serverMeleeEffects,
+            serverConfirmedAlienHitEvents = serverConfirmedAlienHitEvents,
+            serverNonAlienMeleeEffects = serverNonAlienMeleeEffects,
+            serverAlienDeathEvents = serverAlienDeathEvents,
+            serverNonAlienDeathEvents = serverNonAlienDeathEvents,
             monitoredAlienModels = monitoredAlienModelsTotal,
             alienHealthSourcesFound = alienHealthSourcesFound,
             alienDamageEvents = alienDamageEvents,
@@ -3126,6 +3267,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only | Diagnostics=HF5.9 measured-9.7-stud-vertical-hover/torso-priority/horizontal-approach/captured-hit-payload/health/input/movement monitoring | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only; explicit Zombie exclusion | AttackDirection=selected alien cluster centroid | Server hit/death attribution=entity-specific | Diagnostics=HF5.9 measured-9.7-stud-vertical-hover/torso-priority/horizontal-approach/captured-hit-payload/health/input/movement monitoring | Hooks=none")
 refreshDiagPanel()
 log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
