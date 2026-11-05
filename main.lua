@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF9.4 (FULL CLEAR + DEATH-LOCATED TOKEN RECOVERY + ANTI-AFK)
+LAST STOP - ALIEN TOKEN FARMER HF9.0 (CLOSE-RANGE ENGAGEMENT + CONFIRMED CLUSTER CLEAR)
 Standalone experimental build for the Last Stop Roblox experience.
-HF9.4 is built directly from the supplied HF9.2 source. It preserves the scanner, live ReplicaController resolution, original Attack/Hit transport, 50-stud melee ceiling, collateral guard, fullbright, and diagnostics. It adds root-locked hover and corrected hit-part hierarchy classification, removes survivor deferral, collects token prompts around confirmed alien death positions, retries unconfirmed prompts, and adds an Idled-event anti-AFK listener.
+HF9.0 preserves the HF5.9 scanner/collector and the working remote transport, but closes the melee gap, aims at the nearest valid alien contact, revalidates close hits, and holds a cluster until its tracked members have death/health confirmation. Token collection is postponed until a death/clear event so pickup travel cannot interrupt combat.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -30,8 +30,6 @@ local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local UserInputService = game:GetService("UserInputService")
-local VirtualUser = nil
-pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 local LocalPlayer = Players.LocalPlayer
 
 local ENTITY_CONTAINER = Workspace:WaitForChild("ENTITY_CONTAINER", 15)
@@ -54,36 +52,26 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
-    HOVER_BELOW = 9.7, -- measured from the alien model root, matching original HF5.9 safe hover
-    HOVER_REPOSITION_THRESHOLD = 1.0,
-    TORSO_HORIZONTAL_STANDOFF = 0.0, -- direct X/Z lock beneath the actual alien model root
+    HOVER_BELOW = 4.5, -- measured from the selected torso anchor
+    HOVER_REPOSITION_THRESHOLD = 0.75,
+    TORSO_HORIZONTAL_STANDOFF = 1.25,
     ATTACK_INTERVAL = 0.0655, -- measured median from the working outgoing capture
     MELEE_HIT_DELAY = 0.0323, -- measured median Attack -> first Hit delay
 
-    NO_KILL_TIMEOUT = 15, -- ends one failed attack attempt; the active cluster remains locked
-    MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- triggers a close re-approach; never releases the cluster
+    ENGAGE_TIMEOUT = 60,
+    NO_KILL_TIMEOUT = 15,
+    MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- triggers a close re-approach; never skips a living cluster
     CLUSTER_RETRY_DELAY = 0.45,
     MAX_HITS_PER_TARGET = 1, -- observed working aura: one Hit per selected target
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
-    MELEE_HIT_MAX_DISTANCE = 50, -- matches the reference aura's current 50-stud setting
-    MELEE_HIT_HARD_CEILING = 80, -- never allow the configured contact range above the reference UI maximum
-    COLLATERAL_GUARD_RADIUS = 50, -- suppress the sweep if any non-alien entity could be caught in the attack area
+    MELEE_HIT_MAX_DISTANCE = 10.0, -- practical close-range melee contact limit
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
-    TOKEN_SETTLE_WAIT = 0.25,
-    TOKEN_DROP_SPAWN_WAIT = 0.45,
-    TOKEN_DROP_SPAWN_RETRIES = 4,
-    TOKEN_PROMPT_RETRIES = 3,
-    TOKEN_IDLE_PASSES = 4,
+    TOKEN_SETTLE_WAIT = 0.18,
     MAX_TOKEN_PICKUPS_PER_PASS = 40,
-    ANTI_AFK = true,
     AUTO_FULLBRIGHT = true,
 }
-
-local function getMeleeHitRange()
-    return math.min(CONFIG.MELEE_HIT_MAX_DISTANCE, CONFIG.MELEE_HIT_HARD_CEILING)
-end
 
 local running = false
 local paused = false
@@ -111,14 +99,6 @@ local lastResolvedMeleeReplicaId = nil
 local lastReplicaIdSource = "not resolved"
 local tokenAttempts = 0
 local tokenPickupsConfirmed = 0
-local pendingTokenDropCenters = {}
-local tokenDropCentersQueued = 0
-local tokenDropCentersProcessed = 0
-local antiAfkEvents = 0
-local antiAfkErrors = 0
-local antiAfkAvailable = false
-local antiAfkConnection = nil
-local deferredAlienGuidCount = 0
 local rewardToastEstimate = 0
 local remoteErrors = 0
 local currentTarget = "None"
@@ -308,36 +288,6 @@ local function attachServerCombatMonitors()
                             alienRecord.serverDead = true
                             serverDeadAlienModels[model] = true
                             serverAlienDeathEvents = serverAlienDeathEvents + 1
-                        end
-                        if not alienRecord.tokenDropQueued then
-                            local deathPosition = alienRecord.lastKnownPosition
-                            pcall(function()
-                                local deathRoot = model:FindFirstChild("HumanoidRootPart")
-                                    or model.PrimaryPart
-                                    or model:FindFirstChild("Torso", true)
-                                    or model:FindFirstChild("Head", true)
-                                if deathRoot and deathRoot:IsA("BasePart") then
-                                    deathPosition = deathRoot.Position
-                                end
-                            end)
-                            if deathPosition then
-                                alienRecord.tokenDropQueued = true
-                                table.insert(pendingTokenDropCenters, {
-                                    position = deathPosition,
-                                    modelName = tostring(model.Name),
-                                    variant = tostring(alienRecord.variant),
-                                    replicaId = tostring(replicaId),
-                                })
-                                tokenDropCentersQueued = tokenDropCentersQueued + 1
-                                recordEvent("TOKEN", "Confirmed alien death position queued for drop collection",
-                                    string.format("Target=%s/%s | Position=(%.1f, %.1f, %.1f) | Queue=%d",
-                                        tostring(alienRecord.variant), tostring(model.Name),
-                                        deathPosition.X, deathPosition.Y, deathPosition.Z, #pendingTokenDropCenters))
-                            else
-                                recordEvent("TOKEN", "Alien death confirmed but drop position unavailable",
-                                    "Target=" .. tostring(alienRecord.variant) .. "/" .. tostring(model.Name)
-                                        .. " | A tracked cluster position will be used as fallback")
-                            end
                         end
                         recordEvent("KILL", "Server-confirmed alien death",
                             "ReplicaId=" .. tostring(replicaId) .. " | GUID=" .. tostring(guid)
@@ -733,7 +683,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF9.4-FULL-CLEAR-TOKEN-RECOVERY-ANTIAFK-HF9.2-BASE",
+        "Version: HF9.0-CLOSE-RANGE-HOLD-CLUSTER-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -748,12 +698,9 @@ local function buildDiagnosticReport()
         "Melee replica mapping: ID=" .. tostring(lastResolvedMeleeReplicaId) .. " | Source=" .. tostring(lastReplicaIdSource),
         "ReplicaController: " .. tostring(replicaControllerPath) .. " | GUID-tagged replicas indexed=" .. tostring(replicaRegistryIndexed),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
-        "Survivor deferral: disabled | Tracked cluster: full-clear",
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
         "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
-        "Token death centers: queued=" .. tostring(tokenDropCentersQueued) .. " | processed=" .. tostring(tokenDropCentersProcessed) .. " | pending=" .. tostring(#pendingTokenDropCenters),
-        "Anti-AFK: available=" .. tostring(antiAfkAvailable) .. " | Idled events=" .. tostring(antiAfkEvents) .. " | Errors=" .. tostring(antiAfkErrors),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
         "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
         "Events retained: " .. tostring(#diagEvents) .. " / " .. tostring(diagMaxEvents),
@@ -814,65 +761,6 @@ local function log(message)
     end)
 end
 
-local function stopAntiAfk()
-    if antiAfkConnection then
-        pcall(function() antiAfkConnection:Disconnect() end)
-        antiAfkConnection = nil
-        recordEvent("SYSTEM", "Anti-AFK listener stopped", "Idled event connection disconnected")
-    end
-    antiAfkAvailable = false
-end
-
-local function startAntiAfk()
-    if not CONFIG.ANTI_AFK then
-        recordEvent("DIAGNOSTICS", "Anti-AFK disabled by configuration", "ANTI_AFK=false")
-        return false
-    end
-    if antiAfkConnection then
-        antiAfkAvailable = true
-        return true
-    end
-    if not VirtualUser then
-        antiAfkAvailable = false
-        recordEvent("DIAGNOSTICS", "Anti-AFK unavailable", "VirtualUser service is not exposed in this client/executor")
-        return false
-    end
-
-    local ok, connection = pcall(function()
-        return LocalPlayer.Idled:Connect(function()
-            if not running then
-                return
-            end
-            local actionOk, actionError = pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton2(Vector2.new(0, 0))
-            end)
-            if actionOk then
-                antiAfkEvents = antiAfkEvents + 1
-                recordEvent("SYSTEM", "Anti-AFK idle event handled",
-                    "Count=" .. tostring(antiAfkEvents) .. " | Method=VirtualUser ClickButton2 | Trigger=LocalPlayer.Idled")
-            else
-                antiAfkErrors = antiAfkErrors + 1
-                recordEvent("ERROR", "Anti-AFK idle response failed",
-                    "Count=" .. tostring(antiAfkErrors) .. " | Error=" .. diagTraceback(actionError))
-            end
-        end)
-    end)
-
-    if ok and connection then
-        antiAfkConnection = connection
-        antiAfkAvailable = true
-        recordEvent("SYSTEM", "Anti-AFK listener active",
-            "Method=LocalPlayer.Idled + VirtualUser:CaptureController/ClickButton2 | No polling or continuous synthetic input")
-        return true
-    end
-
-    antiAfkAvailable = false
-    antiAfkErrors = antiAfkErrors + 1
-    recordEvent("ERROR", "Anti-AFK listener could not attach", diagTraceback(connection))
-    return false
-end
-
 local function setStatus(message)
     currentStatus = tostring(message)
 end
@@ -884,7 +772,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.4 | Base=supplied HF9.2 scanner/collector and transport | ClusterPolicy=UNLIMITED full clear | TokenCollection=server-death-position centered with prompt retries | AntiAFK=LocalPlayer.Idled listener | CombatProfile=50-stud nearest-contact alien-only aura with collateral guard | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.0 | Base=HF5.9 scanner/collector | CombatProfile=close-range nearest-contact 3-target aura | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -997,89 +885,26 @@ local function getPromptPosition(prompt)
     return nil
 end
 
-local function markerFromText(value)
-    if type(value) ~= "string" then
-        return nil
-    end
-    local name = string.lower(value)
-    if string.find(name, "zombie", 1, true) then
-        return "Zombie"
-    end
-    if string.find(name, "parasite", 1, true) then
-        return "Parasite"
-    end
-    return nil
-end
-
-local function getExcludedHostileMarker(model)
-    if not model or not model:IsA("Model") then
-        return nil
-    end
-
-    local marker = markerFromText(model.Name)
-    if marker then
-        return marker
-    end
-
-    local function inspectAttributes(instance)
-        local ok, attributes = pcall(function()
-            return instance:GetAttributes()
-        end)
-        if ok and type(attributes) == "table" then
-            for key, value in pairs(attributes) do
-                marker = markerFromText(key) or markerFromText(value)
-                if marker then
-                    return marker
-                end
-            end
-        end
-        return nil
-    end
-
-    marker = inspectAttributes(model)
-    if marker then
-        return marker
-    end
-
-    for _, descendant in ipairs(model:GetDescendants()) do
-        marker = markerFromText(descendant.Name)
-        if marker then
-            return marker
-        end
-
-        if descendant:IsA("StringValue") then
-            local value
-            pcall(function() value = descendant.Value end)
-            marker = markerFromText(value)
-            if marker then
-                return marker
-            end
-        end
-
-        if descendant:IsA("Model") or descendant:IsA("Folder") or descendant:IsA("ValueBase") then
-            marker = inspectAttributes(descendant)
-            if marker then
-                return marker
-            end
-        end
-    end
-    return nil
-end
-
 local function hasZombieMarker(model)
-    return getExcludedHostileMarker(model) == "Zombie"
-end
-
-local function hasParasiteMarker(model)
-    return getExcludedHostileMarker(model) == "Parasite"
-end
-
-local function hasExcludedHostileMarker(model)
-    return getExcludedHostileMarker(model) ~= nil
+    if not model or not model:IsA("Model") then
+        return false
+    end
+    if string.find(string.lower(tostring(model.Name)), "zombie", 1, true) then
+        return true
+    end
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("Model") or descendant:IsA("Folder") then
+            local name = string.lower(tostring(descendant.Name))
+            if name == "zombie" or name == "zombietype" or string.find(name, "zombie", 1, true) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 local function isAlienModel(model)
-    if not model or not model:IsA("Model") or hasExcludedHostileMarker(model) then
+    if not model or not model:IsA("Model") or hasZombieMarker(model) then
         return nil
     end
     local variantNames = {
@@ -1106,30 +931,6 @@ local function getModelRoot(model)
         or model.PrimaryPart
         or model:FindFirstChild("Torso", true)
         or model:FindFirstChild("Head", true)
-end
-
-local function getNearestNonAlienEntityWithin(position, radius)
-    if not ENTITY_CONTAINER or not position then
-        return nil
-    end
-    local nearest = nil
-    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-        if model:IsA("Model") and not isAlienModel(model) then
-            local entityRoot = getModelRoot(model) or model:FindFirstChildWhichIsA("BasePart", true)
-            if entityRoot and entityRoot.Parent then
-                local distance = (entityRoot.Position - position).Magnitude
-                if distance <= radius and (not nearest or distance < nearest.distance) then
-                    nearest = {
-                        model = model,
-                        root = entityRoot,
-                        distance = distance,
-                        marker = getExcludedHostileMarker(model) or "UnknownNonAlien",
-                    }
-                end
-            end
-        end
-    end
-    return nearest
 end
 
 local function isModelAlive(model)
@@ -1172,7 +973,7 @@ local function getAliensNear(position, radius)
     end
     for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
         local variant = isAlienModel(model)
-        if variant and not hasExcludedHostileMarker(model) and isModelAlive(model) then
+        if variant and not hasZombieMarker(model) and isModelAlive(model) then
             local root = getModelRoot(model)
             if root then
                 local distance = (root.Position - position).Magnitude
@@ -1187,42 +988,6 @@ local function getAliensNear(position, radius)
             end
         end
     end
-    table.sort(results, function(a, b)
-        return a.distance < b.distance
-    end)
-    return results
-end
-
-local function getTrackedClusterEntries(position, radius, trackedMembers)
-    local results = getAliensNear(position, radius)
-    local seen = {}
-    for _, entry in ipairs(results) do
-        seen[entry.model] = true
-        if trackedMembers then
-            trackedMembers[entry.model] = entry.root.Position
-        end
-    end
-
-    for model, lastPosition in pairs(trackedMembers or {}) do
-        if model and not seen[model] and model.Parent == ENTITY_CONTAINER then
-            local variant = isAlienModel(model)
-            if variant and not hasExcludedHostileMarker(model) and isModelAlive(model) then
-                local root = getModelRoot(model)
-                if root and root.Parent then
-                    local distance = (root.Position - position).Magnitude
-                    table.insert(results, {
-                        model = model,
-                        root = root,
-                        variant = variant,
-                        distance = distance,
-                        trackedOutsideScanRadius = distance > radius,
-                    })
-                    trackedMembers[model] = root.Position
-                end
-            end
-        end
-    end
-
     table.sort(results, function(a, b)
         return a.distance < b.distance
     end)
@@ -1647,11 +1412,9 @@ local function monitorAlienModel(model)
         return
     end
 
-    local initialRoot = getModelRoot(model)
     local record = {
         model = model,
         variant = variant,
-        lastKnownPosition = initialRoot and initialRoot.Position or nil,
         sources = {},
         maxHealthSources = {},
         sourceCount = 0,
@@ -1795,28 +1558,19 @@ local function classifyAlienHitPart(part, model)
     local fullPath = string.lower(part:GetFullName())
     local inAlienDress = string.find(fullPath, ".dress.alientype", 1, true) ~= nil
     local inTorsoFolder = inAlienDress and string.find(fullPath, ".torso.", 1, true) ~= nil
-    local inArmFolder = string.find(fullPath, ".left arm.", 1, true) ~= nil
-        or string.find(fullPath, ".right arm.", 1, true) ~= nil
-        or string.find(fullPath, ".upperarm.", 1, true) ~= nil
-        or string.find(fullPath, ".lowerarm.", 1, true) ~= nil
-    local inHeadFolder = string.find(fullPath, ".head.", 1, true) ~= nil
-    local inLegFolder = string.find(fullPath, ".left leg.", 1, true) ~= nil
-        or string.find(fullPath, ".right leg.", 1, true) ~= nil
-        or string.find(fullPath, ".upperleg.", 1, true) ~= nil
-        or string.find(fullPath, ".lowerleg.", 1, true) ~= nil
 
-    if inTorsoFolder and (lowerName == "cylinder.008" or lowerName == "alien.008") then
+    -- Exact torso meshes captured by the observer get first priority.
+    if lowerName == "cylinder.008" or lowerName == "alien.008" then
         return 0, "TORSO_MESH"
     end
     if inTorsoFolder or lowerName == "torso" or lowerName == "uppertorso" or lowerName == "lowertorso" then
         return 1, "TORSO"
     end
-    if inArmFolder or inHeadFolder or lowerName == "right arm" or lowerName == "left arm"
-        or lowerName == "head" or lowerName == "upperarm" or lowerName == "lowerarm"
-        or lowerName == "alien.008" or lowerName == "cylinder.008" then
-        return 2, (inHeadFolder or lowerName == "head") and "HEAD" or "ARM"
+    if lowerName == "right arm" or lowerName == "left arm"
+        or lowerName == "head" or lowerName == "upperarm" or lowerName == "lowerarm" then
+        return 2, lowerName == "head" and "HEAD" or "ARM"
     end
-    if inLegFolder or lowerName == "right leg" or lowerName == "left leg"
+    if lowerName == "right leg" or lowerName == "left leg"
         or lowerName == "upperleg" or lowerName == "lowerleg" then
         return 3, "LEG"
     end
@@ -2106,55 +1860,55 @@ local function moveCharacter(position, lookAtPosition, moveReason)
 end
 
 local function moveBelowAlien(entry)
-    if not entry or not entry.root or not entry.root.Parent then
-        return false
-    end
+    if not entry or not entry.root or not entry.root.Parent then return false end
 
     local targetRootPosition = entry.root.Position
+    local torsoAnchor = getPreferredTorsoAnchor(entry.model)
+    local anchorPosition = torsoAnchor and torsoAnchor.Position or targetRootPosition
     local _, playerRoot = getCharacter()
-    if not playerRoot then
-        return false
-    end
+    if not playerRoot then return false end
 
+    local approachVector = Vector3.new(anchorPosition.X - playerRoot.Position.X, 0, anchorPosition.Z - playerRoot.Position.Z)
+    if approachVector.Magnitude < 0.001 then
+        local fallbackLook = entry.root.CFrame.LookVector
+        approachVector = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
+    end
+    if approachVector.Magnitude < 0.001 then approachVector = Vector3.new(0, 0, -1) else approachVector = approachVector.Unit end
+
+    -- Measure the hover gap from the torso anchor. The old build measured from
+    -- the lower model root, leaving the torso about 12.2 studs vertically away.
     local hoverPosition = Vector3.new(
-        targetRootPosition.X,
-        targetRootPosition.Y - CONFIG.HOVER_BELOW,
-        targetRootPosition.Z
+        anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
+        anchorPosition.Y - CONFIG.HOVER_BELOW,
+        anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
     )
-    local lookVector = entry.root.CFrame.LookVector
-    local horizontalLookAt = hoverPosition + Vector3.new(lookVector.X, 0, lookVector.Z)
+    local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
     currentTarget = entry.variant .. " / " .. entry.model.Name
 
-    local beforeDistance = (playerRoot.Position - targetRootPosition).Magnitude
+    local beforeDistance = (playerRoot.Position - anchorPosition).Magnitude
     local requestedDelta = (playerRoot.Position - hoverPosition).Magnitude
     local moved = true
     if requestedDelta > CONFIG.HOVER_REPOSITION_THRESHOLD then
-        moved = moveCharacter(hoverPosition, horizontalLookAt, "ROOT_LOCK_UNDER_ALIEN")
+        moved = moveCharacter(hoverPosition, horizontalLookAt, "SAFE_HOVER_CLOSE_TORSO_APPROACH")
     end
 
     local _, actualRoot = getCharacter()
     local actualPosition = actualRoot and actualRoot.Position or hoverPosition
-    local actualVerticalOffset = actualPosition.Y - targetRootPosition.Y
+    local actualTorsoOffset = actualPosition.Y - anchorPosition.Y
+    local actualRootOffset = actualPosition.Y - targetRootPosition.Y
     local actualRootDistance = (actualPosition - targetRootPosition).Magnitude
-    local horizontalOffset = Vector3.new(
-        actualPosition.X - targetRootPosition.X,
-        0,
-        actualPosition.Z - targetRootPosition.Z
-    ).Magnitude
-    local record = monitoredAliens[entry.model]
-    if record then
-        record.lastKnownPosition = targetRootPosition
-    end
+    local actualAnchorDistance = (actualPosition - anchorPosition).Magnitude
     local camera = Workspace.CurrentCamera
     local cameraType = camera and tostring(camera.CameraType) or "unknown"
 
-    recordThrottled("root-lock-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Root-locked hover maintained", string.format(
-        "Variant=%s | Model=%s | ModelRoot=%s | ModelRootPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualVerticalOffset=%.2f | ActualRootDistance=%.2f | HorizontalOffset=%.2f | HoverBelowRoot=%.2f | PreviousRootDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
-        entry.variant, entry.model.Name, entry.root:GetFullName(),
-        targetRootPosition.X, targetRootPosition.Y, targetRootPosition.Z,
+    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Close torso-relative hover maintained", string.format(
+        "Variant=%s | Model=%s | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualTorsoVerticalOffset=%.2f | ActualRootVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelowTorso=%.2f | PreviousAnchorDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
+        entry.variant, entry.model.Name, torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
+        anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
         hoverPosition.X, hoverPosition.Y, hoverPosition.Z,
         actualPosition.X, actualPosition.Y, actualPosition.Z,
-        actualVerticalOffset, actualRootDistance, horizontalOffset,
+        actualTorsoOffset, actualRootOffset, actualRootDistance, actualAnchorDistance,
+        CONFIG.TORSO_HORIZONTAL_STANDOFF, approachVector.X, approachVector.Z,
         CONFIG.HOVER_BELOW, beforeDistance, requestedDelta, tostring(moved), cameraType
     ))
     return moved
@@ -2224,9 +1978,9 @@ local function sendMeleeSweep(entries)
     for _, entry in ipairs(entries) do
         if entry.model and entry.model.Parent == ENTITY_CONTAINER and entry.root and entry.root.Parent
             and isAlienModel(entry.model) == entry.variant
-            and not hasExcludedHostileMarker(entry.model)
+            and not hasZombieMarker(entry.model)
             and not serverDeadAlienModels[entry.model] then
-            local contact = getClosestMeleeContact(entry.model, root.Position, getMeleeHitRange())
+            local contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_HIT_MAX_DISTANCE)
             if contact and contact.part and contact.part.Parent then
                 contact.entry = entry
                 table.insert(candidates, contact)
@@ -2236,7 +1990,7 @@ local function sendMeleeSweep(entries)
                     1,
                     "COMBAT",
                     "Alien skipped: no body-part center in attack radius",
-                    entry.variant .. "/" .. entry.model.Name .. " | MaxPartCenterDistance=" .. tostring(getMeleeHitRange())
+                    entry.variant .. "/" .. entry.model.Name .. " | MaxPartCenterDistance=" .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE)
                 )
             end
         end
@@ -2256,26 +2010,8 @@ local function sendMeleeSweep(entries)
             0.75,
             "COMBAT",
             "No valid alien body part in attack radius",
-            "No eligible body-part center within " .. tostring(getMeleeHitRange()) .. " studs"
+            "No eligible body-part center within " .. tostring(CONFIG.MELEE_HIT_MAX_DISTANCE) .. " studs"
         )
-        return 0
-    end
-
-    -- The observed server melee effect can affect nearby entities beyond the
-    -- exact client-selected part. Suppress the whole sweep if any non-alien
-    -- model is inside the configured attack area; this is intentionally strict.
-    local collateralBlocker = getNearestNonAlienEntityWithin(root.Position, CONFIG.COLLATERAL_GUARD_RADIUS)
-    if collateralBlocker then
-        recordThrottled(
-            "collateral-guard:" .. tostring(collateralBlocker.model.Name),
-            0.75,
-            "COMBAT",
-            "Melee sweep suppressed to prevent non-alien collateral",
-            string.format("BlockedEntity=%s | Marker=%s | Distance=%.2f | GuardRadius=%.1f | AllowedTargets=AlienType1/2/3 only",
-                tostring(collateralBlocker.model.Name), tostring(collateralBlocker.marker),
-                collateralBlocker.distance, CONFIG.COLLATERAL_GUARD_RADIUS)
-        )
-        setStatus("Holding attacks: non-alien entity inside 50-stud attack area")
         return 0
     end
 
@@ -2307,15 +2043,6 @@ local function sendMeleeSweep(entries)
 
     -- The measured working capture had a 32.3 ms median Attack-to-first-Hit delay.
     task.wait(CONFIG.MELEE_HIT_DELAY)
-    local lateCollateralBlocker = getNearestNonAlienEntityWithin(root.Position, CONFIG.COLLATERAL_GUARD_RADIUS)
-    if lateCollateralBlocker then
-        recordEvent("COMBAT", "Hit payloads withheld by late collateral guard",
-            string.format("BlockedEntity=%s | Marker=%s | Distance=%.2f | GuardRadius=%.1f | AttackStartWasSent=true | HitRequestsSent=0",
-                tostring(lateCollateralBlocker.model.Name), tostring(lateCollateralBlocker.marker),
-                lateCollateralBlocker.distance, CONFIG.COLLATERAL_GUARD_RADIUS))
-        setStatus("Holding Hit requests to avoid non-alien collateral")
-        return 0
-    end
     recordThrottled(
         "melee-attack-dispatched",
         0.25,
@@ -2354,7 +2081,7 @@ local function sendMeleeSweep(entries)
         if contact.part and contact.part.Parent and entry.model and entry.model.Parent == ENTITY_CONTAINER
             and contact.part:IsDescendantOf(entry.model)
             and isAlienModel(entry.model) == entry.variant
-            and not hasExcludedHostileMarker(entry.model)
+            and not hasZombieMarker(entry.model)
             and not serverDeadAlienModels[entry.model] then
             local targetHitCount = 0
             for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
@@ -2362,23 +2089,9 @@ local function sendMeleeSweep(entries)
                     break
                 end
 
-                local liveCollateralBlocker = getNearestNonAlienEntityWithin(root.Position, CONFIG.COLLATERAL_GUARD_RADIUS)
-                if liveCollateralBlocker then
-                    recordThrottled(
-                        "collateral-guard-live:" .. tostring(liveCollateralBlocker.model.Name),
-                        0.5,
-                        "COMBAT",
-                        "Remaining Hit requests cancelled by collateral guard",
-                        string.format("BlockedEntity=%s | Marker=%s | Distance=%.2f | GuardRadius=%.1f",
-                            tostring(liveCollateralBlocker.model.Name), tostring(liveCollateralBlocker.marker),
-                            liveCollateralBlocker.distance, CONFIG.COLLATERAL_GUARD_RADIUS)
-                    )
-                    return sentHits
-                end
-
                 local currentPartPosition = contact.part.Position
                 local currentContactDistance = (currentPartPosition - root.Position).Magnitude
-                if currentContactDistance <= getMeleeHitRange() then
+                if currentContactDistance <= CONFIG.MELEE_HIT_MAX_DISTANCE then
                     local okHit, hitError = pcall(function()
                         -- Use the live part center, upward normal and actual material.
                         ReplicaSignal:FireServer(
@@ -2404,8 +2117,8 @@ local function sendMeleeSweep(entries)
                     end
                 else
                     recordThrottled("melee-contact-moved-out:" .. tostring(entry.model.Name), 0.5,
-                        "COMBAT", "Alien contact moved outside configured melee radius; Hit skipped",
-                        string.format("Target=%s/%s | CurrentPartDistance=%.2f | MaxDistance=%.2f", entry.variant, entry.model.Name, currentContactDistance, getMeleeHitRange()))
+                        "COMBAT", "Alien contact moved outside close melee radius; Hit skipped",
+                        string.format("Target=%s/%s | CurrentPartDistance=%.2f | MaxDistance=%.2f", entry.variant, entry.model.Name, currentContactDistance, CONFIG.MELEE_HIT_MAX_DISTANCE))
                 end
             end
 
@@ -2471,214 +2184,82 @@ local function getAlienTokenPrompts(center, radius)
     return prompts
 end
 
-local function activatePrompt(prompt, attemptNumber)
+local function activatePrompt(prompt)
     if not prompt or not prompt.Parent or not prompt.Enabled then
-        return false, "Prompt is missing or disabled"
+        return false
     end
-
-    local previousError = nil
-    if (tonumber(attemptNumber) or 1) % 2 == 1 and type(fireproximityprompt) == "function" then
-        local fireOk, fireError = pcall(function()
+    local ok, activationError = false, nil
+    if type(fireproximityprompt) == "function" then
+        ok, activationError = pcall(function()
             fireproximityprompt(prompt)
         end)
-        if fireOk then
-            return true, nil
-        end
-        previousError = fireError
+    else
+        ok, activationError = pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(math.max(prompt.HoldDuration, 0.05))
+            prompt:InputHoldEnd()
+        end)
     end
-
-    local holdOk, holdError = pcall(function()
-        prompt:InputHoldBegin()
-        task.wait(math.max(tonumber(prompt.HoldDuration) or 0, 0.05))
-        prompt:InputHoldEnd()
-    end)
-    if holdOk then
-        return true, nil
-    end
-    return false, holdError or previousError
+    return ok, activationError
 end
 
 local function collectTokensAround(center, radius)
     if not center then
-        return 0, 0
+        return 0
     end
-
     local confirmed = 0
-    local attemptsByPrompt = {}
-    local confirmedPrompts = {}
+    local collectedThisPass = {}
     local idlePasses = 0
 
-    while running and not paused and idlePasses < CONFIG.TOKEN_IDLE_PASSES
-        and confirmed < CONFIG.MAX_TOKEN_PICKUPS_PER_PASS do
+    while running and not paused and idlePasses < 3 and confirmed < CONFIG.MAX_TOKEN_PICKUPS_PER_PASS do
         local prompts = getAlienTokenPrompts(center, radius)
-        local attemptedAny = false
+        local foundNew = false
 
         for _, item in ipairs(prompts) do
             local prompt = item.prompt
-            local attemptNumber = attemptsByPrompt[prompt] or 0
-            if prompt and prompt.Parent and prompt.Enabled and not confirmedPrompts[prompt]
-                and attemptNumber < CONFIG.TOKEN_PROMPT_RETRIES then
-                attemptedAny = true
-                attemptNumber = attemptNumber + 1
-                attemptsByPrompt[prompt] = attemptNumber
+            if prompt and prompt.Parent and not collectedThisPass[prompt] then
+                foundNew = true
+                collectedThisPass[prompt] = true
                 local position = getPromptPosition(prompt) or item.position
                 if position then
                     local promptPath = "unknown"
                     pcall(function() promptPath = prompt:GetFullName() end)
-                    recordEvent("TOKEN", "Alien Token pickup detected", string.format(
-                        "Path=%s | Position=(%.1f, %.1f, %.1f) | DistanceFromDeath=%.1f | MaxActivationDistance=%.1f | Attempt=%d/%d",
-                        promptPath, position.X, position.Y, position.Z, item.distance,
-                        prompt.MaxActivationDistance, attemptNumber, CONFIG.TOKEN_PROMPT_RETRIES))
+                    recordEvent("TOKEN", "Alien Token pickup detected", string.format("Path=%s | Position=(%.1f, %.1f, %.1f) | DistanceFromCluster=%.1f | MaxActivationDistance=%.1f", promptPath, position.X, position.Y, position.Z, item.distance, prompt.MaxActivationDistance))
                     local moved = moveCharacter(position + Vector3.new(0, 2, 0), position, "TOKEN_PICKUP")
-                    task.wait(0.10)
+                    task.wait(0.08)
                     tokenAttempts = tokenAttempts + 1
-                    recordEvent("TOKEN", "Pickup attempt started", "Path=" .. promptPath
-                        .. " | MoveToPickup=" .. tostring(moved)
-                        .. " | Attempt=" .. tostring(tokenAttempts)
-                        .. " | PromptRetry=" .. tostring(attemptNumber))
-                    local triggered, triggerError = activatePrompt(prompt, attemptNumber)
-                    recordEvent("TOKEN", triggered and "Prompt activation call returned" or "Prompt activation call failed",
-                        "Path=" .. promptPath .. " | LocalResult=" .. tostring(triggered)
-                            .. (triggerError and " | Error=" .. diagTraceback(triggerError) or ""))
+                    recordEvent("TOKEN", "Pickup attempt started", "Path=" .. promptPath .. " | MoveToPickup=" .. tostring(moved) .. " | Attempt=" .. tostring(tokenAttempts))
+                    local triggered, triggerError = activatePrompt(prompt)
+                    recordEvent("TOKEN", triggered and "Prompt activation call returned" or "Prompt activation call failed", "Path=" .. promptPath .. " | LocalResult=" .. tostring(triggered) .. (triggerError and " | Error=" .. diagTraceback(triggerError) or ""))
                     task.wait(CONFIG.TOKEN_SETTLE_WAIT)
                     if triggered and (not prompt.Parent or not prompt.Enabled) then
-                        confirmedPrompts[prompt] = true
                         tokenPickupsConfirmed = tokenPickupsConfirmed + 1
                         confirmed = confirmed + 1
                         setStatus("Collected Alien Token pickup")
-                        recordEvent("TOKEN", "Pickup confirmed by prompt removal/disable",
-                            "Path=" .. promptPath .. " | ConfirmedThisPass=" .. tostring(confirmed)
-                                .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
-                    elseif attemptNumber < CONFIG.TOKEN_PROMPT_RETRIES then
-                        setStatus("Token pickup not confirmed; retrying prompt")
-                        recordThrottled("token-unconfirmed:" .. promptPath, 0.5, "TOKEN", "Pickup not confirmed; retry scheduled",
-                            "Prompt remained present and enabled | Retry=" .. tostring(attemptNumber + 1)
-                                .. "/" .. tostring(CONFIG.TOKEN_PROMPT_RETRIES))
-                        task.wait(0.15)
+                        recordEvent("TOKEN", "Pickup confirmed by prompt removal/disable", "Path=" .. promptPath .. " | ConfirmedThisPass=" .. tostring(confirmed) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
+                    elseif triggered then
+                        setStatus("Token pickup triggered; waiting for confirmation")
+                        recordThrottled("token-unconfirmed:" .. promptPath, 1, "TOKEN", "Pickup not confirmed", "Prompt remained present and enabled after activation")
                     else
-                        recordEvent("TOKEN", "Pickup retries exhausted",
-                            "Path=" .. promptPath .. " | Prompt remained present/enabled after "
-                                .. tostring(CONFIG.TOKEN_PROMPT_RETRIES) .. " attempts")
+                        remoteErrors = remoteErrors + 1
+                        recordEvent("ERROR", "Token pickup activation failed", "Path=" .. promptPath .. " | " .. diagTraceback(triggerError))
                     end
                 end
             end
         end
 
-        if attemptedAny then
+        if foundNew then
             idlePasses = 0
-            task.wait(0.08)
         else
             idlePasses = idlePasses + 1
             task.wait(0.25)
         end
     end
 
-    local remainingPrompts = getAlienTokenPrompts(center, radius)
-    recordEvent("TOKEN", "Token search pass complete",
-        "Confirmed=" .. tostring(confirmed) .. " | RemainingEnabledPrompts=" .. tostring(#remainingPrompts)
-            .. " | SearchRadius=" .. tostring(radius))
-    return confirmed, #remainingPrompts
+    return confirmed
 end
 
-local function collectPendingTokenDrops(fallbackCenters)
-    local totalConfirmed = 0
-    local processedThisPass = 0
-    local searchedCenters = {}
-    local seenCenters = {}
-
-    local function rememberSearchCenter(center)
-        if typeof(center) == "Vector3" then
-            local key = string.format("%.0f:%.0f:%.0f", center.X, center.Y, center.Z)
-            if not seenCenters[key] then
-                seenCenters[key] = true
-                table.insert(searchedCenters, center)
-            end
-        end
-    end
-
-    while running and not paused and #pendingTokenDropCenters > 0 do
-        local drop = table.remove(pendingTokenDropCenters, 1)
-        if drop and drop.position then
-            rememberSearchCenter(drop.position)
-            task.wait(CONFIG.TOKEN_DROP_SPAWN_WAIT)
-            local prompts = getAlienTokenPrompts(drop.position, CONFIG.TOKEN_SEARCH_RADIUS)
-            if #prompts == 0 then
-                task.wait(0.35)
-                prompts = getAlienTokenPrompts(drop.position, CONFIG.TOKEN_SEARCH_RADIUS)
-            end
-
-            if #prompts > 0 then
-                setStatus("Collecting drops from confirmed alien death")
-                local collected, remaining = collectTokensAround(drop.position, CONFIG.TOKEN_SEARCH_RADIUS)
-                totalConfirmed = totalConfirmed + collected
-                tokenDropCentersProcessed = tokenDropCentersProcessed + 1
-                processedThisPass = processedThisPass + 1
-                recordEvent("TOKEN", "Death-location collection pass finished",
-                    "Target=" .. tostring(drop.variant) .. "/" .. tostring(drop.modelName)
-                        .. " | PromptsInitiallyFound=" .. tostring(#prompts)
-                        .. " | Confirmed=" .. tostring(collected)
-                        .. " | Remaining=" .. tostring(remaining))
-            else
-                drop.spawnChecks = (tonumber(drop.spawnChecks) or 0) + 1
-                if drop.spawnChecks < CONFIG.TOKEN_DROP_SPAWN_RETRIES then
-                    table.insert(pendingTokenDropCenters, drop)
-                    recordEvent("TOKEN", "Waiting for delayed token drop spawn",
-                        "Target=" .. tostring(drop.variant) .. "/" .. tostring(drop.modelName)
-                            .. " | SpawnCheck=" .. tostring(drop.spawnChecks) .. "/" .. tostring(CONFIG.TOKEN_DROP_SPAWN_RETRIES)
-                            .. " | Queue=" .. tostring(#pendingTokenDropCenters))
-                else
-                    tokenDropCentersProcessed = tokenDropCentersProcessed + 1
-                    processedThisPass = processedThisPass + 1
-                    recordEvent("TOKEN", "No token prompt found after death-location retries",
-                        "Target=" .. tostring(drop.variant) .. "/" .. tostring(drop.modelName)
-                            .. " | DeathPosition=" .. tostring(drop.position)
-                            .. " | Checks=" .. tostring(drop.spawnChecks)
-                            .. " | SearchRadius=" .. tostring(CONFIG.TOKEN_SEARCH_RADIUS))
-                end
-            end
-        end
-    end
-
-    for _, center in ipairs(fallbackCenters or {}) do
-        if not running or paused then
-            break
-        end
-        rememberSearchCenter(center)
-        if typeof(center) == "Vector3" then
-            local prompts = getAlienTokenPrompts(center, CONFIG.TOKEN_SEARCH_RADIUS)
-            if #prompts > 0 then
-                local collected, remaining = collectTokensAround(center, CONFIG.TOKEN_SEARCH_RADIUS)
-                totalConfirmed = totalConfirmed + collected
-                recordEvent("TOKEN", "Tracked-alien fallback collection pass finished",
-                    "Center=" .. tostring(center) .. " | PromptsInitiallyFound=" .. tostring(#prompts)
-                        .. " | Confirmed=" .. tostring(collected) .. " | Remaining=" .. tostring(remaining))
-            end
-        end
-    end
-
-    local remainingPromptSet = {}
-    for _, center in ipairs(searchedCenters) do
-        for _, item in ipairs(getAlienTokenPrompts(center, CONFIG.TOKEN_SEARCH_RADIUS)) do
-            remainingPromptSet[item.prompt] = true
-        end
-    end
-    local remainingPromptCount = 0
-    for _ in pairs(remainingPromptSet) do
-        remainingPromptCount = remainingPromptCount + 1
-    end
-
-    if processedThisPass > 0 or totalConfirmed > 0 or remainingPromptCount > 0 then
-        recordEvent("TOKEN", "Pending alien drop collection summary",
-            "DeathCentersProcessed=" .. tostring(processedThisPass)
-                .. " | TotalDeathCentersProcessed=" .. tostring(tokenDropCentersProcessed)
-                .. " | ConfirmedThisPass=" .. tostring(totalConfirmed)
-                .. " | RemainingEnabledPrompts=" .. tostring(remainingPromptCount)
-                .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
-    end
-    return totalConfirmed, remainingPromptCount
-end
-
-local function engageAliens(seedEntries, clusterPosition, trackedMembers)
+local function engageAliens(seedEntries)
     if not seedEntries or #seedEntries == 0 then
         return true, false
     end
@@ -2688,139 +2269,80 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
         return false, false
     end
 
-    local clusterCenter = clusterPosition or firstTarget.root.Position
-    local fallbackDropCenters = {}
-    for model, lastPosition in pairs(trackedMembers or {}) do
-        local root = model and model.Parent == ENTITY_CONTAINER and getModelRoot(model) or nil
-        local position = root and root.Position or lastPosition
-        if typeof(position) == "Vector3" then
-            table.insert(fallbackDropCenters, position)
-        end
-    end
-    if #fallbackDropCenters == 0 then
-        for _, entry in ipairs(seedEntries) do
-            if entry.root and entry.root.Parent then
-                table.insert(fallbackDropCenters, entry.root.Position)
-            end
-        end
-    end
-
+    local clusterCenter = firstTarget.root.Position
     local startTime = os.clock()
     local initialKillCount = alienKills
+    local startKillCount = initialKillCount
     local initialAlienImpactCount = serverConfirmedAlienHitEvents
     local initialAlienDeathCount = serverAlienDeathEvents
-    recordEvent("TARGET", "Alien cluster engagement started",
-        string.format("InitialTarget=%s/%s | Count=%d | Policy=UNLIMITED | DetectionRadius=%.1f | Center=(%.1f, %.1f, %.1f)",
-            firstTarget.variant, firstTarget.model.Name, #seedEntries, CONFIG.SCAN_DETECT_RADIUS,
-            clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
-
+    recordEvent("TARGET", "Alien cluster engagement started", string.format("InitialTarget=%s/%s | Count=%d | Center=(%.1f, %.1f, %.1f)", firstTarget.variant, firstTarget.model.Name, #seedEntries, clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
     local lastProgressTime = os.clock()
     local lastKnownAlienImpacts = serverConfirmedAlienHitEvents
     local lastKnownAlienDeaths = serverAlienDeathEvents
-    local lastKnownKillCount = alienKills
-    local lockedTargetModel = nil
-    setStatus("Engaging alien cluster; scan held until clear")
+    setStatus("Engaging alien cluster")
 
-    while running and not paused do
-        local entries = getTrackedClusterEntries(clusterCenter, CONFIG.SCAN_DETECT_RADIUS, trackedMembers)
+    while running and not paused and (os.clock() - startTime) < CONFIG.ENGAGE_TIMEOUT do
+        local entries = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
         if #entries == 0 then
             break
         end
 
-        local nearest = nil
-        if lockedTargetModel then
-            for _, entry in ipairs(entries) do
-                if entry.model == lockedTargetModel then
-                    nearest = entry
-                    break
-                end
-            end
-        end
-        if not nearest then
-            nearest = getNearestEntry(entries)
-            lockedTargetModel = nearest and nearest.model or nil
-        end
+        local nearest = getNearestEntry(entries)
         if not nearest then
             break
         end
 
-        recordThrottled("target-selection", 0.75, "TARGET", "Alien target locked",
-            "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name
-                .. " | ClusterTargets=" .. tostring(#entries) .. " | LockUntilDeadOrRemoved=true")
+        recordThrottled("target-selection", 0.75, "TARGET", "Alien target selected", "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name .. " | ClusterTargets=" .. tostring(#entries))
         moveBelowAlien(nearest)
-        local targetRecordBefore = monitoredAliens[nearest.model]
-        local targetHitCountBefore = targetRecordBefore and (targetRecordBefore.serverHitCount or 0) or 0
-        local hits = sendMeleeSweep({nearest})
+        local hits = sendMeleeSweep(entries)
         if hits > 0 then
-            setStatus("Attacking locked " .. tostring(nearest.variant) .. " / " .. tostring(nearest.model.Name))
+            setStatus("Attacking " .. tostring(#entries) .. " alien(s) / " .. tostring(hits) .. " captured Hit requests")
         else
-            setStatus("Locked alien found; waiting for a valid melee contact")
+            setStatus("Alien target found; no hit parts available")
         end
 
-        local collectedDuringCombat = collectPendingTokenDrops(nil)
-        if collectedDuringCombat > 0 then
-            recordEvent("TOKEN", "Drops collected during active cluster clear",
-                "Confirmed=" .. tostring(collectedDuringCombat) .. " | RemainingAliens=" .. tostring(#entries))
-        end
-
-        local targetRecordAfter = monitoredAliens[nearest.model]
-        local targetHitCountAfter = targetRecordAfter and (targetRecordAfter.serverHitCount or 0) or 0
-        local targetResolved = serverDeadAlienModels[nearest.model]
-            or (targetRecordAfter and targetRecordAfter.serverDead == true)
-            or nearest.model.Parent ~= ENTITY_CONTAINER
-        if targetResolved then
-            recordEvent("TARGET", "Locked alien resolved; selecting next cluster member",
-                "Variant=" .. tostring(nearest.variant) .. " | Model=" .. tostring(nearest.model.Name)
-                    .. " | ServerDead=" .. tostring(serverDeadAlienModels[nearest.model] == true
-                        or (targetRecordAfter and targetRecordAfter.serverDead == true))
-                    .. " | Removed=" .. tostring(nearest.model.Parent ~= ENTITY_CONTAINER))
-            lockedTargetModel = nil
-            lastProgressTime = os.clock()
-        end
-
-        if alienKills > lastKnownKillCount
+        if alienKills > startKillCount
             or serverConfirmedAlienHitEvents > lastKnownAlienImpacts
-            or serverAlienDeathEvents > lastKnownAlienDeaths
-            or targetHitCountAfter > targetHitCountBefore then
+            or serverAlienDeathEvents > lastKnownAlienDeaths then
             lastProgressTime = os.clock()
-            lastKnownKillCount = alienKills
+            startKillCount = alienKills
             lastKnownAlienImpacts = serverConfirmedAlienHitEvents
             lastKnownAlienDeaths = serverAlienDeathEvents
         end
 
+        -- UI animation deltas are diagnostic only; only server-confirmed alien
+        -- impacts/deaths reset this no-progress timer.
         if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
-            setStatus("No confirmed progress on locked alien; cluster remains held for recovery")
-            recordEvent("TARGET", "Attack attempt timed out without confirmed progress",
-                "Target=" .. tostring(nearest.variant) .. "/" .. tostring(nearest.model.Name)
-                    .. " | SecondsWithoutProgress=" .. string.format("%.2f", os.clock() - lastProgressTime)
-                    .. " | ScanAdvanceBlocked=true | ClusterPolicy=UNLIMITED")
+            setStatus("No new server-confirmed alien progress; ending this engagement pass")
             break
         end
 
         task.wait(math.max(0, CONFIG.ATTACK_INTERVAL - CONFIG.MELEE_HIT_DELAY))
     end
 
-    local remaining = getTrackedClusterEntries(clusterCenter, CONFIG.SCAN_DETECT_RADIUS, trackedMembers)
-    local clusterCleared = #remaining == 0
+    local remaining = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
+    local clusterCleared = (#remaining == 0)
+    local confirmedDeathThisPass = serverAlienDeathEvents > initialAlienDeathCount
+        or alienKills > initialKillCount
+    local collected = 0
+    if confirmedDeathThisPass or clusterCleared then
+        setStatus("Collecting drops from confirmed alien kills")
+        collected = collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
+    else
+        recordEvent("TOKEN", "Drop collection deferred while aliens remain alive", "No confirmed alien death in this engagement pass; staying near targets")
+    end
     local madeProgress = serverConfirmedAlienHitEvents > initialAlienImpactCount
         or serverAlienDeathEvents > initialAlienDeathCount
         or alienKills > initialKillCount
 
-    local collectedAtEnd = collectPendingTokenDrops(fallbackDropCenters)
-    recordEvent("TARGET", "Alien engagement ended",
-        "Elapsed=" .. string.format("%.2f", os.clock() - startTime) .. "s"
-            .. " | AlienImpactDelta=" .. tostring(serverConfirmedAlienHitEvents - initialAlienImpactCount)
-            .. " | AlienDeathDelta=" .. tostring(serverAlienDeathEvents - initialAlienDeathCount)
-            .. " | KillNotificationDelta=" .. tostring(alienKills - initialKillCount)
-            .. " | RemainingTrackedAliens=" .. tostring(#remaining)
-            .. " | Progress=" .. tostring(madeProgress)
-            .. " | ScanAdvanceBlocked=" .. tostring(not clusterCleared))
-    recordEvent("TOKEN", "Cluster collection pass finished",
-        "ConfirmedAtEnd=" .. tostring(collectedAtEnd)
-            .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed)
-            .. " | PendingDeathCenters=" .. tostring(#pendingTokenDropCenters))
-    recordEvent("TARGET", "Cluster clearance check",
-        "RemainingAliens=" .. tostring(#remaining) .. " | Cleared=" .. tostring(clusterCleared))
+    recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime)
+        .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount)
+        .. " | AlienImpactDelta=" .. tostring(serverConfirmedAlienHitEvents - initialAlienImpactCount)
+        .. " | AlienDeathDelta=" .. tostring(serverAlienDeathEvents - initialAlienDeathCount)
+        .. " | RemainingInAttackRadius=" .. tostring(#remaining)
+        .. " | Progress=" .. tostring(madeProgress))
+    recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
+    recordEvent("TARGET", "Cluster clearance check", "RemainingAliens=" .. tostring(#remaining) .. " | Cleared=" .. tostring(clusterCleared))
     currentTarget = "None"
     return clusterCleared, madeProgress
 end
@@ -2862,56 +2384,29 @@ local function mainLoop()
 
     local pendingClusterCenter = nil
     local pendingClusterNoProgressPasses = 0
+    local pendingClusterStartedAt = nil
     local pendingClusterMembers = {}
 
     local function rememberClusterMembers(entries)
         for _, entry in ipairs(entries or {}) do
-            if entry.model and entry.root and entry.root.Parent then
-                pendingClusterMembers[entry.model] = entry.root.Position
-            end
+            if entry.model then pendingClusterMembers[entry.model] = true end
         end
     end
 
     local function clusterDeathState()
-        local total, unconfirmed, active = 0, 0, 0
+        local total, unconfirmed = 0, 0
         for model in pairs(pendingClusterMembers) do
             total = total + 1
-            if model and model.Parent == ENTITY_CONTAINER and isAlienModel(model)
-                and not hasExcludedHostileMarker(model) and getModelRoot(model) then
-                active = active + 1
-                if not isAlienConfirmedDead(model) then
-                    unconfirmed = unconfirmed + 1
-                end
-            end
+            if not isAlienConfirmedDead(model) then unconfirmed = unconfirmed + 1 end
         end
-        return total > 0 and unconfirmed == 0, total, unconfirmed, active
-    end
-
-    local function getClusterDropCenters()
-        local centers = {}
-        local seen = {}
-        for model, lastPosition in pairs(pendingClusterMembers) do
-            local root = model and model.Parent == ENTITY_CONTAINER and getModelRoot(model) or nil
-            local position = root and root.Position or lastPosition
-            if typeof(position) == "Vector3" then
-                local key = string.format("%.0f:%.0f:%.0f", position.X, position.Y, position.Z)
-                if not seen[key] then
-                    seen[key] = true
-                    table.insert(centers, position)
-                end
-            end
-        end
-        return centers
+        return total > 0 and unconfirmed == 0, total, unconfirmed
     end
 
     local function resetPendingCluster()
         pendingClusterCenter = nil
         pendingClusterNoProgressPasses = 0
+        pendingClusterStartedAt = nil
         pendingClusterMembers = {}
-    end
-
-    local function getEligibleAliensNear(position, radius)
-        return getTrackedClusterEntries(position, radius, pendingClusterMembers)
     end
 
     local function holdClusterWithoutProgress(stillPending)
@@ -2919,17 +2414,14 @@ local function mainLoop()
         recordEvent("TARGET", "Alien cluster made no confirmed progress",
             "Pass=" .. tostring(pendingClusterNoProgressPasses)
                 .. " | Remaining=" .. tostring(#(stillPending or {}))
-                .. " | ScanAdvanceBlocked=true | ClusterPolicy=UNLIMITED")
+                .. " | ScanAdvanceBlocked=true")
         if pendingClusterNoProgressPasses >= CONFIG.MAX_NO_PROGRESS_CLUSTER_PASSES then
             pendingClusterNoProgressPasses = 0
             local nextTarget = getNearestEntry(stillPending or {})
-            if nextTarget then
-                moveBelowAlien(nextTarget)
-                recordEvent("TARGET", "Cluster recovery re-approach completed",
-                    "Target=" .. tostring(nextTarget.variant) .. "/" .. tostring(nextTarget.model.Name)
-                        .. " | RootLock=true | ScanAdvanceBlocked=true")
-            end
-            setStatus("No damage confirmed; re-locking nearest survivor, scan held")
+            if nextTarget then moveBelowAlien(nextTarget) end
+            setStatus("No damage confirmed; close re-approach, scan held")
+            recordEvent("TARGET", "Cluster retained for close-range recovery",
+                "No scan advance. Re-approached nearest surviving alien; combat will continue.")
         else
             setStatus("No confirmed damage; staying on the same alien cluster")
         end
@@ -2938,17 +2430,14 @@ local function mainLoop()
 
     setStatus("Automatic farming started")
     recordEvent("SCAN", "Initial scan route ready", string.format(
-        "Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | RootLockedHover=%.1f below model root / %.1f horizontal offset | MeleePartRange=%.1f (hard ceiling %.1f) | CollateralGuard=%.1f | ClusterPolicy=UNLIMITED | SurvivorDeferral=disabled | TokenSearch=death-position-centered",
+        "Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | CloseHover=%.1f below torso / %.1f standoff | MeleePartRange=%.1f | StalledClusters=held until death confirmation",
         CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS,
-        CONFIG.SCAN_WAIT, CONFIG.HOVER_BELOW, CONFIG.TORSO_HORIZONTAL_STANDOFF, getMeleeHitRange(),
-        CONFIG.MELEE_HIT_HARD_CEILING, CONFIG.COLLATERAL_GUARD_RADIUS
+        CONFIG.SCAN_WAIT, CONFIG.HOVER_BELOW, CONFIG.TORSO_HORIZONTAL_STANDOFF, CONFIG.MELEE_HIT_MAX_DISTANCE
     ))
 
     while running do
         waitWhilePaused()
-        if not running then
-            break
-        end
+        if not running then break end
 
         local character, root, humanoid = getCharacter()
         if not character or not root or not humanoid then
@@ -2962,82 +2451,50 @@ local function mainLoop()
             setupFlight()
 
             if pendingClusterCenter then
-                local pendingAliens = getEligibleAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                pendingClusterStartedAt = pendingClusterStartedAt or os.clock()
+                local pendingAliens = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
                 rememberClusterMembers(pendingAliens)
-                local allResolvedBeforePass, trackedBeforePass, unconfirmedBeforePass, activeBeforePass = clusterDeathState()
+                local allDeadBeforePass, trackedBeforePass, unconfirmedBeforePass = clusterDeathState()
 
-                if #pendingAliens == 0 and allResolvedBeforePass then
-                    local collected, remainingTokenPrompts = collectPendingTokenDrops(getClusterDropCenters())
-                    if remainingTokenPrompts == 0 then
-                        recordEvent("TARGET", "Alien cluster fully cleared from active container",
-                            "TrackedEntities=" .. tostring(trackedBeforePass)
-                                .. " | Active=" .. tostring(activeBeforePass)
-                                .. " | Unconfirmed=" .. tostring(unconfirmedBeforePass)
-                                .. " | FinalTokenPickups=" .. tostring(collected)
-                                .. " | RemainingTokenPrompts=0 | Scan may advance")
+                if #pendingAliens == 0 then
+                    if allDeadBeforePass then
+                        recordEvent("TARGET", "Alien cluster death-confirmed and cleared",
+                            "TrackedEntities=" .. tostring(trackedBeforePass) .. " | Unconfirmed=" .. tostring(unconfirmedBeforePass) .. " | Advancing scan")
                         resetPendingCluster()
                         advanceScan()
                     else
-                        setStatus("Aliens cleared; collecting remaining token drops before scanning")
-                        recordEvent("TOKEN", "Scan advancement blocked by remaining token prompts",
-                            "RemainingEnabledPrompts=" .. tostring(remainingTokenPrompts)
-                                .. " | ConfirmedThisPass=" .. tostring(collected)
-                                .. " | ScanAdvanceBlocked=true")
+                        recordEvent("TARGET", "Alien models absent without death confirmation; scan held",
+                            "TrackedEntities=" .. tostring(trackedBeforePass) .. " | Unconfirmed=" .. tostring(unconfirmedBeforePass) .. " | Removal/despawn is not treated as a kill")
+                        setStatus("Waiting for alien death confirmation; scan held")
                         task.wait(0.5)
                     end
-                elseif #pendingAliens == 0 then
-                    recordEvent("TARGET", "Tracked alien temporarily unavailable; scan remains held",
-                        "TrackedEntities=" .. tostring(trackedBeforePass)
-                            .. " | Active=" .. tostring(activeBeforePass)
-                            .. " | Unconfirmed=" .. tostring(unconfirmedBeforePass)
-                            .. " | ScanAdvanceBlocked=true")
-                    setStatus("Waiting for remaining tracked alien; scan held")
-                    task.wait(0.5)
                 else
                     recordEvent("TARGET", "Continuing active alien cluster",
-                        "RemainingTrackedAliens=" .. tostring(#pendingAliens)
+                        "RemainingInScanRadius=" .. tostring(#pendingAliens)
                             .. " | TrackedEntities=" .. tostring(trackedBeforePass)
-                            .. " | NoProgressPasses=" .. tostring(pendingClusterNoProgressPasses)
-                            .. " | ClusterPolicy=UNLIMITED")
-                    local passCleared, passMadeProgress = engageAliens(pendingAliens, pendingClusterCenter, pendingClusterMembers)
-                    local stillPending = getEligibleAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                            .. " | NoProgressPasses=" .. tostring(pendingClusterNoProgressPasses))
+                    local passCleared, passMadeProgress = engageAliens(pendingAliens)
+                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
                     rememberClusterMembers(stillPending)
-                    local allResolvedAfterPass, trackedAfterPass, unconfirmedAfterPass, activeAfterPass = clusterDeathState()
+                    local allDeadAfterPass, trackedAfterPass, unconfirmedAfterPass = clusterDeathState()
 
-                    if #stillPending == 0 and allResolvedAfterPass then
-                        local collected, remainingTokenPrompts = collectPendingTokenDrops(getClusterDropCenters())
-                        if remainingTokenPrompts == 0 then
-                            recordEvent("TARGET", "Alien cluster fully cleared from active container",
-                                "TrackedEntities=" .. tostring(trackedAfterPass)
-                                    .. " | Active=" .. tostring(activeAfterPass)
-                                    .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass)
-                                    .. " | FinalTokenPickups=" .. tostring(collected)
-                                    .. " | RemainingTokenPrompts=0 | Scan may advance")
-                            resetPendingCluster()
-                            advanceScan()
-                        else
-                            setStatus("Aliens cleared; collecting remaining token drops before scanning")
-                            recordEvent("TOKEN", "Scan advancement blocked by remaining token prompts",
-                                "RemainingEnabledPrompts=" .. tostring(remainingTokenPrompts)
-                                    .. " | ConfirmedThisPass=" .. tostring(collected)
-                                    .. " | ScanAdvanceBlocked=true")
-                            task.wait(0.5)
-                        end
+                    if #stillPending == 0 and allDeadAfterPass then
+                        recordEvent("TARGET", "Alien cluster fully death-confirmed",
+                            "TrackedEntities=" .. tostring(trackedAfterPass) .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass) .. " | All tracked aliens are dead; advancing scan")
+                        resetPendingCluster()
+                        advanceScan()
                     elseif #stillPending == 0 then
-                        recordEvent("TARGET", "Alien models absent but a tracked target remains unresolved",
-                            "TrackedEntities=" .. tostring(trackedAfterPass)
-                                .. " | Active=" .. tostring(activeAfterPass)
-                                .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass)
-                                .. " | ScanAdvanceBlocked=true")
-                        setStatus("Waiting for remaining tracked alien; scan held")
+                        recordEvent("TARGET", "Alien cluster temporarily absent; death not confirmed",
+                            "TrackedEntities=" .. tostring(trackedAfterPass) .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass) .. " | Scan remains locked")
+                        setStatus("Waiting for death confirmation; scan held")
                         task.wait(0.5)
                     elseif passCleared then
                         pendingClusterNoProgressPasses = 0
-                        setStatus("Current tracked cluster cleared; checking for late spawns/drops")
+                        setStatus("Local alien group cleared; sweeping remaining cluster")
                         task.wait(0.15)
                     elseif passMadeProgress then
                         pendingClusterNoProgressPasses = 0
-                        setStatus("Alien impact confirmed; continuing until every active alien is cleared")
+                        setStatus("Alien damage confirmed; continuing until deaths are confirmed")
                         task.wait(0.2)
                     else
                         holdClusterWithoutProgress(stillPending)
@@ -3056,86 +2513,64 @@ local function mainLoop()
                     end
                     pendingClusterCenter = scanPosition
                     pendingClusterNoProgressPasses = 0
+                    pendingClusterStartedAt = os.clock()
                     pendingClusterMembers = {}
                     rememberClusterMembers(aliens)
                     recordEvent("SCAN", "Alien cluster detected", string.format(
-                        "Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f) | ClusterPolicy=UNLIMITED | SurvivorDeferral=disabled",
+                        "Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)",
                         #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3,
                         scanPosition.X, scanPosition.Y, scanPosition.Z
                     ))
                     setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
-                    local passCleared, passMadeProgress = engageAliens(aliens, pendingClusterCenter, pendingClusterMembers)
-                    local stillPending = getEligibleAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
+                    local passCleared, passMadeProgress = engageAliens(aliens)
+                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
                     rememberClusterMembers(stillPending)
-                    local allResolvedAfterPass, trackedAfterPass, unconfirmedAfterPass, activeAfterPass = clusterDeathState()
+                    local allDeadAfterPass, trackedAfterPass, unconfirmedAfterPass = clusterDeathState()
 
-                    if #stillPending == 0 and allResolvedAfterPass then
-                        local collected, remainingTokenPrompts = collectPendingTokenDrops(getClusterDropCenters())
-                        if remainingTokenPrompts == 0 then
-                            recordEvent("TARGET", "Alien cluster fully cleared from active container",
-                                "TrackedEntities=" .. tostring(trackedAfterPass)
-                                    .. " | Active=" .. tostring(activeAfterPass)
-                                    .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass)
-                                    .. " | FinalTokenPickups=" .. tostring(collected)
-                                    .. " | RemainingTokenPrompts=0 | Scan may advance")
-                            resetPendingCluster()
-                            advanceScan()
-                        else
-                            setStatus("Aliens cleared; collecting remaining token drops before scanning")
-                            recordEvent("TOKEN", "Scan advancement blocked by remaining token prompts",
-                                "RemainingEnabledPrompts=" .. tostring(remainingTokenPrompts)
-                                    .. " | ConfirmedThisPass=" .. tostring(collected)
-                                    .. " | ScanAdvanceBlocked=true")
-                            task.wait(0.5)
-                        end
+                    if #stillPending == 0 and allDeadAfterPass then
+                        recordEvent("TARGET", "Alien cluster fully death-confirmed",
+                            "TrackedEntities=" .. tostring(trackedAfterPass) .. " | All tracked aliens are dead; advancing scan")
+                        resetPendingCluster()
+                        advanceScan()
                     elseif #stillPending == 0 then
-                        recordEvent("TARGET", "Alien models absent but a tracked target remains unresolved",
-                            "TrackedEntities=" .. tostring(trackedAfterPass)
-                                .. " | Active=" .. tostring(activeAfterPass)
-                                .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass)
-                                .. " | ScanAdvanceBlocked=true")
-                        setStatus("Waiting for remaining tracked alien; scan held")
+                        recordEvent("TARGET", "Alien models absent without death confirmation; scan held",
+                            "TrackedEntities=" .. tostring(trackedAfterPass) .. " | Unconfirmed=" .. tostring(unconfirmedAfterPass))
+                        setStatus("Waiting for alien death confirmation; scan held")
                         task.wait(0.5)
                     elseif passCleared then
                         pendingClusterNoProgressPasses = 0
-                        setStatus("Current tracked cluster cleared; checking for late spawns/drops")
+                        setStatus("Local alien group cleared; sweeping remaining cluster")
                         task.wait(0.15)
                     elseif passMadeProgress then
                         pendingClusterNoProgressPasses = 0
-                        setStatus("Alien impact confirmed; continuing until every active alien is cleared")
+                        setStatus("Alien damage confirmed; continuing until deaths are confirmed")
                         task.wait(0.2)
                     else
                         holdClusterWithoutProgress(stillPending)
                     end
                 else
                     recordEvent("SCAN", "No alien target at scan point",
-                        "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ)
-                            .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
+                        "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
                     local looseTokens = getAlienTokenPrompts(scanPosition, 80)
                     if #looseTokens > 0 then
                         recordEvent("TOKEN", "Loose Alien Tokens found during scan",
                             "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
                         setStatus("Loose Alien Tokens detected")
                         local collected = collectTokensAround(scanPosition, 100)
-                        recordEvent("TOKEN", "Loose-token collection pass finished",
-                            "ConfirmedThisPass=" .. tostring(collected))
+                        recordEvent("TOKEN", "Loose-token collection pass finished", "ConfirmedThisPass=" .. tostring(collected))
                     end
                     advanceScan()
                 end
             end
         end
 
-        if os.clock() % 2 < 0.25 then
-            task.wait(0.05)
-        end
+        if os.clock() % 2 < 0.25 then task.wait(0.05) end
     end
 
     restoreMovement()
     restoreFullbright()
-    stopAntiAfk()
     setStatus("Stopped")
 end
-
 -- Lightweight kill/reward feed tracking. No hooks or interception.
 local function trackTextLabel(label)
     if not label:IsA("TextLabel") or trackedTextLabels[label] then
@@ -3524,7 +2959,7 @@ statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = frame
 
 local statsLabel = Instance.new("TextLabel")
-statsLabel.Size = UDim2.new(1, -16, 0, 108)
+statsLabel.Size = UDim2.new(1, -16, 0, 100)
 statsLabel.Position = UDim2.new(0, 8, 0, 72)
 statsLabel.BackgroundTransparency = 1
 statsLabel.Text = "Alien kills: 0\nToken pickups confirmed: 0\nReward toast estimate: 0"
@@ -3731,9 +3166,9 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF9.4-FULL-CLEAR-TOKEN-RECOVERY-ANTIAFK-HF9.2-BASE",
+            version = "HF9.0-CLOSE-RANGE-HOLD-CLUSTER-HF5.9-BASE",
             scanAdvanceCount = scanAdvanceCount,
-            deferredAlienGuidCount = deferredAlienGuidCount,
+            deferredAlienGuidCount = 0,
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -3769,12 +3204,6 @@ local function exportDiagnostics()
             alienHealthSnapshot = buildAlienHealthSnapshot(),
             tokenAttempts = tokenAttempts,
             tokenPickupsConfirmed = tokenPickupsConfirmed,
-            tokenDropCentersQueued = tokenDropCentersQueued,
-            tokenDropCentersProcessed = tokenDropCentersProcessed,
-            pendingTokenDropCenters = #pendingTokenDropCenters,
-            antiAfkAvailable = antiAfkAvailable,
-            antiAfkEvents = antiAfkEvents,
-            antiAfkErrors = antiAfkErrors,
             rewardToastEstimate = rewardToastEstimate,
             localCallErrors = remoteErrors,
             capturedErrors = diagErrorCount,
@@ -3812,7 +3241,6 @@ local function refreshGui()
             .. "\nToken pickups confirmed: " .. tostring(tokenPickupsConfirmed)
             .. " / attempts: " .. tostring(tokenAttempts)
             .. "\nReward toast estimate: " .. tostring(rewardToastEstimate)
-            .. "\nAnti-AFK: " .. (antiAfkAvailable and "ON" or "OFF") .. " | Idle events: " .. tostring(antiAfkEvents)
             .. "\nTool: " .. tostring(equippedToolName)
             .. "\nLap: " .. tostring(lap) .. "  Scan Z: " .. tostring(scanZ)
             .. "\nLocal call errors: " .. tostring(remoteErrors)
@@ -3838,7 +3266,6 @@ local function stopFarm()
     recordEvent("SYSTEM", "Stop requested by user", "Emergency stop button activated")
     running = false
     paused = false
-    stopAntiAfk()
     for _, connection in ipairs(serverMonitorConnections) do
         pcall(function() connection:Disconnect() end)
     end
@@ -3907,7 +3334,6 @@ startAlienHealthMonitoring()
 startToolMonitoring()
 startManualInputMonitoring()
 hookPlayerGui()
-startAntiAfk()
 
 -- Keep the compact HUD current without scanning the world every frame.
 task.spawn(function()
@@ -3937,7 +3363,6 @@ local function startFarm()
     end
     running = true
     paused = false
-    startAntiAfk()
     recordEvent("SYSTEM", "Farming started", "Automatic scan/combat/token loop started")
     applyFullbright()
     setupFlight()
@@ -3950,7 +3375,6 @@ local function startFarm()
             recordEvent("ERROR", "Main farming loop crashed", diagTraceback(loopError))
             running = false
             paused = false
-            stopAntiAfk()
             restoreMovement()
             restoreFullbright()
             setStatus("Stopped after error - open Diagnostics")
@@ -3967,6 +3391,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target allowlist=AlienType1/2/3 | Zombie/Parasite marker exclusion + 50-stud non-alien collateral guard | MeleeContactRange=50 (hard ceiling 80) | ClusterPolicy=UNLIMITED; no survivor deferral | TokenCollection=death-position centered with retries | AntiAFK=" .. tostring(antiAfkAvailable) .. " | AttackDirection=nearest valid alien contact | Diagnostics=HF9.4 | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target filter=AlienType1/2/3 only; explicit Zombie exclusion | AttackDirection=nearest valid alien contact | Server hit/death attribution=entity-specific | Diagnostics=HF9.0 close torso-anchor hover/short standoff/near-contact range/confirmed cluster hold | Hooks=none")
 refreshDiagPanel()
-log("Loaded HF9.4. Automatic start scheduled. Alien-only full-cluster clearing, death-position token collection/retries, root-locked hover, and anti-AFK enabled.")
+log("Loaded. Automatic start scheduled. Target filter: AlienType1/2/3 only. Integrated diagnostics enabled.")
