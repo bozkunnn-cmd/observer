@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF8.4 (CLASSIC SHOVEL PROFILE + HF5.9 SCANNER)
+LAST STOP - ALIEN TOKEN FARMER HF8.5 (OBSERVED AURA SEQUENCE + HF5.9 SCANNER)
 Standalone experimental build for the Last Stop Roblox experience.
-HF8.4 preserves the original HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Its Shovel Attack/Hit timing, direction bias, hit radius, and repeat count are restored from the original main.lua Classic profile; Bus Rush Bat values are not reused.
+HF8.5 preserves the HF5.9 scanner, token collection, torso-priority hitboxes, and safe hover geometry. Combat now follows the measured successful-aura pattern: camera-look Attack direction, approximately 32 ms Attack-to-Hit delay, one Hit per selected target, up to three targets, and approximately 65 ms attack cadence. Classic Shovel replica ID 120 remains an explicitly unverified fallback unless a live ReplicaCreate event maps the equipped tool GUID.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -14,7 +14,7 @@ Observed melee signal shape from the supplied V1.2 diagnostics:
 
 No external loaders, no global metamethod hooks, no input interception.
 Passive UserInputService event listeners are used for diagnostics; no synthetic input is sent.
-The Classic Shovel replica ID remains the original source fallback (120), not dynamically verified. Classic-specific combat settings are restored from main.lua; server damage confirmation is monitored separately.
+The Classic Shovel replica ID 120 is retained only as a legacy fallback. A passive ReplicaCreate listener attempts to map the equipped Shovel GUID to its live replica ID. Attack direction follows CurrentCamera.CFrame.LookVector, matching the direction variation in the observed working traffic. Server damage confirmation is monitored separately.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -53,16 +53,16 @@ local CONFIG = {
     ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
     HOVER_BELOW = 9.7,
     TORSO_HORIZONTAL_STANDOFF = 4.8,
-    MELEE_ATTACK_VERTICAL_BIAS = 0.19, -- original Classic Shovel profile from main.lua
-    ATTACK_INTERVAL = 0.05, -- original Classic Shovel interval from main.lua
-    MELEE_HIT_DELAY = 0.026, -- original Classic Shovel Attack -> Hit delay from main.lua
+    ATTACK_INTERVAL = 0.0655, -- measured median from the working outgoing capture
+    MELEE_HIT_DELAY = 0.0323, -- measured median Attack -> first Hit delay
+
     ENGAGE_TIMEOUT = 45,
     NO_KILL_TIMEOUT = 8,
-    MAX_HITS_PER_TARGET = 10, -- original Classic Shovel repeat count per selected target
+    MAX_HITS_PER_TARGET = 1, -- observed working aura: one Hit per selected target
     MAX_TARGETS_PER_SWEEP = 3,
-    MAX_HITS_PER_SWEEP = 30, -- original Classic Shovel cap: up to 10 hits on each of 3 targets
+    MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
     MELEE_HIT_MAX_DISTANCE = 50, -- original Classic Shovel hit-part distance from main.lua
-    CLASSIC_SHOVEL_REPLICA_ID = 120, -- original Classic source ID; not the Bus Rush Bat ID
+    CLASSIC_SHOVEL_REPLICA_ID = 120, -- legacy fallback only; dynamic GUID mapping takes priority
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -80,6 +80,10 @@ local serverOnDiedEvents = 0
 local serverMeleeEffects = 0
 local lastServerDamageAt = nil
 local serverMonitorConnections = {}
+local itemReplicaIdsByGuid = {}
+local itemReplicaResolverConnection = nil
+local lastResolvedMeleeReplicaId = nil
+local lastReplicaIdSource = "not resolved"
 local tokenAttempts = 0
 local tokenPickupsConfirmed = 0
 local rewardToastEstimate = 0
@@ -261,6 +265,65 @@ end
 
 attachServerCombatMonitors()
 
+-- Resolve the equipped item's live replica ID when ReplicaCreate metadata exposes
+-- the same GUID used as the Tool.Name. This does not hook or intercept outgoing calls.
+do
+    local createRemote = ReplicaRemoteEvents and ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaCreate")
+    if createRemote and createRemote:IsA("RemoteEvent") then
+        local ok, connection = pcall(function()
+            return createRemote.OnClientEvent:Connect(function(replicaId, payload)
+                if type(payload) ~= "table" then return end
+                local metadata = type(payload[2]) == "table" and payload[2] or payload
+                if type(metadata) ~= "table" then return end
+                local guid = metadata.Id or metadata.id or metadata.Guid or metadata.GUID
+                if guid ~= nil then
+                    itemReplicaIdsByGuid[tostring(guid)] = tonumber(replicaId) or replicaId
+                    local character = LocalPlayer.Character
+                    local equipped = character and character:FindFirstChildOfClass("Tool")
+                    if equipped and tostring(equipped.Name) == tostring(guid) then
+                        recordEvent("WEAPON", "Equipped Shovel replica dynamically mapped",
+                            "ToolGuid=" .. tostring(guid) .. " | ReplicaId=" .. tostring(replicaId))
+                    end
+                end
+            end)
+        end)
+        if ok and connection then
+            itemReplicaResolverConnection = connection
+            table.insert(serverMonitorConnections, connection)
+            recordEvent("SYSTEM", "Dynamic item replica resolver attached", createRemote:GetFullName())
+        else
+            recordEvent("DIAGNOSTICS", "Dynamic item replica resolver unavailable", tostring(connection))
+        end
+    else
+        recordEvent("DIAGNOSTICS", "Dynamic item replica resolver unavailable", "Replica_ReplicaCreate was not found")
+    end
+end
+
+local function resolveMeleeReplicaId(tool)
+    local resolved, source
+    if tool then
+        local guid = tostring(tool.Name)
+        local mapped = itemReplicaIdsByGuid[guid]
+        if mapped ~= nil then
+            resolved, source = mapped, "dynamic Tool GUID match"
+        else
+            for _, attributeName in ipairs({"ReplicaId", "ReplicaID", "Replica"}) do
+                local value = tool:GetAttribute(attributeName)
+                if type(value) == "number" then
+                    resolved, source = value, "Tool attribute " .. attributeName
+                    break
+                end
+            end
+        end
+    end
+    if resolved == nil then
+        resolved, source = CONFIG.CLASSIC_SHOVEL_REPLICA_ID, "legacy fallback; not dynamically verified"
+    end
+    lastResolvedMeleeReplicaId = resolved
+    lastReplicaIdSource = source
+    return resolved, source
+end
+
 local function buildAlienHealthSnapshot()
     local snapshot = {}
     for model, record in pairs(monitoredAliens) do
@@ -305,7 +368,7 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF8.4-CLASSIC-SHOVEL-MAIN-LUA-PROFILE-HF5.9-BASE",
+        "Version: HF8.5-OBSERVED-AURA-SEQUENCE-HF5.9-BASE",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
@@ -316,6 +379,7 @@ local function buildDiagnosticReport()
         "Alien health-source decrease signals: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
         "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Auto-correlated foreground damage events: " .. tostring(automatedDamageUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
         "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
+        "Melee replica mapping: ID=" .. tostring(lastResolvedMeleeReplicaId) .. " | Source=" .. tostring(lastReplicaIdSource),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
         "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
@@ -391,7 +455,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.4 | Base=HF5.9 scanner/collector | CombatProfile=original Classic Shovel main.lua | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId) .. " | ClassicShovelReplicaId=" .. tostring(CONFIG.CLASSIC_SHOVEL_REPLICA_ID) .. " (source fallback, not dynamically resolved)")
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF8.5 | Base=HF5.9 scanner/collector | CombatProfile=observed 3-target aura sequence | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId) .. " | ClassicShovelReplicaIdFallback=" .. tostring(CONFIG.CLASSIC_SHOVEL_REPLICA_ID) .. " (dynamic Tool GUID mapping preferred)")
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1533,7 +1597,6 @@ local function restoreMovement()
 end
 
 local function sendMeleeSweep(entries)
-    local signalId = CONFIG.CLASSIC_SHOVEL_REPLICA_ID
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
         return 0
@@ -1550,6 +1613,7 @@ local function sendMeleeSweep(entries)
         setStatus("Starting shovel is not equipped")
         return 0
     end
+    local signalId, signalIdSource = resolveMeleeReplicaId(equippedTool)
     if not equippedTool.Enabled then
         recordThrottled("shovel-disabled-state", 2, "WEAPON", "Shovel equipped but Tool.Enabled is false", "HF5.9 leaves this game-controlled property unchanged; remote-call success does not prove server damage")
     end
@@ -1592,25 +1656,25 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    -- Aim at the first selected body contact. The observer capture shows the
-    -- Attack direction leading to the first Hit part, followed by Hit calls.
+    -- The successful outgoing capture's Attack vector varied with the camera
+    -- direction. Use the live camera look vector instead of a fixed vertical bias.
     local nearestContact = candidates[1]
     local contactDelta = nearestContact.position - root.Position
-    local horizontalDirection = Vector3.new(contactDelta.X, 0, contactDelta.Z)
-    if horizontalDirection.Magnitude < 0.001 then
-        local fallbackLook = root.CFrame.LookVector
-        horizontalDirection = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
+    local camera = Workspace.CurrentCamera
+    local direction
+    local directionSource = "camera look vector"
+    if camera then
+        direction = camera.CFrame.LookVector
     end
-    if horizontalDirection.Magnitude < 0.001 then
-        horizontalDirection = Vector3.new(0, 0, -1)
-    else
-        horizontalDirection = horizontalDirection.Unit
+    if not direction or direction.Magnitude < 0.001 then
+        direction = contactDelta
+        directionSource = "target contact fallback"
     end
-    local direction = Vector3.new(
-        horizontalDirection.X,
-        CONFIG.MELEE_ATTACK_VERTICAL_BIAS,
-        horizontalDirection.Z
-    ).Unit
+    if direction.Magnitude < 0.001 then
+        direction = root.CFrame.LookVector
+        directionSource = "character look fallback"
+    end
+    direction = direction.Unit
 
     lastAutoAttackAt = os.clock()
     automatedAttackRequests = automatedAttackRequests + 1
@@ -1623,8 +1687,7 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
-    -- The captured working sequence had approximately 26 ms between Attack
-    -- and the first Hit event.
+    -- The measured working capture had a 32.3 ms median Attack-to-first-Hit delay.
     task.wait(CONFIG.MELEE_HIT_DELAY)
     recordThrottled(
         "melee-attack-dispatched",
@@ -1632,7 +1695,7 @@ local function sendMeleeSweep(entries)
         "COMBAT",
         "Melee Attack request dispatched",
         string.format(
-            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | SwingDirection=(%.3f, %.3f, %.3f) | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
+            "Nearest=%s/%s | HitPart=%s | PartClass=%s | Priority=%d | PartPath=%s | PartCenterDistance=%.2f | PartPosition=(%.2f, %.2f, %.2f) | PartVector=(%.3f, %.3f, %.3f) | HitNormal=(0, 1, 0) | Material=%s | Root=(%.2f, %.2f, %.2f) | AttackDirection=(%.3f, %.3f, %.3f) | DirectionSource=%s | ReplicaId=%s | ReplicaIdSource=%s | Tool=%s | ToolEnabled=%s | Server acceptance unknown",
             nearestContact.entry.variant,
             nearestContact.entry.model.Name,
             nearestContact.part.Name,
@@ -1645,6 +1708,9 @@ local function sendMeleeSweep(entries)
             tostring(nearestContact.material),
             root.Position.X, root.Position.Y, root.Position.Z,
             direction.X, direction.Y, direction.Z,
+            directionSource,
+            tostring(signalId),
+            signalIdSource,
             equippedTool.Name,
             tostring(equippedTool.Enabled)
         )
@@ -1723,8 +1789,8 @@ local function sendMeleeSweep(entries)
         "Captured-payload Hit requests without local error=" .. tostring(sentHits) .. " | Targets=" .. tostring(maxTargets) .. " | Local call errors=" .. tostring(remoteErrors)
     )
     recordEvent("COMBAT", "Classic Shovel sweep summary", string.format(
-        "ReplicaId=%d | Targets=%d | HitRequests=%d | HitsPerTargetCap=%d | ServerDamageEvents=%d | ServerMeleeEffects=%d | ServerDeaths=%d | Server acceptance remains determined only by confirmations",
-        signalId, maxTargets, sentHits, CONFIG.MAX_HITS_PER_TARGET,
+        "ReplicaId=%s | ReplicaIdSource=%s | Targets=%d | HitRequests=%d | HitsPerTargetCap=%d | DirectionSource=%s | ServerDamageEvents=%d | ServerMeleeEffects=%d | ServerDeaths=%d | Server acceptance remains determined only by confirmations",
+        tostring(signalId), signalIdSource, maxTargets, sentHits, CONFIG.MAX_HITS_PER_TARGET, directionSource,
         serverDamageEvents, serverMeleeEffects, serverOnDiedEvents
     ))
     return sentHits
@@ -2644,7 +2710,7 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF8.4-CLASSIC-SHOVEL-MAIN-LUA-PROFILE-HF5.9-BASE",
+            version = "HF8.5-OBSERVED-AURA-SEQUENCE-HF5.9-BASE",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
@@ -2661,6 +2727,8 @@ local function exportDiagnostics()
             nativeToolActivations = nativeToolActivations,
             automatedAttackRequests = automatedAttackRequests,
             automatedHitRequests = automatedHitRequests,
+            meleeReplicaId = lastResolvedMeleeReplicaId,
+            meleeReplicaIdSource = lastReplicaIdSource,
             manualMouseDownCount = manualMouseDownCount,
             manualMouseUpCount = manualMouseUpCount,
             manualTouchCount = manualTouchCount,
