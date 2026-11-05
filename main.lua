@@ -1,24 +1,18 @@
 --[[
-LAST STOP ALIEN TOKEN FARMER HF8.1 - CLASSIC ONLY
+LAST STOP - ALIEN TOKEN FARMER HF8.2 (CLASSIC KILL AURA)
+Classic-only build based on the supplied working V1.0.1 scanner/collector.
 
-Production target: normal Classic Last Stop gameplay.
-Bus Rush is not supported as a runtime mode and is not used for mode detection.
+Observed game structures used:
+  Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
+  Workspace.ITEM_CONTAINER.<GUID>.Main.CollectAlienTokenPrompt
+  ReplicatedStorage.ClientSource.ReplicaRemoteEvents.Replica_ReplicaSignal
 
-Classic systems retained from the original HF5.9 scanner/collector:
-  - Workspace.ENTITY_CONTAINER alien hierarchy detection (AlienType1/2/3)
-  - Original scan route, flight controllers, collision handling and safe-hover approach
-  - Torso-priority alien hitbox selection
-  - Workspace.ITEM_CONTAINER token prompt discovery and pickup confirmation
+Classic Shovel melee signal uses the original Classic source ID 120.
+  Attack -> 32 ms delay -> up to 3 distinct target Hit requests.
+  The successful Bus Rush capture measured about 65 ms between Attack requests.
 
-Combat integration:
-  - Classic starting Shovel only (runtime Tool name may be a GUID)
-  - Dynamic Shovel replica mapping where available; Classic source fallback ID 120
-  - Attack -> short delay -> up to three distinct alien Hit targets per sweep
-  - Tool.Enabled is observed but never forced; native Tool.Activated is not required
-  - Server DamageDealt, replica health, OnDied and kill counter diagnostics
-
-No Bus Rush mode switching, Bat fallback, global metamethod hooks, outgoing-call
-interception, external loaders, or synthetic mouse/touch input.
+No external loaders, no global metamethod hooks, no input hooks.
+Server damage confirmations are monitored passively; runtime acceptance still needs testing.
 ]]
 
 if game.GameId ~= 10759337137 then
@@ -32,7 +26,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
-local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 local ENTITY_CONTAINER = Workspace:WaitForChild("ENTITY_CONTAINER", 15)
@@ -47,7 +40,6 @@ if not ENTITY_CONTAINER or not ITEM_CONTAINER or not ReplicaSignal then
 end
 
 local CONFIG = {
-    -- Original Classic alien scan route (retained from main.lua / HF5.9).
     SCAN_X = 300,
     SCAN_Y = 112,
     SCAN_START_Z = 500,
@@ -55,26 +47,19 @@ local CONFIG = {
     SCAN_MIN_Z = -100000,
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
-    ALIEN_ATTACK_RANGE = 50,
-
-    -- Original safe-hover geometry for approaching an alien cluster.
-    HOVER_BELOW = 9.7,
-    TORSO_HORIZONTAL_STANDOFF = 4.8,
-
-    -- Validated melee sweep cadence/shape from the successful passive capture.
+    ALIEN_ATTACK_RANGE = 120,
+    HOVER_BELOW = 10,
+    -- Successful aura cadence: 32 ms Attack-to-Hit + about 33 ms loop wait.
     MELEE_RADIUS = 16,
-    MELEE_ATTACK_VERTICAL_BIAS = 0.36,
-    ATTACK_INTERVAL = 0.50,
     MELEE_HIT_DELAY = 0.032,
+    MELEE_ATTACK_VERTICAL_BIAS = 0.39,
+    ATTACK_INTERVAL = 0.033,
+    ENGAGE_TIMEOUT = 18,
+    NO_KILL_TIMEOUT = 6,
     MAX_TARGETS_PER_SWEEP = 3,
+    MAX_HITS_PER_TARGET = 10, -- candidate body parts inspected; one actual Hit is sent per alien
     MAX_HITS_PER_SWEEP = 3,
-    MAX_HITS_PER_TARGET = 1,
-
-    -- Dynamic Shovel mapping is preferred; 120 is the original Classic fallback.
-    CLASSIC_SHOVEL_REPLICA_FALLBACK = 120,
-
-    ENGAGE_TIMEOUT = 45,
-    NO_KILL_TIMEOUT = 8,
+    CLASSIC_SHOVEL_REPLICA_ID = 120,
     TOKEN_SEARCH_RADIUS = 260,
     TOKEN_PROMPT_DISTANCE = 14,
     TOKEN_SETTLE_WAIT = 0.18,
@@ -87,6 +72,9 @@ local paused = false
 local scanZ = CONFIG.SCAN_START_Z
 local lap = 1
 local alienKills = 0
+local serverDamageEvents = 0
+local serverOnDiedEvents = 0
+local lastServerDamageAt = nil
 local tokenAttempts = 0
 local tokenPickupsConfirmed = 0
 local rewardToastEstimate = 0
@@ -106,7 +94,6 @@ local flyVelocity = nil
 local flyGyro = nil
 local originalLighting = {}
 local fullbrightApplied = false
-local safeCameraState = nil
 local mainLoopThread = nil
 local diagEvents = {}
 local diagCounts = {}
@@ -119,49 +106,6 @@ local diagCountLabel = nil
 local refreshDiagPanel = nil
 local flightLogRoot = nil
 local monitoredHumanoids = {}
--- HF4 diagnostics-only counters and correlation timestamps.
-local monitoredAliens = {}
-local monitoredAlienModelsTotal = 0
-local alienHealthSourcesFound = 0
-local alienDamageEvents = 0
-local alienDeathEvents = 0
-local alienHealthUiEvents = 0
-local automatedDamageUiEvents = 0
-local monitoredTools = {}
-local nativeToolActivations = 0
-local automatedAttackRequests = 0
-local automatedHitRequests = 0
-local lastManualToolActivationAt = nil
-local lastAutoAttackAt = nil
-local lastAutoHitAt = nil
-local lastAutoHitByModel = {}
-local manualMouseDownCount = 0
-local manualMouseUpCount = 0
-local manualTouchCount = 0
-local lastManualInputAt = nil
-local lastManualInputKind = "None"
-local lastManualInputProcessed = nil
-local movementAnomalyCount = 0
-local fallWarningCount = 0
-local movementSamples = 0
-local movementMonitorCharacters = setmetatable({}, { __mode = "k" })
-local expectedCharacterMove = nil
-
--- HF8.1 replica/combat state. No global hooks are installed.
-local replicaStates = {}
-local replicaGuidToId = {}
-local replicaIdToGuid = {}
-local replicaConnections = {}
-local meleeItemName = nil
-local meleeItemGuid = nil
-local meleeReplicaId = nil
-local meleeReplicaIdSource = "unresolved"
-local meleeEquipRefreshAttempted = false
-local currentMode = "Classic production - alien scan + token collection"
-local serverDamageEvents = 0
-local serverConfirmedKills = 0
-local lastServerDamageAt = nil
-local lastServerDamageAmount = nil
 
 local function diagTraceback(err)
     local message = tostring(err)
@@ -206,67 +150,64 @@ local function recordThrottled(key, interval, category, message, details)
     return nil
 end
 
-local function buildAlienHealthSnapshot()
-    local snapshot = {}
-    for model, record in pairs(monitoredAliens) do
-        local sources = {}
-        for sourceName, value in pairs(record.sources or {}) do
-            table.insert(sources, { name = tostring(sourceName), value = tonumber(value) })
-        end
-        table.sort(sources, function(a, b) return a.name < b.name end)
-        table.insert(snapshot, {
-            variant = tostring(record.variant),
-            modelName = tostring(model.Name),
-            inEntityContainer = model.Parent == ENTITY_CONTAINER,
-            deadSignal = record.dead == true,
-            removed = record.removed == true,
-            sourceCount = tonumber(record.sourceCount) or 0,
-            uiSourceCount = (function()
-                local count = 0
-                for _ in pairs(record.uiSources or {}) do count = count + 1 end
-                return count
-            end)(),
-            lastHealthValue = record.lastHealthValue,
-            lastHealthDelta = record.lastHealthDelta,
-            lastHealthSource = record.lastHealthSource,
-            lastHealthAttribution = record.lastHealthAttribution,
-            lastUiDamageAt = record.lastUiDamageAt,
-            lastUiDamageDelta = record.lastUiDamageDelta,
-            lastUiDamageAttribution = record.lastUiDamageAttribution,
-            lastAutoUiDamageAt = record.lastAutoUiDamageAt,
-            lastAutoUiDamageDelta = record.lastAutoUiDamageDelta,
-            lastAutoUiDamageAttribution = record.lastAutoUiDamageAttribution,
-            maxHealthSources = record.maxHealthSources or {},
-            sources = sources,
-        })
+local serverMonitorConnections = {}
+
+local function attachServerCombatMonitors()
+    -- Replica OnDied notifications are passive server-to-client events.
+    if ReplicaSignal and ReplicaSignal:IsA("RemoteEvent") then
+        local connection = ReplicaSignal.OnClientEvent:Connect(function(replicaId, signalName, ...)
+            if signalName == "OnDied" then
+                serverOnDiedEvents = serverOnDiedEvents + 1
+                recordEvent("KILL", "Server OnDied signal observed",
+                    "ReplicaId=" .. tostring(replicaId))
+            end
+        end)
+        table.insert(serverMonitorConnections, connection)
     end
-    table.sort(snapshot, function(a, b)
-        if a.variant == b.variant then return a.modelName < b.modelName end
-        return a.variant < b.variant
+
+    -- DamageDealt is a separate Knit RemoteEvent. Wait briefly for its service tree.
+    task.spawn(function()
+        local mutual = ClientSource and (ClientSource:FindFirstChild("Mutual") or ClientSource:WaitForChild("Mutual", 8))
+        local packages = mutual and (mutual:FindFirstChild("Packages") or mutual:WaitForChild("Packages", 8))
+        local knit = packages and (packages:FindFirstChild("Knit") or packages:WaitForChild("Knit", 8))
+        local services = knit and (knit:FindFirstChild("Services") or knit:WaitForChild("Services", 8))
+        local damageService = services and (services:FindFirstChild("DamageService") or services:WaitForChild("DamageService", 8))
+        local re = damageService and (damageService:FindFirstChild("RE") or damageService:WaitForChild("RE", 8))
+        local damageRemote = re and (re:FindFirstChild("DamageDealt") or re:WaitForChild("DamageDealt", 8))
+
+        if damageRemote and damageRemote:IsA("RemoteEvent") then
+            local connection = damageRemote.OnClientEvent:Connect(function(...)
+                local args = table.pack(...)
+                serverDamageEvents = serverDamageEvents + 1
+                lastServerDamageAt = os.clock()
+                local damage = args[2]
+                local position = args[3]
+                recordEvent("COMBAT", "Server DamageDealt confirmation",
+                    "Damage=" .. tostring(damage) .. " | Position=" .. tostring(position)
+                    .. " | TotalDamageEvents=" .. tostring(serverDamageEvents))
+            end)
+            table.insert(serverMonitorConnections, connection)
+            recordEvent("SYSTEM", "Server damage confirmation monitor attached",
+                "Remote=" .. damageRemote:GetFullName())
+        else
+            recordEvent("DIAGNOSTICS", "DamageDealt monitor unavailable",
+                "Knit DamageService.RE.DamageDealt was not found during startup")
+        end
     end)
-    return snapshot
 end
+
+attachServerCombatMonitors()
 
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: 1.0.1-HF8.1-CLASSIC-ONLY",
+        "Version: HF8.2-CLASSIC-KILLAURA",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
-        "Mode: " .. tostring(currentMode),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
-        "Server melee item: " .. tostring(meleeItemName) .. " | ItemGuid=" .. tostring(meleeItemGuid)
-            .. " | ReplicaId=" .. tostring(meleeReplicaId) .. " | IDSource=" .. tostring(meleeReplicaIdSource),
-        "Server confirmations: DamageDealt=" .. tostring(serverDamageEvents) .. " | OnDied=" .. tostring(serverConfirmedKills),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
         "Alien kill notifications: " .. tostring(alienKills),
-        "Alien monitors: " .. tostring(monitoredAlienModelsTotal) .. " | Numeric health sources: " .. tostring(alienHealthSourcesFound),
-        "Alien health-source decrease signals: " .. tostring(alienDamageEvents) .. " | Alien death signals: " .. tostring(alienDeathEvents),
-        "Health-bar UI changes: " .. tostring(alienHealthUiEvents) .. " | Auto-correlated foreground damage events: " .. tostring(automatedDamageUiEvents) .. " | Native Tool.Activated signals: " .. tostring(nativeToolActivations),
-        "Farmer requests: Attack=" .. tostring(automatedAttackRequests) .. " | Hit=" .. tostring(automatedHitRequests),
-        "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
-        "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
-        "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
+        "Server confirmations: DamageDealt=" .. tostring(serverDamageEvents) .. " | OnDied=" .. tostring(serverOnDiedEvents),
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
         "Reward toast estimate (not a verified balance): " .. tostring(rewardToastEstimate),
         "Local call errors: " .. tostring(remoteErrors) .. " | Captured errors: " .. tostring(diagErrorCount),
@@ -281,37 +222,6 @@ local function buildDiagnosticReport()
         end)(),
         string.rep("-", 72),
     }
-    local healthSnapshot = buildAlienHealthSnapshot()
-    table.insert(lines, "Alien health snapshot (client-visible sources only):")
-    if #healthSnapshot == 0 then
-        table.insert(lines, "  No alien models have been attached to the health observer yet.")
-    else
-        for index, npc in ipairs(healthSnapshot) do
-            if index > 40 then
-                table.insert(lines, "  ... " .. tostring(#healthSnapshot - 40) .. " additional alien records omitted from text summary; see JSON export.")
-                break
-            end
-            local sourceParts = {}
-            for _, source in ipairs(npc.sources) do
-                table.insert(sourceParts, source.name .. "=" .. tostring(source.value))
-            end
-            local maxParts = {}
-            for sourceName, value in pairs(npc.maxHealthSources or {}) do
-                table.insert(maxParts, tostring(sourceName) .. "=" .. tostring(value))
-            end
-            table.sort(maxParts)
-            table.insert(lines, string.format(
-                "  %s/%s | InContainer=%s | Sources=%d | UI=%d | DeadSignal=%s | Removed=%s | LastValue=%s | LastDelta=%s | Attribution=%s | AutoUiDelta=%s | AutoUiAttribution=%s | Max=%s | %s",
-                npc.variant, npc.modelName, tostring(npc.inEntityContainer), npc.sourceCount, npc.uiSourceCount,
-                tostring(npc.deadSignal), tostring(npc.removed), tostring(npc.lastHealthValue),
-                tostring(npc.lastHealthDelta), tostring(npc.lastHealthAttribution),
-                tostring(npc.lastAutoUiDamageDelta), tostring(npc.lastAutoUiDamageAttribution),
-                #maxParts > 0 and table.concat(maxParts, "; ") or "unknown",
-                #sourceParts > 0 and table.concat(sourceParts, "; ") or "No numeric health source"
-            ))
-        end
-    end
-    table.insert(lines, string.rep("-", 72))
     for _, event in ipairs(diagEvents) do
         local line = string.format("[%s] [%.3f] [%s] %s", event.time, event.clock, event.category, event.message)
         if event.details ~= "" then
@@ -382,84 +292,56 @@ local function ensureToolEquipped()
         return false
     end
 
-    -- Classic starts with the Shovel in slot 1. Runtime Tool names are GUIDs.
     local equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
-        if meleeItemGuid and equipped.Name ~= meleeItemGuid then
-            recordEvent("WEAPON", "Equipped Tool changed; refreshing melee identity",
-                "PreviousGuid=" .. tostring(meleeItemGuid) .. " | CurrentTool=" .. tostring(equipped.Name))
-            meleeItemName = nil
-            meleeItemGuid = nil
-            meleeReplicaId = nil
-            meleeReplicaIdSource = "awaiting new equipped item"
-            meleeEquipRefreshAttempted = false
-        end
-
         if equippedToolName ~= equipped.Name then
             equippedToolName = equipped.Name
-            recordEvent("WEAPON", "Starting melee Tool already equipped",
-                "RuntimeTool=" .. equippedToolName .. " | ServerItem=" .. tostring(meleeItemName)
-                .. " | Classic starting weapon=Shovel")
-        end
-
-        -- If the script started after the tool was already equipped, refresh the
-        -- equip event once so MethodCalled can reveal the item's server replica.
-        if not meleeReplicaId and not meleeEquipRefreshAttempted then
-            meleeEquipRefreshAttempted = true
-            recordEvent("WEAPON", "Refreshing equipped melee item mapping",
-                "One-time unequip/equip cycle to observe the server OnEquipped mapping")
-            pcall(function() humanoid:UnequipTools() end)
-            task.wait(0.08)
-            pcall(function() humanoid:EquipTool(equipped) end)
-            task.wait(0.15)
-            equipped = character:FindFirstChildOfClass("Tool") or equipped
+            recordEvent("WEAPON", "Tool already equipped", equippedToolName)
         end
         return true
     end
 
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
     if not backpack then
-        recordThrottled("no-backpack", 3, "WEAPON", "Waiting for Backpack",
-            "Cannot equip the starting melee Tool")
         return false
     end
 
-    -- The Classic starting Shovel is slot 1; its runtime Tool name is a GUID.
     local candidate = nil
     for _, child in ipairs(backpack:GetChildren()) do
         if child:IsA("Tool") then
-            candidate = child
-            break
+            local descriptor = string.lower(child.Name .. " " .. tostring(child.ToolTip or ""))
+            if string.find(descriptor, "shovel", 1, true) or string.find(descriptor, "melee", 1, true) then
+                candidate = child
+                break
+            end
+            if not candidate then
+                candidate = child
+            end
         end
     end
 
     if not candidate then
-        recordThrottled("no-tool", 3, "WEAPON", "Starting melee Tool not found",
-            "No Tool in Backpack or Character")
+        recordThrottled("no-tool", 3, "WEAPON", "No usable tool found", "Backpack contains no Tool instance")
         return false
     end
 
-    recordEvent("WEAPON", "Equipping starting melee Tool",
-        candidate.Name .. " | Source=Backpack first Tool | Classic expected item=Shovel")
+    recordEvent("WEAPON", "Equip requested", candidate.Name)
     local ok, equipError = pcall(function()
         humanoid:EquipTool(candidate)
     end)
     if not ok then
-        recordEvent("ERROR", "Starting melee Tool EquipTool failed", diagTraceback(equipError))
+        recordEvent("ERROR", "EquipTool failed", diagTraceback(equipError))
         return false
     end
 
-    task.wait(0.15)
+    task.wait(0.12)
     equipped = character:FindFirstChildOfClass("Tool")
     if equipped then
         equippedToolName = equipped.Name
-        recordEvent("WEAPON", "Starting melee Tool equipped",
-            equippedToolName .. " | ToolEnabled=" .. tostring(equipped.Enabled)
-            .. " | ServerItem=" .. tostring(meleeItemName))
+        recordEvent("WEAPON", "Tool equipped", equippedToolName)
         return true
     end
-
-    recordThrottled("equip-not-confirmed", 2, "WEAPON", "Starting melee Tool equip not confirmed", candidate.Name)
+    recordThrottled("equip-not-confirmed", 2, "WEAPON", "Equip request not confirmed", candidate.Name)
     return false
 end
 
@@ -554,949 +436,40 @@ local function getAliensNear(position, radius)
     return results
 end
 
--- HF8.1: map replica IDs to entity GUIDs and retain state after ReplicaDestroy.
-local function replicaPathKey(value)
-    if type(value) == "table" then
-        local parts = {}
-        for i = 1, #value do
-            parts[#parts + 1] = tostring(value[i])
-        end
-        return table.concat(parts, ".")
-    end
-    return tostring(value)
-end
-
-local function findEntityByGuid(guid)
-    if not ENTITY_CONTAINER or not guid then
-        return nil
-    end
-    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-        if model:IsA("Model") then
-            local id = model:GetAttribute("Id")
-            if id == guid or model.Name == guid then
-                return model
-            end
-        end
-    end
-    return nil
-end
-
-local function bindReplicaRemote(remote, callback)
-    if not remote or not remote:IsA("RemoteEvent") then
-        return false
-    end
-    local ok, connection = pcall(function()
-        return remote.OnClientEvent:Connect(function(...)
-            local success, err = pcall(callback, ...)
-            if not success then
-                recordEvent("ERROR", "Replica listener failed", tostring(err))
-            end
-        end)
-    end)
-    if ok and connection then
-        table.insert(replicaConnections, connection)
-        return true
-    end
-    return false
-end
-
-local function isSupportedMeleeItemName(name)
-    return string.lower(tostring(name or "")) == "shovel"
-end
-
-local function getMeleeSignalId()
-    if meleeReplicaId then
-        return meleeReplicaId, meleeReplicaIdSource
-    end
-
-    local lower = string.lower(tostring(meleeItemName or ""))
-    if lower == "shovel" then
-        return CONFIG.CLASSIC_SHOVEL_REPLICA_FALLBACK, "Classic Shovel fallback from original scanner source"
-    end
-
-    return nil, "waiting for Classic Shovel server identity"
-end
-
-local function startReplicaMonitoring()
-    if not ReplicaRemoteEvents then
-        recordEvent("ERROR", "Replica monitoring unavailable", "ReplicaRemoteEvents folder was not found")
-        return
-    end
-
-    local createRemote = ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaCreate")
-    local setValueRemote = ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaSetValue")
-    local setValuesRemote = ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaSetValues")
-    local signalRemote = ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaSignal")
-    local destroyRemote = ReplicaRemoteEvents:FindFirstChild("Replica_ReplicaDestroy")
-
-    bindReplicaRemote(createRemote, function(replicaId, payload)
-        local metadata = type(payload) == "table" and payload[2] or nil
-        local initial = type(payload) == "table" and payload[3] or nil
-        local state = replicaStates[replicaId] or {}
-        if type(metadata) == "table" then
-            state.Id = metadata.Id
-            state.Name = metadata.Name
-            if metadata.Id then
-                replicaGuidToId[tostring(metadata.Id)] = replicaId
-                replicaIdToGuid[replicaId] = tostring(metadata.Id)
-            end
-        end
-        if type(initial) == "table" then
-            for key, value in pairs(initial) do
-                state[tostring(key)] = value
-            end
-        end
-        replicaStates[replicaId] = state
-
-        local stateNameLower = string.lower(tostring(state.Name or ""))
-        local matchesEquippedMelee = (meleeItemGuid and state.Id == meleeItemGuid)
-            or (meleeItemName and stateNameLower == string.lower(meleeItemName))
-        if matchesEquippedMelee then
-            meleeReplicaId = replicaId
-            meleeReplicaIdSource = "dynamic ReplicaCreate mapping"
-            recordEvent("WEAPON", "Equipped melee replica mapped",
-                "Item=" .. tostring(meleeItemName) .. " | ReplicaId=" .. tostring(meleeReplicaId)
-                .. " | ItemGuid=" .. tostring(state.Id) .. " | DynamicMapping=true")
-        elseif isSupportedMeleeItemName(state.Name) then
-            recordThrottled("melee-replica-pending:" .. tostring(replicaId), 1, "REPLICA",
-                "Melee item replica discovered; waiting for equip identity",
-                "Item=" .. tostring(state.Name) .. " | ReplicaId=" .. tostring(replicaId)
-                .. " | Guid=" .. tostring(state.Id))
-        elseif string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
-            recordThrottled("hostile-replica-create:" .. tostring(replicaId), 0.2, "REPLICA", "Hostile replica created", "ReplicaId=" .. tostring(replicaId) .. " | Name=" .. tostring(state.Name) .. " | Guid=" .. tostring(state.Id))
-        end
-    end)
-
-    bindReplicaRemote(setValueRemote, function(replicaId, keyPath, value)
-        local key = replicaPathKey(keyPath)
-        local state = replicaStates[replicaId] or {}
-        state[key] = value
-        replicaStates[replicaId] = state
-
-        if key == "Kills" and type(value) == "number" then
-            alienKills = value
-            recordEvent("KILL", "Server kill counter updated", "ReplicaId=" .. tostring(replicaId) .. " | ConfirmedKills=" .. tostring(value))
-        elseif key == "Health" and type(value) == "number" and value <= 0 then
-            if state.Friendly == false or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true) then
-                recordThrottled("replica-health-zero:" .. tostring(replicaId), 0.1, "KILL", "Hostile replica health reached zero", "ReplicaId=" .. tostring(replicaId) .. " | Guid=" .. tostring(state.Id) .. " | Name=" .. tostring(state.Name))
-            end
-        end
-    end)
-
-    bindReplicaRemote(setValuesRemote, function(replicaId, values)
-        local state = replicaStates[replicaId] or {}
-        if type(values) == "table" then
-            for key, value in pairs(values) do
-                state[tostring(key)] = value
-            end
-        end
-        replicaStates[replicaId] = state
-        recordThrottled("replica-setvalues:" .. tostring(replicaId), 0.5, "REPLICA", "Replica values batch received", "ReplicaId=" .. tostring(replicaId))
-    end)
-
-    bindReplicaRemote(signalRemote, function(replicaId, signalName, payload)
-        local state = replicaStates[replicaId] or {}
-        if signalName == "OnDied" then
-            local wasDead = state.Dead == true
-            state.Dead = true
-            replicaStates[replicaId] = state
-            if not wasDead and (state.Friendly == false or string.find(string.lower(tostring(state.Name or "")), "alien", 1, true)) then
-                serverConfirmedKills = serverConfirmedKills + 1
-                recordEvent("KILL", "Hostile OnDied signal confirmed", "ReplicaId=" .. tostring(replicaId) .. " | Guid=" .. tostring(state.Id) .. " | Name=" .. tostring(state.Name) .. " | OnDiedCount=" .. tostring(serverConfirmedKills))
-            end
-        end
-    end)
-
-    bindReplicaRemote(destroyRemote, function(replicaId)
-        local state = replicaStates[replicaId] or {}
-        state.Destroyed = true
-        replicaStates[replicaId] = state
-        recordThrottled("replica-destroy:" .. tostring(replicaId), 0.1, "REPLICA", "Replica destroyed", "ReplicaId=" .. tostring(replicaId) .. " | Guid=" .. tostring(state.Id) .. " | Name=" .. tostring(state.Name))
-    end)
-
-    local clientSource = ReplicatedStorage:FindFirstChild("ClientSource")
-    local mutual = clientSource and clientSource:FindFirstChild("Mutual")
-    local packages = mutual and mutual:FindFirstChild("Packages")
-    local knit = packages and packages:FindFirstChild("Knit")
-    local services = knit and knit:FindFirstChild("Services")
-    local methodService = services and services:FindFirstChild("MethodService")
-    local methodRemoteFolder = methodService and methodService:FindFirstChild("RE")
-    local methodRemote = methodRemoteFolder and methodRemoteFolder:FindFirstChild("MethodCalled")
-
-    bindReplicaRemote(methodRemote, function(itemName, methodName, itemPath)
-        if methodName == "OnEquipped" and isSupportedMeleeItemName(itemName) then
-            local guid = string.match(tostring(itemPath or ""), "^ITEM|(.+)$")
-            if guid then
-                meleeItemName = tostring(itemName)
-                meleeItemGuid = guid
-                local mapped = replicaGuidToId[guid]
-                meleeReplicaId = mapped
-                if mapped then
-                    meleeReplicaIdSource = "dynamic MethodCalled/ReplicaCreate mapping"
-                elseif string.lower(meleeItemName) == "shovel" then
-                    meleeReplicaId = CONFIG.CLASSIC_SHOVEL_REPLICA_FALLBACK
-                    meleeReplicaIdSource = "Classic Shovel fallback from original scanner source"
-                else
-                    meleeReplicaIdSource = "unresolved"
-                end
-                equippedToolName = meleeItemName .. " (" .. guid .. ")"
-                local resolvedId, idSource = getMeleeSignalId()
-                recordEvent("WEAPON", meleeItemName .. " equip confirmed by server",
-                    "ItemGuid=" .. guid .. " | ReplicaId=" .. tostring(resolvedId)
-                    .. " | DynamicReplicaMapping=" .. tostring(mapped ~= nil)
-                    .. " | IDSource=" .. tostring(idSource))
-            else
-                recordEvent("WEAPON", "Melee item equip event had no ITEM GUID",
-                    "Item=" .. tostring(itemName) .. " | ItemPath=" .. tostring(itemPath))
-            end
-        end
-    end)
-
-    local damageService = services and services:FindFirstChild("DamageService")
-    local damageFolder = damageService and damageService:FindFirstChild("RE")
-    local damageRemote = damageFolder and damageFolder:FindFirstChild("DamageDealt")
-    bindReplicaRemote(damageRemote, function(...)
-        local args = table.pack(...)
-        serverDamageEvents = serverDamageEvents + 1
-        lastServerDamageAt = os.clock()
-        lastServerDamageAmount = args[2]
-        recordEvent("DAMAGE", "Server DamageDealt confirmed", "Amount=" .. tostring(args[2]) .. " | Position=" .. tostring(args[3]) .. " | Flags=" .. tostring(args[4]) .. "," .. tostring(args[5]) .. " | TotalDamageEvents=" .. tostring(serverDamageEvents))
-    end)
-
-    local entityKilledRemote = damageFolder and damageFolder:FindFirstChild("EntityKilled")
-    bindReplicaRemote(entityKilledRemote, function(...)
-        local args = table.pack(...)
-        recordEvent("KILL", "EntityKilled server event received", "Arg1=" .. tostring(args[1]) .. " | Arg2=" .. tostring(args[2]) .. " | Arg3=" .. tostring(args[3]))
-    end)
-
-    local effectService = services and services:FindFirstChild("EffectService")
-    local effectFolder = effectService and effectService:FindFirstChild("RE")
-    local effectRemote = effectFolder and effectFolder:FindFirstChild("Play")
-    bindReplicaRemote(effectRemote, function(effectType, actionName, timestamp, payload)
-        if effectType == "Melee" and actionName == "Hit" then
-            local hitInstance = type(payload) == "table" and payload.Instance or nil
-            recordEvent("COMBAT_EFFECT", "Server melee Hit effect received", "Source=" .. tostring(type(payload) == "table" and payload.Source or nil) .. " | Instance=" .. tostring(hitInstance) .. " | ImpactType=" .. tostring(type(payload) == "table" and payload.ImpactType or nil) .. " | Timestamp=" .. tostring(timestamp))
-        end
-    end)
-
-    recordEvent("SYSTEM", "Passive replica/combat monitoring active", "Classic Shovel mapping + alien replica health/death + DamageDealt + EntityKilled + Melee Hit effects | No hooks installed")
-end
-
--- HF4: observe client-visible alien health-- HF4: observe client-visible alien health without changing game state.
-local function isHealthValueName(name)
-    local lower = string.lower(tostring(name or ""))
-    local normalized = string.gsub(lower, "[%s_%-]", "")
-    if string.find(normalized, "maxhealth", 1, true) or string.find(normalized, "maxhp", 1, true)
-        or string.find(normalized, "maxhitpoint", 1, true) then
-        return false
-    end
-    return normalized == "health"
-        or normalized == "hp"
-        or normalized == "currenthealth"
-        or normalized == "currenthp"
-        or normalized == "healthvalue"
-        or normalized == "hpvalue"
-        or normalized == "healthpercent"
-        or normalized == "hppercent"
-        or normalized == "healthratio"
-        or normalized == "hitpoints"
-        or normalized == "currenthitpoints"
-        or normalized == "hitpoint"
-        or normalized == "currenthitpoint"
-        or normalized == "healthnow"
-        or normalized == "hpnow"
-        or string.find(normalized, "currenthealth", 1, true) ~= nil
-        or string.find(normalized, "currenthp", 1, true) ~= nil
-end
-
-local function hasHealthNamedAncestor(instance, model)
-    local current = instance and instance.Parent
-    while current and current ~= model do
-        local normalized = string.gsub(string.lower(tostring(current.Name or "")), "[%s_%-]", "")
-        if string.find(normalized, "health", 1, true) or normalized == "hp" or string.find(normalized, "hitpoint", 1, true) then
-            return true
-        end
-        current = current.Parent
-    end
-    return false
-end
-
-local function getAlienDamageAttribution(model)
-    local now = os.clock()
-    local manualToolAge = lastManualToolActivationAt and (now - lastManualToolActivationAt) or math.huge
-    local manualInputAge = lastManualInputAt and (now - lastManualInputAt) or math.huge
-    local manualAge = math.min(manualToolAge, manualInputAge)
-    local autoAge = lastAutoHitByModel[model] and (now - lastAutoHitByModel[model]) or math.huge
-    if manualAge <= 1.25 and autoAge <= 1.25 then
-        return "AMBIGUOUS: manual input/native activation and farmer Hit requests both occurred recently"
-    elseif manualToolAge <= 1.25 and manualInputAge <= 1.25 then
-        return "Mouse/touch input plus native Tool.Activated recently (timing correlation only)"
-    elseif manualAge <= 1.25 then
-        return "Recent manual mouse/touch input or native Tool.Activated (timing correlation only)"
-    elseif autoAge <= 1.25 then
-        return "Farmer sent a Hit request to this alien recently (timing correlation only)"
-    elseif lastAutoAttackAt and (now - lastAutoAttackAt) <= 1.25 then
-        return "Farmer Attack request was recent, but no per-alien Hit correlation (not proof)"
-    end
-    return "Unattributed: no recent monitored tool activation or farmer hit request"
-end
-
-local function markAlienDead(record, reason)
-    if not record or record.dead then
-        return
-    end
-    record.dead = true
-    alienDeathEvents = alienDeathEvents + 1
-    recordEvent("KILL", "Alien death signal observed", "Variant=" .. tostring(record.variant)
-        .. " | Model=" .. tostring(record.model.Name) .. " | Signal=" .. tostring(reason)
-        .. " | Death is client-observed, not independently server-verified")
-end
-
-local function recordAlienHealthChange(record, sourceKey, oldValue, newValue)
-    oldValue = tonumber(oldValue)
-    newValue = tonumber(newValue)
-    if not oldValue or not newValue or math.abs(newValue - oldValue) < 0.001 then
-        return
-    end
-
-    record.lastHealthValue = newValue
-    record.lastHealthDelta = newValue - oldValue
-    record.lastHealthSource = tostring(sourceKey)
-    record.lastHealthChangeAt = os.clock()
-    record.lastHealthAttribution = getAlienDamageAttribution(record.model)
-
-    if newValue < oldValue then
-        local amount = oldValue - newValue
-        alienDamageEvents = alienDamageEvents + 1
-        recordEvent("DAMAGE", "Alien health decreased", string.format(
-            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Damage=%.3f | Attribution=%s | ManualInput=%s | Paused=%s",
-            tostring(record.variant), tostring(record.model.Name), tostring(sourceKey),
-            oldValue, newValue, amount, tostring(record.lastHealthAttribution), tostring(lastManualInputKind), tostring(paused)
-        ))
-    else
-        recordEvent("HEAL", "Alien health increased", string.format(
-            "Variant=%s | Model=%s | Source=%s | Health=%.3f->%.3f | Change=+%.3f",
-            tostring(record.variant), tostring(record.model.Name), tostring(sourceKey),
-            oldValue, newValue, newValue - oldValue
-        ))
-    end
-
-    if newValue <= 0 then
-        markAlienDead(record, sourceKey .. " reached zero")
-    end
-end
-
-local function attachNumericAlienHealthSource(record, sourceKey, initialValue, connectCallback)
-    if not record or record.sources[sourceKey] ~= nil then
-        return
-    end
-    local initialNumber = tonumber(initialValue)
-    if not initialNumber then
-        return
-    end
-    record.sources[sourceKey] = initialNumber
-    record.sourceCount = record.sourceCount + 1
-    alienHealthSourcesFound = alienHealthSourcesFound + 1
-    recordEvent("NPC_HEALTH", "Alien numeric health source attached", string.format(
-        "Variant=%s | Model=%s | Source=%s | InitialValue=%.3f",
-        tostring(record.variant), tostring(record.model.Name), tostring(sourceKey), initialNumber
-    ))
-    if initialNumber <= 0 then
-        markAlienDead(record, sourceKey .. " was already zero when monitored")
-    end
-
-    local ok, connection = pcall(connectCallback, function(newValue)
-        local currentNumber = tonumber(newValue)
-        if not currentNumber then
-            return
-        end
-        local previousNumber = record.sources[sourceKey]
-        record.sources[sourceKey] = currentNumber
-        recordAlienHealthChange(record, sourceKey, previousNumber, currentNumber)
-    end)
-    if ok and connection then
-        table.insert(record.connections, connection)
-    elseif not ok then
-        recordEvent("ERROR", "Alien health source connection failed", "Source=" .. tostring(sourceKey) .. " | Error=" .. tostring(connection))
-    end
-end
-
-local function parseHealthText(textValue)
-    local text = tostring(textValue or "")
-    local current, maximum = string.match(text, "([%d%.]+)%s*/%s*([%d%.]+)")
-    if current then
-        return tonumber(current), tonumber(maximum)
-    end
-    local percent = string.match(text, "([%d%.]+)%s*%%")
-    if percent then
-        return tonumber(percent), 100
-    end
-    local labelled = string.match(text, "[Hh][Pp]?%s*[:=]%s*([%d%.]+)")
-        or string.match(text, "[Hh]ealth%s*[:=]%s*([%d%.]+)")
-    if labelled then
-        return tonumber(labelled), nil
-    end
-    if string.match(text, "^%s*[%d%.]+%s*$") then
-        return tonumber(text), nil
-    end
-    return nil, nil
-end
-
-local function findHealthBarAncestor(instance, model)
-    local current = instance
-    while current and current ~= model do
-        local lower = string.lower(tostring(current.Name or ""))
-        local normalized = string.gsub(lower, "[%s_%-]", "")
-        if string.find(normalized, "healthbar", 1, true) or normalized == "hpbar" then
-            return current
-        end
-        current = current.Parent
-    end
-    return nil
-end
-
-local function attachAlienHealthUi(record, instance)
-    if not record or not instance or record.uiSources[instance] then
-        return
-    end
-    local barRoot = findHealthBarAncestor(instance, record.model)
-    if not barRoot then
-        return
-    end
-
-    local isBillboard = instance:IsA("BillboardGui") or instance:IsA("SurfaceGui")
-    local isGuiObject = instance:IsA("GuiObject")
-    local isTextObject = instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
-    if not isBillboard and not isGuiObject then
-        return
-    end
-
-    record.uiSources[instance] = true
-    local path = "unknown"
-    pcall(function() path = instance:GetFullName() end)
-
-    if isBillboard then
-        local enabledValue = false
-        pcall(function() enabledValue = instance.Enabled end)
-        recordEvent("NPC_UI", "Alien health-bar container observed", "Variant=" .. tostring(record.variant)
-            .. " | Model=" .. tostring(record.model.Name) .. " | Enabled=" .. tostring(enabledValue)
-            .. " | Path=" .. path)
-        local ok, connection = pcall(function()
-            return instance:GetPropertyChangedSignal("Enabled"):Connect(function()
-                local newValue = instance.Enabled
-                alienHealthUiEvents = alienHealthUiEvents + 1
-                recordEvent("NPC_UI", "Alien health-bar visibility changed", "Model=" .. tostring(record.model.Name)
-                    .. " | Enabled=" .. tostring(newValue) .. " | Path=" .. path)
-            end)
-        end)
-        if ok and connection then table.insert(record.connections, connection) end
-    end
-
-    if isGuiObject then
-        local previousSize = instance.Size
-        local ok, connection = pcall(function()
-            return instance:GetPropertyChangedSignal("Size"):Connect(function()
-                local newSize = instance.Size
-                if newSize ~= previousSize then
-                    local oldWidth = previousSize.X.Scale + previousSize.X.Offset / 100000
-                    local newWidth = newSize.X.Scale + newSize.X.Offset / 100000
-                    local oldHeight = previousSize.Y.Scale + previousSize.Y.Offset / 100000
-                    local newHeight = newSize.Y.Scale + newSize.Y.Offset / 100000
-                    alienHealthUiEvents = alienHealthUiEvents + 1
-                    local direction = (newWidth < oldWidth or newHeight < oldHeight) and "shrunk (possible damage indicator)" or "changed"
-                    local widthDrop = oldWidth - newWidth
-                    local isForegroundHealthBar = string.lower(instance.Name) == "bar"
-                        and string.find(string.lower(path), "healthbar.frame.bar", 1, true) ~= nil
-
-                    if isForegroundHealthBar and widthDrop > 0.001 then
-                        local attribution = getAlienDamageAttribution(record.model)
-                        record.lastUiDamageAt = os.clock()
-                        record.lastUiDamageDelta = widthDrop
-                        record.lastUiDamageAttribution = attribution
-                        if string.find(attribution, "Farmer sent a Hit request", 1, true) ~= nil then
-                            record.lastAutoUiDamageAt = record.lastUiDamageAt
-                            record.lastAutoUiDamageDelta = widthDrop
-                            record.lastAutoUiDamageAttribution = attribution
-                            automatedDamageUiEvents = automatedDamageUiEvents + 1
-                            recordEvent("DAMAGE_UI", "Alien foreground health bar decreased after farmer Hit request", string.format(
-                                "Variant=%s | Model=%s | WidthDrop=%.5f | OldWidth=%.5f | NewWidth=%.5f | Attribution=%s | Path=%s",
-                                tostring(record.variant), tostring(record.model.Name), widthDrop, oldWidth, newWidth, attribution, path
-                            ))
-                        else
-                            recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
-                                "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
-                                .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize)
-                                .. " | Attribution=" .. attribution .. " | Path=" .. path)
-                        end
-                    else
-                        recordThrottled("alien-health-ui-size:" .. path, 0.08, "NPC_UI", "Alien health-bar GUI size " .. direction,
-                            "Model=" .. tostring(record.model.Name) .. " | Object=" .. tostring(instance.Name)
-                            .. " | OldSize=" .. tostring(previousSize) .. " | NewSize=" .. tostring(newSize) .. " | Path=" .. path)
-                    end
-                    previousSize = newSize
-                end
-            end)
-        end)
-        if ok and connection then table.insert(record.connections, connection) end
-    end
-
-    if isGuiObject then
-        local previousVisible = instance.Visible
-        local visibleOk, visibleConnection = pcall(function()
-            return instance:GetPropertyChangedSignal("Visible"):Connect(function()
-                local currentVisible = instance.Visible
-                if currentVisible ~= previousVisible then
-                    alienHealthUiEvents = alienHealthUiEvents + 1
-                    recordEvent("NPC_UI", "Alien health-bar GUI visibility changed", "Model=" .. tostring(record.model.Name)
-                        .. " | Object=" .. tostring(instance.Name) .. " | Old=" .. tostring(previousVisible)
-                        .. " | New=" .. tostring(currentVisible) .. " | Path=" .. path)
-                    previousVisible = currentVisible
-                end
-            end)
-        end)
-        if visibleOk and visibleConnection then table.insert(record.connections, visibleConnection) end
-    end
-
-    if isTextObject then
-        local sourceKey = "HealthBarText:" .. path
-        local initialCurrent, initialMaximum = parseHealthText(instance.Text)
-        if initialMaximum then
-            record.maxHealthSources[sourceKey] = initialMaximum
-        end
-        if initialCurrent then
-            attachNumericAlienHealthSource(record, sourceKey, initialCurrent, function(callback)
-                return instance:GetPropertyChangedSignal("Text"):Connect(function()
-                    local current, maximum = parseHealthText(instance.Text)
-                    if maximum then record.maxHealthSources[sourceKey] = maximum end
-                    if current then callback(current) end
-                end)
-            end)
-        else
-            local previousText = tostring(instance.Text or "")
-            local ok, connection = pcall(function()
-                return instance:GetPropertyChangedSignal("Text"):Connect(function()
-                    local currentText = tostring(instance.Text or "")
-                    if currentText ~= previousText then
-                        local currentNumeric, currentMaximum = parseHealthText(currentText)
-                        if currentMaximum then record.maxHealthSources[sourceKey] = currentMaximum end
-                        if currentNumeric then
-                            if record.sources[sourceKey] ~= nil then
-                                local oldNumeric = record.sources[sourceKey]
-                                record.sources[sourceKey] = currentNumeric
-                                recordAlienHealthChange(record, sourceKey, oldNumeric, currentNumeric)
-                            else
-                                record.sources[sourceKey] = currentNumeric
-                                record.sourceCount = record.sourceCount + 1
-                                alienHealthSourcesFound = alienHealthSourcesFound + 1
-                                recordEvent("NPC_HEALTH", "Numeric health-bar text source became available", "Model=" .. tostring(record.model.Name)
-                                    .. " | Source=" .. sourceKey .. " | InitialValue=" .. tostring(currentNumeric))
-                            end
-                        else
-                            alienHealthUiEvents = alienHealthUiEvents + 1
-                            recordThrottled("alien-health-ui-text:" .. path, 0.1, "NPC_UI", "Alien health-bar text changed",
-                                "Model=" .. tostring(record.model.Name) .. " | Old=" .. previousText
-                                .. " | New=" .. currentText .. " | Path=" .. path)
-                        end
-                        previousText = currentText
-                    end
-                end)
-            end)
-            if ok and connection then table.insert(record.connections, connection) end
-        end
-    end
-end
-
-local function inspectAlienHealthInstance(record, instance)
-    if not record or not instance then
-        return
-    end
-
-    if instance:IsA("Humanoid") then
-        local humanoidPath = tostring(instance:GetFullName())
-        local maxHealthKey = "Humanoid.MaxHealth:" .. humanoidPath
-        if record.maxHealthSources[maxHealthKey] == nil then
-            record.maxHealthSources[maxHealthKey] = instance.MaxHealth
-            recordEvent("NPC_HEALTH", "Alien Humanoid max-health baseline", "Variant=" .. tostring(record.variant)
-                .. " | Model=" .. tostring(record.model.Name) .. " | MaxHealth=" .. tostring(instance.MaxHealth)
-                .. " | Path=" .. humanoidPath)
-            local maxOk, maxConnection = pcall(function()
-                local previousMax = instance.MaxHealth
-                return instance:GetPropertyChangedSignal("MaxHealth"):Connect(function()
-                    local currentMax = instance.MaxHealth
-                    if currentMax ~= previousMax then
-                        recordEvent("NPC_HEALTH", "Alien Humanoid MaxHealth changed", "Model=" .. tostring(record.model.Name)
-                            .. " | Old=" .. tostring(previousMax) .. " | New=" .. tostring(currentMax) .. " | Path=" .. humanoidPath)
-                        previousMax = currentMax
-                        record.maxHealthSources[maxHealthKey] = currentMax
-                    end
-                end)
-            end)
-            if maxOk and maxConnection then table.insert(record.connections, maxConnection) end
-        end
-        attachNumericAlienHealthSource(record, "Humanoid.Health:" .. humanoidPath, instance.Health, function(callback)
-            return instance.HealthChanged:Connect(callback)
-        end)
-        if not record.humanoidDeathSignals[instance] then
-            record.humanoidDeathSignals[instance] = true
-            local ok, connection = pcall(function()
-                return instance.Died:Connect(function()
-                    markAlienDead(record, "Humanoid.Died")
-                end)
-            end)
-            if ok and connection then table.insert(record.connections, connection) end
-        end
-    end
-
-    local attributes = {}
-    pcall(function() attributes = instance:GetAttributes() end)
-    for attributeName, attributeValue in pairs(attributes) do
-        if (isHealthValueName(attributeName) or (string.lower(tostring(attributeName)) == "value" and hasHealthNamedAncestor(instance, record.model))) and tonumber(attributeValue) then
-            local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
-            attachNumericAlienHealthSource(record, sourceKey, attributeValue, function(callback)
-                return instance:GetAttributeChangedSignal(attributeName):Connect(function()
-                    callback(instance:GetAttribute(attributeName))
-                end)
-            end)
-        end
-    end
-    if not record.attributeWatchers[instance] then
-        record.attributeWatchers[instance] = true
-        local attributeOk, attributeConnection = pcall(function()
-            return instance.AttributeChanged:Connect(function(attributeName)
-                if isHealthValueName(attributeName) or (string.lower(tostring(attributeName)) == "value" and hasHealthNamedAncestor(instance, record.model)) then
-                    local currentValue = instance:GetAttribute(attributeName)
-                    if tonumber(currentValue) then
-                        local sourceKey = "Attribute:" .. tostring(instance.Name) .. "." .. tostring(attributeName)
-                        attachNumericAlienHealthSource(record, sourceKey, currentValue, function(callback)
-                            return instance:GetAttributeChangedSignal(attributeName):Connect(function()
-                                callback(instance:GetAttribute(attributeName))
-                            end)
-                        end)
-                    end
-                end
-            end)
-        end)
-        if attributeOk and attributeConnection then table.insert(record.connections, attributeConnection) end
-    end
-
-    if instance:IsA("ValueBase") and (isHealthValueName(instance.Name) or (string.lower(tostring(instance.Name)) == "value" and hasHealthNamedAncestor(instance, record.model))) then
-        local sourceKey = "ValueObject:" .. tostring(instance:GetFullName())
-        attachNumericAlienHealthSource(record, sourceKey, instance.Value, function(callback)
-            return instance:GetPropertyChangedSignal("Value"):Connect(function()
-                callback(instance.Value)
-            end)
-        end)
-    end
-
-    attachAlienHealthUi(record, instance)
-end
-
-local function monitorAlienModel(model)
-    if not model or not model:IsA("Model") or monitoredAliens[model] then
-        return
-    end
-    local variant = isAlienModel(model)
-    if not variant then
-        return
-    end
-
-    local record = {
-        model = model,
-        variant = variant,
-        sources = {},
-        maxHealthSources = {},
-        sourceCount = 0,
-        uiSources = {},
-        humanoidDeathSignals = {},
-        attributeWatchers = {},
-        connections = {},
-        dead = false,
-        removed = false,
-        lastHealthValue = nil,
-        lastHealthDelta = nil,
-        lastHealthSource = nil,
-        lastHealthAttribution = nil,
-        lastHealthChangeAt = nil,
-        lastUiDamageAt = nil,
-        lastUiDamageDelta = nil,
-        lastUiDamageAttribution = nil,
-        lastAutoUiDamageAt = nil,
-        lastAutoUiDamageDelta = nil,
-        lastAutoUiDamageAttribution = nil,
+local function getHitParts(model)
+    local parts = {}
+    local seen = {}
+    local preferredNames = {
+        "Head", "Torso", "UpperTorso", "LowerTorso",
+        "Right Arm", "Left Arm", "Right Leg", "Left Leg",
     }
-    monitoredAliens[model] = record
-    monitoredAlienModelsTotal = monitoredAlienModelsTotal + 1
 
-    inspectAlienHealthInstance(record, model)
-    for _, descendant in ipairs(model:GetDescendants()) do
-        inspectAlienHealthInstance(record, descendant)
-    end
-
-    local addedOk, addedConnection = pcall(function()
-        return model.DescendantAdded:Connect(function(descendant)
-            inspectAlienHealthInstance(record, descendant)
-        end)
-    end)
-    if addedOk and addedConnection then table.insert(record.connections, addedConnection) end
-
-    local ancestryOk, ancestryConnection = pcall(function()
-        return model.AncestryChanged:Connect(function(_, parent)
-            if not parent and not record.removed then
-                record.removed = true
-                recordEvent("NPC_LIFECYCLE", "Alien model removed from Workspace", "Variant=" .. tostring(record.variant)
-                    .. " | Model=" .. tostring(model.Name) .. " | HealthDeathConfirmed=" .. tostring(record.dead)
-                    .. " | Removal alone is not counted as a kill")
-            end
-        end)
-    end)
-    if ancestryOk and ancestryConnection then table.insert(record.connections, ancestryConnection) end
-
-    local destroyingOk, destroyingConnection = pcall(function()
-        return model.Destroying:Connect(function()
-            if not record.removed then
-                record.removed = true
-                recordEvent("NPC_LIFECYCLE", "Alien model Destroying signal", "Variant=" .. tostring(record.variant)
-                    .. " | Model=" .. tostring(model.Name) .. " | HealthDeathConfirmed=" .. tostring(record.dead)
-                    .. " | Destruction alone is not counted as a kill")
-            end
-        end)
-    end)
-    if destroyingOk and destroyingConnection then table.insert(record.connections, destroyingConnection) end
-
-    if record.sourceCount == 0 then
-        recordEvent("NPC_HEALTH", "No numeric alien health source found at monitor attach", "Variant=" .. tostring(variant)
-            .. " | Model=" .. tostring(model.Name) .. " | HealthBarUI=" .. tostring(next(record.uiSources) ~= nil)
-            .. " | Watching new descendants, attributes, value objects, health-bar UI and removal")
-    else
-        recordEvent("NPC_HEALTH", "Alien health monitor attached", "Variant=" .. tostring(variant)
-            .. " | Model=" .. tostring(model.Name) .. " | NumericSources=" .. tostring(record.sourceCount)
-            .. " | HealthBarUI=" .. tostring(next(record.uiSources) ~= nil))
-    end
-end
-
-local function startAlienHealthMonitoring()
-    if not ENTITY_CONTAINER then
-        recordEvent("ERROR", "Alien health monitor could not start", "ENTITY_CONTAINER is missing")
-        return
-    end
-    for _, model in ipairs(ENTITY_CONTAINER:GetChildren()) do
-        task.spawn(function()
-            for attempt = 1, 20 do
-                if not model or model.Parent ~= ENTITY_CONTAINER then
-                    return
+    for _, wantedName in ipairs(preferredNames) do
+        for _, descendant in ipairs(model:GetDescendants()) do
+            if descendant:IsA("BasePart") and descendant.Name == wantedName and not seen[descendant] then
+                if descendant.Name ~= "HumanoidRootPart" then
+                    seen[descendant] = true
+                    table.insert(parts, descendant)
                 end
-                if isAlienModel(model) then
-                    monitorAlienModel(model)
-                    return
-                end
-                task.wait(0.1)
             end
-        end)
-    end
-    ENTITY_CONTAINER.ChildAdded:Connect(function(model)
-        task.spawn(function()
-            for attempt = 1, 20 do
-                if not model or model.Parent ~= ENTITY_CONTAINER then
-                    return
-                end
-                if isAlienModel(model) then
-                    monitorAlienModel(model)
-                    return
-                end
-                task.wait(0.1)
-            end
-            recordThrottled("alien-monitor-unclassified:" .. tostring(model.Name), 5, "NPC_HEALTH", "New entity did not expose an AlienType1/2/3 marker during monitor window", "Model=" .. tostring(model.Name))
-        end)
-    end)
-    recordEvent("NPC_HEALTH", "Alien health monitoring active", "Container=Workspace.ENTITY_CONTAINER | ExistingModels="
-        .. tostring(monitoredAlienModelsTotal) .. " | Mode=Humanoid/attributes/ValueBase/HealthBar UI/despawn observation")
-end
-
-local function classifyAlienHitPart(part, model)
-    if not part or not part:IsA("BasePart") or not model then
-        return nil
-    end
-
-    local lowerName = string.lower(part.Name)
-    local normalizedPartName = string.gsub(lowerName, "[%s_%-]", "")
-    local blockedNames = {
-        ["humanoidrootpart"] = true,
-        ["entitydetector"] = true,
-        ["handle"] = true,
-        ["sword"] = true,
-        ["blade"] = true,
-        ["hitbox"] = true,
-    }
-    if blockedNames[lowerName] then
-        return nil
-    end
-
-    -- Determine the anatomical region from the part's real ancestor chain.
-    -- Mesh names such as alien.008 are reused on different limbs, so their
-    -- names alone must never promote an arm mesh to torso priority.
-    local bodyRegion = nil
-    local ancestor = part.Parent
-    while ancestor and ancestor ~= model do
-        if ancestor:IsA("Accessory") or ancestor:IsA("Tool") then
-            return nil
         end
-
-        local ancestorName = string.lower(tostring(ancestor.Name or ""))
-        local normalizedAncestorName = string.gsub(ancestorName, "[%s_%-]", "")
-        if normalizedAncestorName == "sword" or normalizedAncestorName == "blade"
-            or normalizedAncestorName == "weapon" or normalizedAncestorName == "accessories" then
-            return nil
-        end
-
-        if normalizedAncestorName == "torso" or normalizedAncestorName == "uppertorso"
-            or normalizedAncestorName == "lowertorso" or normalizedAncestorName == "chest" then
-            bodyRegion = "TORSO"
-            break
-        elseif normalizedAncestorName == "leftarm" or normalizedAncestorName == "rightarm"
-            or normalizedAncestorName == "upperarm" or normalizedAncestorName == "lowerarm"
-            or normalizedAncestorName == "arm" then
-            bodyRegion = "ARM"
-            break
-        elseif normalizedAncestorName == "head" then
-            bodyRegion = "HEAD"
-            break
-        elseif normalizedAncestorName == "leftleg" or normalizedAncestorName == "rightleg"
-            or normalizedAncestorName == "upperleg" or normalizedAncestorName == "lowerleg"
-            or normalizedAncestorName == "leg" then
-            bodyRegion = "LEG"
-            break
-        end
-        ancestor = ancestor.Parent
     end
-
-    -- Exact captured meshes receive top priority only when they are actually
-    -- descendants of the torso hierarchy.
-    if bodyRegion == "TORSO" then
-        if lowerName == "cylinder.008" or lowerName == "alien.008" then
-            return 0, "TORSO_MESH"
-        end
-        return 1, "TORSO"
-    elseif bodyRegion == "ARM" then
-        return 2, "ARM"
-    elseif bodyRegion == "HEAD" then
-        return 2, "HEAD"
-    elseif bodyRegion == "LEG" then
-        return 3, "LEG"
-    end
-
-    -- Some variants expose body parts directly without a named body folder.
-    if normalizedPartName == "torso" or normalizedPartName == "uppertorso"
-        or normalizedPartName == "lowertorso" or normalizedPartName == "chest" then
-        return 1, "TORSO"
-    elseif normalizedPartName == "leftarm" or normalizedPartName == "rightarm"
-        or normalizedPartName == "upperarm" or normalizedPartName == "lowerarm" then
-        return 2, "ARM"
-    elseif normalizedPartName == "head" then
-        return 2, "HEAD"
-    elseif normalizedPartName == "leftleg" or normalizedPartName == "rightleg"
-        or normalizedPartName == "upperleg" or normalizedPartName == "lowerleg" then
-        return 3, "LEG"
-    end
-
-    return nil
-end
-
-local function getPreferredTorsoAnchor(model)
-    if not model then
-        return nil
-    end
-    local modelRoot = getModelRoot(model)
-    local origin = modelRoot and modelRoot.Position or Vector3.zero
-    local bestPart = nil
-    local bestPriority = math.huge
-    local bestDistance = math.huge
 
     for _, descendant in ipairs(model:GetDescendants()) do
-        local priority, partClass = classifyAlienHitPart(descendant, model)
-        if priority ~= nil and priority <= 1 then
-            local distance = (descendant.Position - origin).Magnitude
-            if priority < bestPriority or (priority == bestPriority and distance < bestDistance) then
-                bestPart = descendant
-                bestPriority = priority
-                bestDistance = distance
-            end
+        if #parts >= CONFIG.MAX_HITS_PER_TARGET then
+            break
         end
-    end
-    return bestPart
-end
-
-local function getClosestMeleeContact(model, origin, maxDistance)
-    if not model or not origin then
-        return nil
-    end
-
-    -- Select by body-part class first, not just nearest center. The earlier
-    -- distance-only selector repeatedly chose a leg while torso meshes existed.
-    -- Priority: captured torso meshes, torso parts, arms/head, then legs.
-    local bestContact = nil
-    local counts = { torso = 0, armHead = 0, leg = 0 }
-    local nearestTorsoDistance = nil
-    local nearestArmHeadDistance = nil
-    local nearestLegDistance = nil
-
-    for _, descendant in ipairs(model:GetDescendants()) do
-        local priority, partClass = classifyAlienHitPart(descendant, model)
-        if priority ~= nil then
-            local partPosition = descendant.Position
-            local distance = (partPosition - origin).Magnitude
-            if priority <= 1 then
-                counts.torso = counts.torso + 1
-                if not nearestTorsoDistance or distance < nearestTorsoDistance then
-                    nearestTorsoDistance = distance
-                end
-            elseif priority == 2 then
-                counts.armHead = counts.armHead + 1
-                if not nearestArmHeadDistance or distance < nearestArmHeadDistance then
-                    nearestArmHeadDistance = distance
-                end
-            else
-                counts.leg = counts.leg + 1
-                if not nearestLegDistance or distance < nearestLegDistance then
-                    nearestLegDistance = distance
-                end
-            end
-
-            if (maxDistance == nil or distance <= maxDistance) then
-                if not bestContact
-                    or priority < bestContact.priority
-                    or (priority == bestContact.priority and distance < bestContact.distance) then
-                    bestContact = {
-                        part = descendant,
-                        position = partPosition,
-                        normal = Vector3.new(0, 1, 0),
-                        material = descendant.Material,
-                        distance = distance,
-                        priority = priority,
-                        partClass = partClass,
-                    }
-                end
+        if descendant:IsA("BasePart") and descendant.Name ~= "HumanoidRootPart" and not seen[descendant] then
+            local parentName = descendant.Parent and string.lower(descendant.Parent.Name) or ""
+            local pathText = string.lower(descendant:GetFullName())
+            if string.find(pathText, "alientype", 1, true) or parentName == "torso" then
+                seen[descendant] = true
+                table.insert(parts, descendant)
             end
         end
     end
 
-    local selected = bestContact and (bestContact.part.Name .. "/" .. bestContact.partClass) or "none"
-    recordThrottled(
-        "melee-hitbox-audit:" .. tostring(model.Name),
-        0.75,
-        "COMBAT",
-        "Alien hitbox priority audit",
-        string.format(
-            "Target=%s | TorsoParts=%d | ArmHeadParts=%d | LegParts=%d | NearestTorso=%s | NearestArmHead=%s | NearestLeg=%s | Selected=%s | SelectedPriority=%s | MaxDistance=%.1f",
-            tostring(model.Name), counts.torso, counts.armHead, counts.leg,
-            nearestTorsoDistance and string.format("%.2f", nearestTorsoDistance) or "none",
-            nearestArmHeadDistance and string.format("%.2f", nearestArmHeadDistance) or "none",
-            nearestLegDistance and string.format("%.2f", nearestLegDistance) or "none",
-            selected,
-            bestContact and tostring(bestContact.priority) or "none",
-            tonumber(maxDistance) or 0
-        )
-    )
-    return bestContact
+    return parts
 end
 
 local function getNearestEntry(entries)
@@ -1621,30 +594,7 @@ local function setupFlight()
     return true
 end
 
-local function restoreSafeCamera()
-    local state = safeCameraState
-    safeCameraState = nil
-    if not state then
-        return
-    end
-    local camera = state.camera
-    if camera and camera.Parent then
-        pcall(function()
-            camera.CameraType = state.cameraType
-            if state.cameraSubject then
-                camera.CameraSubject = state.cameraSubject
-            end
-            camera.CFrame = state.cframe
-            camera.Focus = state.focus
-        end)
-        recordThrottled("camera-safe-restore", 0.5, "CAMERA", "Default camera restored", "CameraType and CameraSubject returned to their pre-engagement values")
-    end
-end
-
-
-local function moveCharacter(position, lookAtPosition, moveReason)
-    -- Keep the normal Roblox camera attached to the character, including during safe hover.
-    restoreSafeCamera()
+local function moveCharacter(position, lookAtPosition)
     if not setupFlight() then
         return false
     end
@@ -1654,11 +604,6 @@ local function moveCharacter(position, lookAtPosition, moveReason)
     end
     local lookAt = lookAtPosition or (position + Vector3.new(0, 0, -1))
     local targetCFrame = CFrame.lookAt(position, lookAt)
-    expectedCharacterMove = {
-        position = position,
-        at = os.clock(),
-        reason = tostring(moveReason or "FARMER_REPOSITION"),
-    }
     local ok, moveError = pcall(function()
         root.CFrame = targetCFrame
         root.AssemblyLinearVelocity = Vector3.zero
@@ -1679,7 +624,7 @@ local function moveCharacter(position, lookAtPosition, moveReason)
     if camera then
         cameraGap = string.format("%.1f", (camera.CFrame.Position - root.Position).Magnitude)
     end
-    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Reason=%s | Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s (informational) | PlatformStand=%s", tostring(moveReason or "FARMER_REPOSITION"), position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
+    recordThrottled("movement-sample", 0.65, "MOVEMENT", "Character repositioned", string.format("Requested=(%.1f, %.1f, %.1f) | Actual=(%.1f, %.1f, %.1f) | CameraRootGap=%s | PlatformStand=%s", position.X, position.Y, position.Z, root.Position.X, root.Position.Y, root.Position.Z, cameraGap, tostring(activeHumanoid and activeHumanoid.PlatformStand)))
     return true
 end
 
@@ -1687,67 +632,17 @@ local function moveBelowAlien(entry)
     if not entry or not entry.root or not entry.root.Parent then
         return false
     end
-
-    local targetRootPosition = entry.root.Position
-    local torsoAnchor = getPreferredTorsoAnchor(entry.model)
-    local anchorPosition = torsoAnchor and torsoAnchor.Position or targetRootPosition
-    local _, playerRoot = getCharacter()
-    if not playerRoot then
-        return false
-    end
-
-    -- Approach from the horizontal direction the player was already travelling
-    -- toward the target. This keeps the measured vertical offset while avoiding
-    -- the exact same X/Z line that made the leg centers win every selection.
-    local approachVector = Vector3.new(
-        anchorPosition.X - playerRoot.Position.X,
-        0,
-        anchorPosition.Z - playerRoot.Position.Z
-    )
-    if approachVector.Magnitude < 0.001 then
-        local fallbackLook = entry.root.CFrame.LookVector
-        approachVector = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
-    end
-    if approachVector.Magnitude < 0.001 then
-        approachVector = Vector3.new(0, 0, -1)
-    else
-        approachVector = approachVector.Unit
-    end
-
-    local hoverPosition = Vector3.new(
-        anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
-        targetRootPosition.Y - CONFIG.HOVER_BELOW,
-        anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
-    )
-    local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
+    local targetPosition = entry.root.Position
+    local hoverPosition = targetPosition + Vector3.new(0, -CONFIG.HOVER_BELOW, 0)
     currentTarget = entry.variant .. " / " .. entry.model.Name
-    local beforeDistance = (playerRoot.Position - anchorPosition).Magnitude
-    local moved = moveCharacter(hoverPosition, horizontalLookAt, "SAFE_HOVER_TORSO_APPROACH")
-    local _, actualRoot = getCharacter()
-    local actualPosition = actualRoot and actualRoot.Position or hoverPosition
-    local actualOffset = actualPosition.Y - targetRootPosition.Y
-    local actualRootDistance = (actualPosition - targetRootPosition).Magnitude
-    local actualAnchorDistance = (actualPosition - anchorPosition).Magnitude
-    local camera = Workspace.CurrentCamera
-    local cameraType = camera and tostring(camera.CameraType) or "unknown"
-
-    recordEvent("TARGET", "Torso-relative safe-hover positioning requested", string.format(
-        "Variant=%s | Model=%s | TargetRoot=(%.2f, %.2f, %.2f) | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelow=%.2f | PreviousAnchorDistance=%.2f | CharacterMove=%s | CameraType=%s",
-        entry.variant, entry.model.Name,
-        targetRootPosition.X, targetRootPosition.Y, targetRootPosition.Z,
-        torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
-        anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
-        hoverPosition.X, hoverPosition.Y, hoverPosition.Z,
-        actualPosition.X, actualPosition.Y, actualPosition.Z,
-        actualOffset, actualRootDistance, actualAnchorDistance,
-        CONFIG.TORSO_HORIZONTAL_STANDOFF, approachVector.X, approachVector.Z,
-        CONFIG.HOVER_BELOW, beforeDistance, tostring(moved), cameraType
-    ))
+    local _, playerRoot = getCharacter()
+    local beforeDistance = playerRoot and (playerRoot.Position - targetPosition).Magnitude or -1
+    local moved = moveCharacter(hoverPosition, targetPosition)
+    recordEvent("TARGET", "Hover-below positioning requested", string.format("Variant=%s | Model=%s | Target=(%.1f, %.1f, %.1f) | DesiredPlayerY=%.1f | PreviousDistance=%.1f | Success=%s", entry.variant, entry.model.Name, targetPosition.X, targetPosition.Y, targetPosition.Z, hoverPosition.Y, beforeDistance, tostring(moved)))
     return moved
 end
 
 local function restoreMovement()
-    restoreSafeCamera()
     if activeHumanoid or flyVelocity or flyGyro then
         recordEvent("FLIGHT", "Restoring character movement and collision state", "Emergency stop / cleanup requested")
     end
@@ -1773,6 +668,46 @@ local function restoreMovement()
     activeHumanoid = nil
 end
 
+local function getClosestMeleeContact(model, position, radius)
+    local best = nil
+    if not model or not model.Parent or not position then
+        return nil
+    end
+
+    for _, part in ipairs(getHitParts(model)) do
+        if part and part.Parent and part:IsA("BasePart") and part.Name ~= "EntityDetector" then
+            local distance = (part.Position - position).Magnitude
+            if distance <= radius and (not best or distance < best.distance) then
+                best = {
+                    part = part,
+                    position = part.Position,
+                    distance = distance,
+                }
+            end
+        end
+    end
+
+    return best
+end
+
+local function getMeleeContacts(entries, position)
+    local contacts = {}
+    for _, entry in ipairs(entries) do
+        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
+            local contact = getClosestMeleeContact(entry.model, position, CONFIG.MELEE_RADIUS)
+            if contact then
+                contact.entry = entry
+                table.insert(contacts, contact)
+            end
+        end
+    end
+
+    table.sort(contacts, function(a, b)
+        return a.distance < b.distance
+    end)
+    return contacts
+end
+
 local function sendMeleeSweep(entries)
     local character, root = getCharacter()
     if not character or not root or not ReplicaSignal then
@@ -1780,74 +715,33 @@ local function sendMeleeSweep(entries)
     end
 
     if not ensureToolEquipped() then
-        setStatus("Waiting for starting melee Tool")
+        setStatus("Waiting for the starting Shovel")
         return 0
     end
 
     local equippedTool = character:FindFirstChildOfClass("Tool")
     if not equippedTool then
-        setStatus("Starting melee Tool is not equipped")
+        setStatus("Starting Shovel is not equipped")
         return 0
     end
 
+    -- Tool.Enabled is game-controlled. Do not force it and do not require Tool.Activated.
     if not equippedTool.Enabled then
         recordThrottled("melee-tool-disabled", 3, "WEAPON",
-            "Melee Tool is equipped but Tool.Enabled is false",
-            "The game controls this property; HF8.1 does not force it and does not require Tool.Activated")
+            "Shovel is equipped but Tool.Enabled is false",
+            "Observed only; no override is applied")
     end
 
-    local signalId, signalIdSource = getMeleeSignalId()
-    if not signalId then
-        recordThrottled("melee-replica-id-wait", 1.5, "WEAPON",
-            "Waiting for equipped melee replica ID",
-            "ServerItem=" .. tostring(meleeItemName) .. " | ItemGuid=" .. tostring(meleeItemGuid)
-            .. " | No Shovel ID will be guessed before the server identifies the item")
-        return 0
-    end
-
-    if meleeItemGuid and equippedTool.Name ~= meleeItemGuid then
-        recordThrottled("melee-tool-guid-mismatch", 1.5, "WEAPON",
-            "Equipped Tool does not match server melee item",
-            "EquippedTool=" .. tostring(equippedTool.Name) .. " | ExpectedGuid=" .. tostring(meleeItemGuid)
-            .. " | ServerItem=" .. tostring(meleeItemName))
-        return 0
-    end
-
-    local candidates = {}
-    for _, entry in ipairs(entries) do
-        if entry.model and entry.model.Parent and entry.root and entry.root.Parent then
-            local contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_RADIUS)
-
-            if contact and contact.part and contact.part.Parent then
-                contact.entry = entry
-                table.insert(candidates, contact)
-            else
-                recordThrottled("melee-no-contact:" .. tostring(entry.model.Name), 1, "COMBAT",
-                    "Hostile skipped: no eligible body part inside melee radius",
-                    tostring(entry.variant) .. "/" .. tostring(entry.model.Name)
-                    .. " | Radius=" .. tostring(CONFIG.MELEE_RADIUS))
-            end
-        end
-    end
-
-    table.sort(candidates, function(a, b)
-        local ap = a.priority or 99
-        local bp = b.priority or 99
-        if ap ~= bp then
-            return ap < bp
-        end
-        return a.distance < b.distance
-    end)
-
-    local maxTargets = math.min(#candidates, CONFIG.MAX_TARGETS_PER_SWEEP, CONFIG.MAX_HITS_PER_SWEEP)
+    local contacts = getMeleeContacts(entries, root.Position)
+    local maxTargets = math.min(#contacts, CONFIG.MAX_TARGETS_PER_SWEEP)
     if maxTargets == 0 then
-        recordThrottled("melee-no-valid-contact", 0.75, "COMBAT",
-            "No eligible hostile body part inside melee radius",
-            "Radius=" .. tostring(CONFIG.MELEE_RADIUS) .. " | Hostiles passed in=" .. tostring(#entries))
+        recordThrottled("melee-no-contact", 0.75, "COMBAT",
+            "No alien body part inside the proximity radius",
+            "Radius=" .. tostring(CONFIG.MELEE_RADIUS) .. " | Alien entries=" .. tostring(#entries))
         return 0
     end
 
-    local first = candidates[1]
+    local first = contacts[1]
     local delta = first.position - root.Position
     local horizontal = Vector3.new(delta.X, 0, delta.Z)
     if horizontal.Magnitude < 0.001 then
@@ -1860,10 +754,13 @@ local function sendMeleeSweep(entries)
         horizontal = horizontal.Unit
     end
 
-    local direction = Vector3.new(horizontal.X, CONFIG.MELEE_ATTACK_VERTICAL_BIAS, horizontal.Z).Unit
-    lastAutoAttackAt = os.clock()
-    automatedAttackRequests = automatedAttackRequests + 1
+    local direction = Vector3.new(
+        horizontal.X,
+        CONFIG.MELEE_ATTACK_VERTICAL_BIAS,
+        horizontal.Z
+    ).Unit
 
+    local signalId = CONFIG.CLASSIC_SHOVEL_REPLICA_ID
     local okAttack, attackError = pcall(function()
         ReplicaSignal:FireServer(signalId, "Melee", "Attack", direction, 1)
     end)
@@ -1873,58 +770,53 @@ local function sendMeleeSweep(entries)
         return 0
     end
 
+    -- The successful capture showed a short Attack -> Hit delay (~33 ms median).
     task.wait(CONFIG.MELEE_HIT_DELAY)
 
     local sentHits = 0
-    local targetNames = {}
+    local hitTargets = {}
     for index = 1, maxTargets do
         if sentHits >= CONFIG.MAX_HITS_PER_SWEEP then
             break
         end
 
-        local contact = candidates[index]
+        local contact = contacts[index]
         local entry = contact.entry
-        if contact.part and contact.part.Parent and entry.model and entry.model.Parent then
-            for hitIndex = 1, CONFIG.MAX_HITS_PER_TARGET do
-                if sentHits >= CONFIG.MAX_HITS_PER_SWEEP or not contact.part.Parent then
-                    break
-                end
+        local part = contact.part
+        if part and part.Parent and entry and entry.model and entry.model.Parent then
+            local okHit, hitError = pcall(function()
+                ReplicaSignal:FireServer(
+                    signalId,
+                    "Melee",
+                    "Hit",
+                    part,
+                    part.Position,
+                    Vector3.new(0, 1, 0),
+                    part.Material
+                )
+            end)
 
-                local okHit, hitError = pcall(function()
-                    ReplicaSignal:FireServer(
-                        signalId,
-                        "Melee",
-                        "Hit",
-                        contact.part,
-                        contact.part.Position,
-                        Vector3.new(0, 1, 0),
-                        contact.part.Material
-                    )
-                end)
-
-                if okHit then
-                    sentHits = sentHits + 1
-                    automatedHitRequests = automatedHitRequests + 1
-                    lastAutoHitAt = os.clock()
-                    lastAutoHitByModel[entry.model] = lastAutoHitAt
-                    targetNames[#targetNames + 1] = string.format(
-                        "%s/%s:%s@%.1f",
-                        tostring(entry.variant), tostring(entry.model.Name),
-                        tostring(contact.part.Name), contact.distance)
-                else
-                    remoteErrors = remoteErrors + 1
-                    recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
-                end
+            if okHit then
+                sentHits = sentHits + 1
+                hitTargets[#hitTargets + 1] = string.format(
+                    "%s/%s:%s@%.1f",
+                    tostring(entry.variant), tostring(entry.model.Name),
+                    tostring(part.Name), contact.distance
+                )
+            else
+                remoteErrors = remoteErrors + 1
+                recordEvent("ERROR", "Melee Hit call failed locally", diagTraceback(hitError))
             end
         end
     end
 
-    currentTarget = table.concat(targetNames, " | ")
-    recordThrottled("hf81-classic-melee-sweep", 0.35, "COMBAT", "Melee proximity sweep dispatched",
-        string.format("Item=%s | ItemGuid=%s | ReplicaId=%s | IDSource=%s | AttackDirection=(%.3f, %.3f, %.3f) | Targets=%d | HitRequests=%d | Radius=%.1f | Tool=%s | ToolEnabled=%s | DamageEvents=%d | ConfirmedDeaths=%d",
-            tostring(meleeItemName), tostring(meleeItemGuid), tostring(signalId), tostring(signalIdSource),
-            direction.X, direction.Y, direction.Z, maxTargets, sentHits, CONFIG.MELEE_RADIUS,
-            equippedTool.Name, tostring(equippedTool.Enabled), serverDamageEvents, serverConfirmedKills))
+    recordEvent("COMBAT", "Melee proximity sweep dispatched",
+        string.format("Item=Shovel | ItemGuid=%s | ReplicaId=%d (Classic source ID) | AttackDirection=(%.3f, %.3f, %.3f) | Targets=%d | HitRequests=%d | Radius=%.1f | ToolEnabled=%s | ServerDamage=%d | ServerOnDied=%d | Selected=%s",
+            tostring(equippedTool.Name), signalId,
+            direction.X, direction.Y, direction.Z,
+            maxTargets, sentHits, CONFIG.MELEE_RADIUS,
+            tostring(equippedTool.Enabled), serverDamageEvents, serverOnDiedEvents,
+            table.concat(hitTargets, " ; ")))
 
     return sentHits
 end
@@ -1993,7 +885,7 @@ local function collectTokensAround(center, radius)
                     local promptPath = "unknown"
                     pcall(function() promptPath = prompt:GetFullName() end)
                     recordEvent("TOKEN", "Alien Token pickup detected", string.format("Path=%s | Position=(%.1f, %.1f, %.1f) | DistanceFromCluster=%.1f | MaxActivationDistance=%.1f", promptPath, position.X, position.Y, position.Z, item.distance, prompt.MaxActivationDistance))
-                    local moved = moveCharacter(position + Vector3.new(0, 2, 0), position, "TOKEN_PICKUP")
+                    local moved = moveCharacter(position + Vector3.new(0, 2, 0), position)
                     task.wait(0.08)
                     tokenAttempts = tokenAttempts + 1
                     recordEvent("TOKEN", "Pickup attempt started", "Path=" .. promptPath .. " | MoveToPickup=" .. tostring(moved) .. " | Attempt=" .. tostring(tokenAttempts))
@@ -2029,31 +921,23 @@ end
 
 local function engageAliens(seedEntries)
     if not seedEntries or #seedEntries == 0 then
-        return false
+        return
     end
 
     local firstTarget = seedEntries[1]
     if not firstTarget.root or not firstTarget.root.Parent then
-        return false
+        return
     end
 
     local clusterCenter = firstTarget.root.Position
     local startTime = os.clock()
     local initialKillCount = alienKills
-    local initialDeathCount = serverConfirmedKills
-    local initialDamageCount = serverDamageEvents
+    local startKillCount = initialKillCount
+    recordEvent("TARGET", "Alien cluster engagement started", string.format("InitialTarget=%s/%s | Count=%d | Center=(%.1f, %.1f, %.1f)", firstTarget.variant, firstTarget.model.Name, #seedEntries, clusterCenter.X, clusterCenter.Y, clusterCenter.Z))
     local lastProgressTime = os.clock()
-    local lastKnownKillCount = alienKills
-    local lastKnownDeathCount = serverConfirmedKills
     local lastKnownDamageCount = serverDamageEvents
-    local lastApproachModel = nil
-    local lastApproachAt = 0
-
-    recordEvent("TARGET", "Alien cluster engagement started",
-        string.format("InitialTarget=%s/%s | SeedCount=%d | Center=(%.1f, %.1f, %.1f) | AuraRadius=%.1f",
-            tostring(firstTarget.variant), tostring(firstTarget.model.Name), #seedEntries,
-            clusterCenter.X, clusterCenter.Y, clusterCenter.Z, CONFIG.MELEE_RADIUS))
-    setStatus("Approaching alien cluster")
+    local lastKnownDeathCount = serverOnDiedEvents
+    setStatus("Engaging alien cluster")
 
     while running and not paused and (os.clock() - startTime) < CONFIG.ENGAGE_TIMEOUT do
         local entries = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
@@ -2061,120 +945,50 @@ local function engageAliens(seedEntries)
             break
         end
 
-        local character, root, humanoid = getCharacter()
-        if not character or not root or not humanoid then
-            setStatus("Waiting for character during alien engagement")
-            task.wait(0.25)
-        elseif humanoid.Health <= 0 then
-            setStatus("Character down during alien engagement")
-            task.wait(0.5)
-        else
-            -- Keep the player still while one or more aliens are inside the
-            -- validated proximity radius. Reposition only when no eligible
-            -- alien body part is close enough for the next local sweep.
-            local inRange = {}
-            for _, entry in ipairs(entries) do
-                if entry.model and entry.model.Parent then
-                    local contact = getClosestMeleeContact(entry.model, root.Position, CONFIG.MELEE_RADIUS)
-                    if contact and contact.part and contact.part.Parent then
-                        table.insert(inRange, entry)
-                    end
-                end
-            end
-
-            if #inRange == 0 then
-                local nearest = nil
-                local nearestDistance = math.huge
-                for _, entry in ipairs(entries) do
-                    if entry.root and entry.root.Parent then
-                        local distance = (entry.root.Position - root.Position).Magnitude
-                        if distance < nearestDistance then
-                            nearest = entry
-                            nearestDistance = distance
-                        end
-                    end
-                end
-
-                if nearest and (nearest.model ~= lastApproachModel or (os.clock() - lastApproachAt) >= 1.25) then
-                    recordThrottled("classic-approach:" .. tostring(nearest.model.Name), 0.5,
-                        "TARGET", "Approaching nearest alien for proximity engagement",
-                        string.format("Target=%s/%s | RootDistance=%.2f | RepositionOnlyWhenNoTargetInsideRadius=true",
-                            tostring(nearest.variant), tostring(nearest.model.Name), nearestDistance))
-                    moveBelowAlien(nearest)
-                    lastApproachModel = nearest.model
-                    lastApproachAt = os.clock()
-                    task.wait(0.12)
-
-                    local _, refreshedRoot = getCharacter()
-                    if refreshedRoot then
-                        inRange = {}
-                        for _, entry in ipairs(entries) do
-                            if entry.model and entry.model.Parent then
-                                local contact = getClosestMeleeContact(entry.model, refreshedRoot.Position, CONFIG.MELEE_RADIUS)
-                                if contact and contact.part and contact.part.Parent then
-                                    table.insert(inRange, entry)
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-
-            if #inRange > 0 then
-                local sent = sendMeleeSweep(inRange)
-                if sent > 0 then
-                    setStatus("Alien aura | Nearby=" .. tostring(#inRange) .. " | Hits=" .. tostring(sent))
-                else
-                    setStatus("Alien nearby | Waiting for Shovel replica mapping or valid hitbox")
-                end
-            else
-                setStatus("Alien cluster found | Waiting for target inside melee radius")
-                recordThrottled("classic-no-contact", 1, "COMBAT",
-                    "No alien body part inside melee radius after approach",
-                    "Radius=" .. tostring(CONFIG.MELEE_RADIUS) .. " | RemainingClusterAliens=" .. tostring(#entries))
-            end
-
-            if serverDamageEvents > lastKnownDamageCount
-                or serverConfirmedKills > lastKnownDeathCount
-                or alienKills > lastKnownKillCount then
-                lastProgressTime = os.clock()
-                lastKnownDamageCount = serverDamageEvents
-                lastKnownDeathCount = serverConfirmedKills
-                lastKnownKillCount = alienKills
-            end
-
-            if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
-                setStatus("No server-confirmed alien damage; ending this engagement pass")
-                recordEvent("COMBAT", "Alien engagement stalled",
-                    "DamageDelta=" .. tostring(serverDamageEvents - initialDamageCount)
-                    .. " | DeathDelta=" .. tostring(serverConfirmedKills - initialDeathCount)
-                    .. " | KillCounterDelta=" .. tostring(alienKills - initialKillCount)
-                    .. " | NoProgressSeconds=" .. string.format("%.2f", os.clock() - lastProgressTime))
-                break
-            end
-
-            task.wait(CONFIG.ATTACK_INTERVAL)
+        local nearest = getNearestEntry(entries)
+        if not nearest then
+            break
         end
+
+        local _, playerRoot = getCharacter()
+        local contactsInRange = playerRoot and getMeleeContacts(entries, playerRoot.Position) or {}
+        if #contactsInRange == 0 then
+            recordThrottled("target-approach", 0.75, "TARGET", "Approaching nearest alien for proximity engagement",
+                "Target=" .. tostring(nearest.variant) .. "/" .. tostring(nearest.model.Name)
+                .. " | No eligible hit part inside " .. tostring(CONFIG.MELEE_RADIUS) .. " studs")
+            moveBelowAlien(nearest)
+            task.wait(0.04)
+        end
+
+        local hits = sendMeleeSweep(entries)
+        if hits > 0 then
+            setStatus("Stationary aura: " .. tostring(hits) .. " alien hit(s) dispatched")
+        else
+            setStatus("Positioning below alien cluster / waiting for melee contact")
+        end
+
+        if alienKills > startKillCount
+            or serverDamageEvents > lastKnownDamageCount
+            or serverOnDiedEvents > lastKnownDeathCount then
+            lastProgressTime = os.clock()
+            startKillCount = alienKills
+            lastKnownDamageCount = serverDamageEvents
+            lastKnownDeathCount = serverOnDiedEvents
+        end
+
+        if (os.clock() - lastProgressTime) > CONFIG.NO_KILL_TIMEOUT then
+            setStatus("No new alien kill confirmation; ending this engagement")
+            break
+        end
+
+        task.wait(CONFIG.ATTACK_INTERVAL)
     end
 
-    setStatus("Collecting Alien Tokens from cleared area")
-    recordEvent("TARGET", "Alien engagement phase ended",
-        "Elapsed=" .. string.format("%.2f", os.clock() - startTime)
-        .. "s | DamageDelta=" .. tostring(serverDamageEvents - initialDamageCount)
-        .. " | OnDiedDelta=" .. tostring(serverConfirmedKills - initialDeathCount)
-        .. " | KillCounterDelta=" .. tostring(alienKills - initialKillCount))
-
+    setStatus("Collecting drops from cleared alien area")
+    recordEvent("TARGET", "Alien engagement ended", "Elapsed=" .. string.format("%.2f", os.clock() - startTime) .. "s | KillNotificationDelta=" .. tostring(alienKills - initialKillCount) .. " | CurrentKillNotifications=" .. tostring(alienKills))
     local collected = collectTokensAround(clusterCenter, CONFIG.TOKEN_SEARCH_RADIUS)
-    recordEvent("TOKEN", "Cluster collection pass finished",
-        "ConfirmedThisPass=" .. tostring(collected)
-        .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
-
-    local remaining = getAliensNear(clusterCenter, CONFIG.ALIEN_ATTACK_RANGE)
-    local clusterCleared = (#remaining == 0)
-    recordEvent("TARGET", "Cluster clearance check",
-        "RemainingAliens=" .. tostring(#remaining) .. " | Cleared=" .. tostring(clusterCleared))
+    recordEvent("TOKEN", "Cluster collection pass finished", "ConfirmedThisPass=" .. tostring(collected) .. " | TotalConfirmed=" .. tostring(tokenPickupsConfirmed))
     currentTarget = "None"
-    return clusterCleared
 end
 
 local function getCurrentScanPosition()
@@ -2190,7 +1004,7 @@ local function advanceScan()
         scanZ = CONFIG.SCAN_START_Z
     end
     local position = getCurrentScanPosition()
-    local moved = moveCharacter(position, position + Vector3.new(0, 0, -1), "SCAN_ADVANCE")
+    local moved = moveCharacter(position, position + Vector3.new(0, 0, -1))
     setStatus("Scanning lap " .. tostring(lap) .. " / Z=" .. tostring(scanZ))
     recordEvent("SCAN", "Scan route advanced", "Lap=" .. tostring(oldLap) .. "->" .. tostring(lap) .. " | Z=" .. tostring(oldZ) .. "->" .. tostring(scanZ) .. " | Step=" .. tostring(CONFIG.SCAN_STEP) .. " | MoveSuccess=" .. tostring(moved))
     task.wait(CONFIG.SCAN_WAIT)
@@ -2202,11 +1016,8 @@ local function waitWhilePaused()
     end
 end
 
-local function runClassicAlienScanAndCollection()
-    currentMode = "Classic production - alien scan + token collection"
-    -- Equip/map the Classic starting Shovel before entering PlatformStand flight.
-    ensureToolEquipped()
-    task.wait(0.15)
+local function mainLoop()
+    applyFullbright()
     setupFlight()
 
     local _, initialRoot = getCharacter()
@@ -2214,15 +1025,14 @@ local function runClassicAlienScanAndCollection()
         scanZ = CONFIG.SCAN_START_Z + math.floor((initialRoot.Position.Z - CONFIG.SCAN_START_Z) / CONFIG.SCAN_STEP) * CONFIG.SCAN_STEP
     end
 
-    local pendingClusterCenter = nil
-    setStatus("Classic alien scanning started")
-    recordEvent("SCAN", "Original Classic scan route ready",
-        string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs | Weapon=Shovel (server-mapped)",
-            CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
+    setStatus("Automatic farming started")
+    recordEvent("SCAN", "Initial scan route ready", string.format("Start=(%.1f, %.1f, %.1f) | Step=%d | DetectionRadius=%.1f | Wait=%.2fs", CONFIG.SCAN_X, CONFIG.SCAN_Y, scanZ, CONFIG.SCAN_STEP, CONFIG.SCAN_DETECT_RADIUS, CONFIG.SCAN_WAIT))
 
     while running do
         waitWhilePaused()
-        if not running then break end
+        if not running then
+            break
+        end
 
         local character, root, humanoid = getCharacter()
         if not character or not root or not humanoid then
@@ -2234,69 +1044,29 @@ local function runClassicAlienScanAndCollection()
             task.wait(1)
         else
             setupFlight()
+            local scanPosition = getCurrentScanPosition()
+            moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1))
+            task.wait(0.25)
 
-            if pendingClusterCenter then
-                local pendingAliens = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
-                if #pendingAliens == 0 then
-                    recordEvent("TARGET", "Pending alien cluster cleared",
-                        "No AlienType1/2/3 models remain within the active scan radius")
-                    pendingClusterCenter = nil
-                    advanceScan()
-                else
-                    recordEvent("TARGET", "Retrying active alien cluster in place",
-                        "RemainingInScanRadius=" .. tostring(#pendingAliens)
-                        .. " | Scan-point teleport suppressed")
-                    local passCleared = engageAliens(pendingAliens)
-                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
-                    if passCleared and #stillPending == 0 then
-                        pendingClusterCenter = nil
-                        advanceScan()
-                    else
-                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
-                        task.wait(0.5)
-                    end
+            local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
+            if #aliens > 0 then
+                local variantCounts = {AlienType1 = 0, AlienType2 = 0, AlienType3 = 0}
+                for _, entry in ipairs(aliens) do
+                    variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
                 end
+                recordEvent("SCAN", "Alien cluster detected", string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)", #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3, scanPosition.X, scanPosition.Y, scanPosition.Z))
+                setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
+                engageAliens(aliens)
             else
-                local scanPosition = getCurrentScanPosition()
-                moveCharacter(scanPosition, scanPosition + Vector3.new(0, 0, -1), "SCAN_POINT")
-                task.wait(0.25)
-
-                local aliens = getAliensNear(scanPosition, CONFIG.SCAN_DETECT_RADIUS)
-                if #aliens > 0 then
-                    local variantCounts = {AlienType1 = 0, AlienType2 = 0, AlienType3 = 0}
-                    for _, entry in ipairs(aliens) do
-                        variantCounts[entry.variant] = (variantCounts[entry.variant] or 0) + 1
-                    end
-                    pendingClusterCenter = scanPosition
-                    recordEvent("SCAN", "Alien cluster detected",
-                        string.format("Total=%d | AlienType1=%d | AlienType2=%d | AlienType3=%d | ScanPosition=(%.1f, %.1f, %.1f)",
-                            #aliens, variantCounts.AlienType1, variantCounts.AlienType2, variantCounts.AlienType3,
-                            scanPosition.X, scanPosition.Y, scanPosition.Z))
-                    setStatus("Detected " .. tostring(#aliens) .. " alien(s)")
-                    local passCleared = engageAliens(aliens)
-                    local stillPending = getAliensNear(pendingClusterCenter, CONFIG.SCAN_DETECT_RADIUS)
-                    if passCleared and #stillPending == 0 then
-                        pendingClusterCenter = nil
-                        advanceScan()
-                    else
-                        setStatus("Aliens remain; continuing current cluster without scan-point teleport")
-                        task.wait(0.5)
-                    end
-                else
-                    recordEvent("SCAN", "No alien target at scan point",
-                        "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ)
-                        .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
-                    local looseTokens = getAlienTokenPrompts(scanPosition, 80)
-                    if #looseTokens > 0 then
-                        recordEvent("TOKEN", "Loose Alien Tokens found during scan",
-                            "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
-                        setStatus("Loose Alien Tokens detected")
-                        local collected = collectTokensAround(scanPosition, 100)
-                        recordEvent("TOKEN", "Loose-token collection pass finished",
-                            "ConfirmedThisPass=" .. tostring(collected))
-                    end
-                    advanceScan()
+                recordEvent("SCAN", "No alien target at scan point", "Lap=" .. tostring(lap) .. " | Z=" .. tostring(scanZ) .. " | DetectionRadius=" .. tostring(CONFIG.SCAN_DETECT_RADIUS))
+                local looseTokens = getAlienTokenPrompts(scanPosition, 80)
+                if #looseTokens > 0 then
+                    recordEvent("TOKEN", "Loose Alien Tokens found during scan", "Count=" .. tostring(#looseTokens) .. " | ScanZ=" .. tostring(scanZ))
+                    setStatus("Loose Alien Tokens detected")
+                    local collected = collectTokensAround(scanPosition, 100)
+                    recordEvent("TOKEN", "Loose-token collection pass finished", "ConfirmedThisPass=" .. tostring(collected))
                 end
+                advanceScan()
             end
         end
 
@@ -2304,12 +1074,7 @@ local function runClassicAlienScanAndCollection()
             task.wait(0.05)
         end
     end
-end
 
-local function mainLoop()
-    applyFullbright()
-    recordEvent("SYSTEM", "Classic-only mode locked", "Bus Rush detection and stationary test branch are disabled")
-    runClassicAlienScanAndCollection()
     restoreMovement()
     restoreFullbright()
     setStatus("Stopped")
@@ -2380,102 +1145,6 @@ local function trackTextLabel(label)
     label:GetPropertyChangedSignal("Text"):Connect(inspectText)
 end
 
-local function monitorCharacterMovement(character)
-    if not character or movementMonitorCharacters[character] then
-        return
-    end
-    movementMonitorCharacters[character] = true
-    expectedCharacterMove = nil
-    task.spawn(function()
-        local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 8)
-        local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8)
-        if not root or not humanoid then
-            recordThrottled("movement-monitor-missing-root", 2, "MOVEMENT", "Character movement monitor could not attach", "RootPart or Humanoid was not available")
-            return
-        end
-
-        local previousPosition = root.Position
-        local previousAt = os.clock()
-        local previousState = humanoid:GetState()
-        local previousFloor = humanoid.FloorMaterial
-        recordEvent("MOVEMENT", "Character movement observer attached", string.format(
-            "Character=%s | Start=(%.1f, %.1f, %.1f) | State=%s | Floor=%s",
-            tostring(character.Name), previousPosition.X, previousPosition.Y, previousPosition.Z,
-            tostring(previousState), tostring(previousFloor)
-        ))
-
-        local stateConnection = humanoid.StateChanged:Connect(function(oldState, newState)
-            recordThrottled("humanoid-state:" .. tostring(newState), 0.2, "MOVEMENT", "Character humanoid state changed",
-                "Old=" .. tostring(oldState) .. " | New=" .. tostring(newState)
-                .. " | Health=" .. tostring(humanoid.Health) .. " | PlatformStand=" .. tostring(humanoid.PlatformStand))
-        end)
-        local floorConnection = humanoid:GetPropertyChangedSignal("FloorMaterial"):Connect(function()
-            local floor = humanoid.FloorMaterial
-            if floor ~= previousFloor then
-                recordThrottled("floor-material:" .. tostring(floor), 0.2, "MOVEMENT", "Character floor material changed",
-                    "Old=" .. tostring(previousFloor) .. " | New=" .. tostring(floor)
-                    .. " | State=" .. tostring(humanoid:GetState()))
-                previousFloor = floor
-            end
-        end)
-
-        while character.Parent and root.Parent and humanoid.Parent do
-            task.wait(0.12)
-            local now = os.clock()
-            local position = root.Position
-            local dt = math.max(now - previousAt, 0.001)
-            local displacement = position - previousPosition
-            local velocity = root.AssemblyLinearVelocity
-            local state = humanoid:GetState()
-            local floor = humanoid.FloorMaterial
-            local expected = expectedCharacterMove
-                and (now - expectedCharacterMove.at) <= 1.25
-                and (position - expectedCharacterMove.position).Magnitude <= 20
-            movementSamples = movementSamples + 1
-
-            if displacement.Magnitude >= 75 then
-                local from = string.format("(%.1f, %.1f, %.1f)", previousPosition.X, previousPosition.Y, previousPosition.Z)
-                local to = string.format("(%.1f, %.1f, %.1f)", position.X, position.Y, position.Z)
-                if expected then
-                    recordThrottled("expected-reposition:" .. tostring(expectedCharacterMove.reason), 0.25, "MOVEMENT",
-                        "Large farmer-requested reposition observed", string.format(
-                            "Reason=%s | From=%s | To=%s | Delta=%.1f | SampleDt=%.3f",
-                            tostring(expectedCharacterMove.reason), from, to, displacement.Magnitude, dt
-                        ))
-                else
-                    movementAnomalyCount = movementAnomalyCount + 1
-                    recordEvent("MOVEMENT_ALERT", "Unexpected character displacement / possible teleport",
-                        string.format("From=%s | To=%s | Delta=%.1f studs | Speed=%.1f studs/s | Velocity=(%.1f, %.1f, %.1f) | State=%s | Floor=%s | Health=%.1f/%.1f | Target=%s | Running=%s | Paused=%s",
-                            from, to, displacement.Magnitude, displacement.Magnitude / dt,
-                            velocity.X, velocity.Y, velocity.Z, tostring(state), tostring(floor),
-                            humanoid.Health, humanoid.MaxHealth, tostring(currentTarget), tostring(running), tostring(paused)))
-                end
-            end
-
-            local freefallState = state == Enum.HumanoidStateType.Freefall
-                or state == Enum.HumanoidStateType.FallingDown
-                or state == Enum.HumanoidStateType.Physics
-            local rapidDrop = floor == Enum.Material.Air
-                and not expected
-                and ((freefallState and velocity.Y <= -35) or (displacement.Y <= -15 and dt <= 0.4))
-            if rapidDrop then
-                local warningEvent = recordThrottled("possible-character-fall", 0.75, "MOVEMENT_ALERT", "Possible character fall / void descent",
-                    string.format("Position=(%.1f, %.1f, %.1f) | DeltaY=%.1f | VelocityY=%.1f | State=%s | Floor=%s | Health=%.1f/%.1f | Target=%s | ExpectedMove=%s",
-                        position.X, position.Y, position.Z, displacement.Y, velocity.Y, tostring(state), tostring(floor),
-                        humanoid.Health, humanoid.MaxHealth, tostring(currentTarget), tostring(expected)))
-                if warningEvent then fallWarningCount = fallWarningCount + 1 end
-            end
-
-            previousPosition = position
-            previousAt = now
-            previousState = state
-        end
-        pcall(function() stateConnection:Disconnect() end)
-        pcall(function() floorConnection:Disconnect() end)
-        recordEvent("MOVEMENT", "Character movement observer detached", "Character=" .. tostring(character.Name))
-    end)
-end
-
 local function monitorCharacter(character)
     if not character then
         return
@@ -2498,143 +1167,6 @@ local function monitorCharacter(character)
     humanoid.Died:Connect(function()
         recordEvent("PLAYER", "Player humanoid died", "Health=" .. tostring(humanoid.Health))
     end)
-end
-
-local function monitorTool(tool)
-    if not tool or not tool:IsA("Tool") or monitoredTools[tool] then
-        return
-    end
-    monitoredTools[tool] = { connections = {} }
-    local toolPath = "unknown"
-    pcall(function() toolPath = tool:GetFullName() end)
-    recordEvent("WEAPON", "Tool diagnostic monitor attached", "Tool=" .. tostring(tool.Name)
-        .. " | Enabled=" .. tostring(tool.Enabled) .. " | Path=" .. toolPath)
-
-    local activatedOk, activatedConnection = pcall(function()
-        return tool.Activated:Connect(function()
-            nativeToolActivations = nativeToolActivations + 1
-            lastManualToolActivationAt = os.clock()
-            local inputAge = lastManualInputAt and (os.clock() - lastManualInputAt) or math.huge
-            recordEvent("WEAPON", "Native Tool.Activated signal observed", "Tool=" .. tostring(tool.Name)
-                .. " | Count=" .. tostring(nativeToolActivations)
-                .. " | RecentMouseOrTouch=" .. tostring(inputAge <= 0.5)
-                .. " | InputAge=" .. (inputAge < math.huge and string.format("%.3f", inputAge) or "none")
-                .. " | InputKind=" .. tostring(lastManualInputKind)
-                .. " | InputGameProcessed=" .. tostring(lastManualInputProcessed)
-                .. " | Target=" .. tostring(currentTarget)
-                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
-                .. " | Native activation is timing evidence, not proof of damage")
-        end)
-    end)
-    if activatedOk and activatedConnection then
-        table.insert(monitoredTools[tool].connections, activatedConnection)
-    elseif not activatedOk then
-        recordEvent("ERROR", "Tool.Activated monitor failed", "Tool=" .. tostring(tool.Name) .. " | Error=" .. tostring(activatedConnection))
-    end
-
-    local equippedOk, equippedConnection = pcall(function()
-        return tool.Equipped:Connect(function()
-            recordEvent("WEAPON", "Tool Equipped event observed", "Tool=" .. tostring(tool.Name)
-                .. " | Parent=" .. tostring(tool.Parent and tool.Parent.Name))
-        end)
-    end)
-    if equippedOk and equippedConnection then table.insert(monitoredTools[tool].connections, equippedConnection) end
-    local unequippedOk, unequippedConnection = pcall(function()
-        return tool.Unequipped:Connect(function()
-            recordEvent("WEAPON", "Tool Unequipped event observed", "Tool=" .. tostring(tool.Name))
-        end)
-    end)
-    if unequippedOk and unequippedConnection then table.insert(monitoredTools[tool].connections, unequippedConnection) end
-
-    local enabledOk, enabledConnection = pcall(function()
-        local previousEnabled = tool.Enabled
-        return tool:GetPropertyChangedSignal("Enabled"):Connect(function()
-            local currentEnabled = tool.Enabled
-            recordEvent("WEAPON", "Tool.Enabled changed", "Tool=" .. tostring(tool.Name)
-                .. " | Old=" .. tostring(previousEnabled) .. " | New=" .. tostring(currentEnabled))
-            previousEnabled = currentEnabled
-        end)
-    end)
-    if enabledOk and enabledConnection then
-        table.insert(monitoredTools[tool].connections, enabledConnection)
-    elseif not enabledOk then
-        recordEvent("ERROR", "Tool.Enabled monitor failed", "Tool=" .. tostring(tool.Name) .. " | Error=" .. tostring(enabledConnection))
-    end
-end
-
-local function monitorToolContainer(container)
-    if not container then
-        return
-    end
-    for _, child in ipairs(container:GetChildren()) do
-        monitorTool(child)
-    end
-    container.ChildAdded:Connect(function(child)
-        monitorTool(child)
-    end)
-end
-
-local function startManualInputMonitoring()
-    UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        local inputType = input.UserInputType
-        if inputType == Enum.UserInputType.MouseButton1 then
-            manualMouseDownCount = manualMouseDownCount + 1
-            local character = LocalPlayer.Character
-            local tool = character and character:FindFirstChildOfClass("Tool")
-            local root = character and character:FindFirstChild("HumanoidRootPart")
-            local camera = Workspace.CurrentCamera
-            if tool and not gameProcessed then
-                lastManualInputAt = os.clock()
-                lastManualInputKind = "MouseButton1"
-            end
-            lastManualInputProcessed = gameProcessed == true
-            local rootText = root and string.format("(%.1f, %.1f, %.1f)", root.Position.X, root.Position.Y, root.Position.Z) or "unknown"
-            local lookText = camera and string.format("(%.2f, %.2f, %.2f)", camera.CFrame.LookVector.X, camera.CFrame.LookVector.Y, camera.CFrame.LookVector.Z) or "unknown"
-            recordEvent("INPUT", "MouseButton1 input began", "Count=" .. tostring(manualMouseDownCount)
-                .. " | GameProcessed=" .. tostring(gameProcessed == true)
-                .. " | EquippedTool=" .. tostring(tool and tool.Name or "None")
-                .. " | Root=" .. rootText .. " | CameraLook=" .. lookText
-                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
-                .. " | Target=" .. tostring(currentTarget))
-        elseif inputType == Enum.UserInputType.Touch then
-            manualTouchCount = manualTouchCount + 1
-            local character = LocalPlayer.Character
-            local tool = character and character:FindFirstChildOfClass("Tool")
-            local root = character and character:FindFirstChild("HumanoidRootPart")
-            local camera = Workspace.CurrentCamera
-            if tool and not gameProcessed then
-                lastManualInputAt = os.clock()
-                lastManualInputKind = "Touch"
-            end
-            lastManualInputProcessed = gameProcessed == true
-            local rootText = root and string.format("(%.1f, %.1f, %.1f)", root.Position.X, root.Position.Y, root.Position.Z) or "unknown"
-            local lookText = camera and string.format("(%.2f, %.2f, %.2f)", camera.CFrame.LookVector.X, camera.CFrame.LookVector.Y, camera.CFrame.LookVector.Z) or "unknown"
-            recordEvent("INPUT", "Touch input began", "Count=" .. tostring(manualTouchCount)
-                .. " | GameProcessed=" .. tostring(gameProcessed == true)
-                .. " | EquippedTool=" .. tostring(tool and tool.Name or "None")
-                .. " | Root=" .. rootText .. " | CameraLook=" .. lookText
-                .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused)
-                .. " | Target=" .. tostring(currentTarget))
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input, gameProcessed)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            manualMouseUpCount = manualMouseUpCount + 1
-            recordThrottled("mouse1-up", 0.08, "INPUT", "MouseButton1 input ended",
-                "Count=" .. tostring(manualMouseUpCount) .. " | GameProcessed=" .. tostring(gameProcessed == true))
-        end
-    end)
-    recordEvent("INPUT", "Manual input observer active", "Observes MouseButton1 and Touch only; no input interception or synthetic input")
-end
-
-local function startToolMonitoring()
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
-    if not backpack then
-        backpack = LocalPlayer:WaitForChild("Backpack", 10)
-    end
-    monitorToolContainer(backpack)
-    monitorToolContainer(LocalPlayer.Character)
-    recordEvent("WEAPON", "Native tool activation monitoring active", "Monitoring Tool.Activated, Equipped/Unequipped, Enabled and physical mouse/touch input; no input interception")
 end
 
 local function hookPlayerGui()
@@ -2662,7 +1194,7 @@ if not guiParent then
 end
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "LastStopAlienFarmerHF8"
+screenGui.Name = "LastStopAlienFarmerHF82"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.Parent = guiParent
@@ -2683,7 +1215,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -16, 0, 28)
 title.Position = UDim2.new(0, 8, 0, 6)
 title.BackgroundTransparency = 1
-title.Text = "LAST STOP - ALIEN TOKEN FARMER HF8.1"
+title.Text = "LAST STOP - ALIEN FARMER"
 title.TextColor3 = Color3.fromRGB(115, 235, 150)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 14
@@ -2706,7 +1238,7 @@ local statsLabel = Instance.new("TextLabel")
 statsLabel.Size = UDim2.new(1, -16, 0, 100)
 statsLabel.Position = UDim2.new(0, 8, 0, 72)
 statsLabel.BackgroundTransparency = 1
-statsLabel.Text = "Classic scanner initializing\nShovel mapping pending\nDamageDealt: 0 | OnDied: 0"
+statsLabel.Text = "Alien kills: 0\nToken pickups confirmed: 0\nReward toast estimate: 0"
 statsLabel.TextColor3 = Color3.fromRGB(190, 200, 210)
 statsLabel.Font = Enum.Font.Code
 statsLabel.TextSize = 11
@@ -2910,36 +1442,13 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "1.0.1-HF8.1-CLASSIC-ONLY",
+            version = "HF8.2-CLASSIC-KILLAURA",
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
-            mode = currentMode,
-            meleeItemName = meleeItemName,
-            meleeItemGuid = meleeItemGuid,
-            meleeReplicaId = meleeReplicaId,
-            meleeReplicaIdSource = meleeReplicaIdSource,
-            serverDamageEvents = serverDamageEvents,
-            serverConfirmedKills = serverConfirmedKills,
             alienKills = alienKills,
-            monitoredAlienModels = monitoredAlienModelsTotal,
-            alienHealthSourcesFound = alienHealthSourcesFound,
-            alienDamageEvents = alienDamageEvents,
-            alienDeathEvents = alienDeathEvents,
-            alienHealthUiEvents = alienHealthUiEvents,
-            automatedDamageUiEvents = automatedDamageUiEvents,
-            nativeToolActivations = nativeToolActivations,
-            automatedAttackRequests = automatedAttackRequests,
-            automatedHitRequests = automatedHitRequests,
-            manualMouseDownCount = manualMouseDownCount,
-            manualMouseUpCount = manualMouseUpCount,
-            manualTouchCount = manualTouchCount,
-            lastManualInputKind = lastManualInputKind,
-            lastManualInputProcessed = lastManualInputProcessed,
-            movementSamples = movementSamples,
-            movementAnomalyCount = movementAnomalyCount,
-            fallWarningCount = fallWarningCount,
-            alienHealthSnapshot = buildAlienHealthSnapshot(),
+            serverDamageEvents = serverDamageEvents,
+            serverOnDiedEvents = serverOnDiedEvents,
             tokenAttempts = tokenAttempts,
             tokenPickupsConfirmed = tokenPickupsConfirmed,
             rewardToastEstimate = rewardToastEstimate,
@@ -2974,17 +1483,13 @@ local function refreshGui()
         statusLabel.Text = currentStatus .. "\nTarget: " .. tostring(currentTarget)
     end
     if statsLabel and statsLabel.Parent then
-        statsLabel.Text = "Mode: " .. tostring(currentMode)
-            .. "\nConfirmed kills: " .. tostring(alienKills)
-            .. " | OnDied: " .. tostring(serverConfirmedKills)
-            .. " | Damage: " .. tostring(serverDamageEvents)
-            .. "\nMelee item: " .. tostring(meleeItemName)
-            .. " | Replica ID: " .. tostring(meleeReplicaId)
-            .. " (" .. tostring(meleeReplicaIdSource) .. ")"
+        statsLabel.Text = "Alien kills: " .. tostring(alienKills)
+            .. "\nServer damage: " .. tostring(serverDamageEvents) .. " | OnDied: " .. tostring(serverOnDiedEvents)
+            .. "\nToken pickups confirmed: " .. tostring(tokenPickupsConfirmed)
+            .. " / attempts: " .. tostring(tokenAttempts)
+            .. "\nReward toast estimate: " .. tostring(rewardToastEstimate)
             .. "\nTool: " .. tostring(equippedToolName)
-            .. " | Scan Z: " .. tostring(scanZ) .. " | Lap: " .. tostring(lap)
-            .. "\nAttack requests: " .. tostring(automatedAttackRequests)
-            .. " | Hit requests: " .. tostring(automatedHitRequests)
+            .. "\nLap: " .. tostring(lap) .. "  Scan Z: " .. tostring(scanZ)
             .. "\nLocal call errors: " .. tostring(remoteErrors)
             .. " | Diagnostics: " .. tostring(#diagEvents)
             .. " | Captured errors: " .. tostring(diagErrorCount)
@@ -3008,10 +1513,6 @@ local function stopFarm()
     recordEvent("SYSTEM", "Stop requested by user", "Emergency stop button activated")
     running = false
     paused = false
-    for _, connection in ipairs(replicaConnections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    replicaConnections = {}
     restoreMovement()
     restoreFullbright()
     setStatus("Stopped by user")
@@ -3058,23 +1559,17 @@ diagCopyButton.Activated:Connect(copyDiagnostics)
 diagExportButton.Activated:Connect(exportDiagnostics)
 
 LocalPlayer.CharacterAdded:Connect(function(character)
-    meleeEquipRefreshAttempted = false
-    meleeItemName = nil
-    meleeItemGuid = nil
-    meleeReplicaId = nil
-    meleeReplicaIdSource = "awaiting respawn equip mapping"
     task.wait(1)
     monitorCharacter(character)
-    monitorToolContainer(character)
     recordEvent("PLAYER", "Character respawned", "Character=" .. tostring(character.Name))
+    if running then
+        setupFlight()
+    end
 end)
 if LocalPlayer.Character then
     task.spawn(monitorCharacter, LocalPlayer.Character)
 end
 
-startReplicaMonitoring()
-startToolMonitoring()
-startManualInputMonitoring()
 hookPlayerGui()
 
 -- Keep the compact HUD current without scanning the world every frame.
@@ -3092,7 +1587,7 @@ task.spawn(function()
         if root and camera then
             local gap = (camera.CFrame.Position - root.Position).Magnitude
             if gap > 100 then
-                recordThrottled("camera-root-gap", 2.0, "CAMERA", "Camera/root offset observed (informational; may be intentional safe-hover view)", string.format("Gap=%.1f studs | Root=(%.1f, %.1f, %.1f) | Camera=(%.1f, %.1f, %.1f) | Target=%s | No movement error inferred from camera offset alone", gap, root.Position.X, root.Position.Y, root.Position.Z, camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z, tostring(currentTarget)))
+                recordThrottled("camera-root-gap", 0.75, "CAMERA", "User-controlled camera look offset (informational)", string.format("Gap=%.1f studs | Root=(%.1f, %.1f, %.1f) | Camera=(%.1f, %.1f, %.1f) | Not classified as a movement error", gap, root.Position.X, root.Position.Y, root.Position.Z, camera.CFrame.Position.X, camera.CFrame.Position.Y, camera.CFrame.Position.Z))
             end
         end
         task.wait(0.5)
@@ -3105,8 +1600,9 @@ local function startFarm()
     end
     running = true
     paused = false
-    recordEvent("SYSTEM", "Classic Alien Token Farmer started", "Classic scan/approach/kill/token-collection loop; Shovel is the only supported melee item")
+    recordEvent("SYSTEM", "Farming started", "Automatic scan/combat/token loop started")
     applyFullbright()
+    setupFlight()
     if mainLoopThread then
         mainLoopThread = nil
     end
@@ -3132,6 +1628,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "HF8.1 initialization complete", "Automatic start scheduled | Classic-only alien scan + token collection | Starting Shovel dynamically mapped | No mode detection or Bus Rush branch | No global hooks")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Classic AlienType1/2/3 scan + stationary 3-target Shovel aura | Diagnostics=integrated | Hooks=none")
 refreshDiagPanel()
-log("HF8.1 loaded. Classic-only alien scan and token collection scheduled.")
+log("HF8.2 loaded. Classic scan/hover/token collection preserved; Shovel proximity aura enabled. Integrated diagnostics enabled.")
