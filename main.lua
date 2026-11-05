@@ -1,7 +1,7 @@
 --[[
-LAST STOP - ALIEN TOKEN FARMER HF9.7 (CLOSE TORSO + 3-TARGET SWEEP + FULL CLEAR + TOKEN RECOVERY + ANTI-AFK)
+LAST STOP - ALIEN TOKEN FARMER HF9.9 (CENTERED UNDERBODY TETHER + NEAREST CONTACT + TARGET ROTATION + HEALTH GUARD + FULL CLEAR + TOKEN RECOVERY + ANTI-AFK)
 Standalone experimental build for the Last Stop Roblox experience.
-HF9.7 keeps HF9.5's unlimited cluster clearing, death-position token recovery, anti-AFK, corrected hit-part hierarchy, collateral protection, and original ReplicaSignal transport. It uses an 8-stud torso-relative attack hover with 0.5-stud horizontal standoff (inside the 10-stud melee contact limit), debounces shovel re-equips, and retreats to a 20-stud hover while the shovel is unavailable.
+HF9.9 keeps the HF9.8 full-clear, token recovery, anti-AFK, health guard, collateral protection, nearest-contact selection, and original ReplicaSignal transport. It removes the lateral hover offset and continuously tethers the player root directly beneath the selected alien torso on Heartbeat, maintaining a 6.5-stud vertical gap during attack and tool cooldown.
 
 Observed game structures used:
   Workspace.ENTITY_CONTAINER.<GUID>.Dress.AlienType1/2/3
@@ -30,6 +30,7 @@ local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local VirtualUser = nil
 pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 local LocalPlayer = Players.LocalPlayer
@@ -54,17 +55,20 @@ local CONFIG = {
     SCAN_WAIT = 0.8,
     SCAN_DETECT_RADIUS = 900,
     ALIEN_ATTACK_RANGE = 50, -- original Classic engagement radius from main.lua
-    HOVER_BELOW = 8.0, -- torso-relative spacing; keeps selected torso contact inside the 10-stud hit limit
-    HOVER_REPOSITION_THRESHOLD = 0.75,
-    TORSO_HORIZONTAL_STANDOFF = 0.5, -- remain almost directly underneath the selected torso anchor
+    HOVER_BELOW = 6.5, -- centered beneath torso with 3.5 studs of margin inside the 10-stud contact limit
+    HOVER_REPOSITION_THRESHOLD = 0.05,
+    TORSO_HORIZONTAL_STANDOFF = 0.0, -- no sideways offset; player root stays directly under torso anchor
+    HOVER_TETHER_DEADBAND = 0.05, -- Heartbeat tether corrects even small target-relative drift
     ATTACK_INTERVAL = 0.0655, -- measured median from the working outgoing capture
     MELEE_HIT_DELAY = 0.0323, -- measured median Attack -> first Hit delay
     TOOL_EQUIP_RETRY_INTERVAL = 0.35, -- prevent rapid EquipTool/Unequipped cycling
-    COOLDOWN_HOVER_BELOW = 20.0, -- temporary retreat while the shovel is not equipped
 
-    NO_KILL_TIMEOUT = 15, -- ends one failed attack attempt; the active cluster remains locked
-    MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- triggers a close re-approach; never releases the cluster
+    NO_KILL_TIMEOUT = 15, -- backup per-pass timeout; the active cluster remains locked
+    TARGET_STALL_TIMEOUT = 4.0, -- rotate to another tracked alien after no confirmed hit on the current one
+    TARGET_RETRY_COOLDOWN = 8.0, -- revisit a stalled alien after trying other cluster members
+    MAX_NO_PROGRESS_CLUSTER_PASSES = 2, -- backup recovery pass count; never releases the cluster
     CLUSTER_RETRY_DELAY = 0.45,
+    LOW_HEALTH_STOP_PERCENT = 35.0, -- stop farming and restore player control before critical health
     MAX_HITS_PER_TARGET = 1, -- observed working aura: one Hit per selected target
     MAX_TARGETS_PER_SWEEP = 3,
     MAX_HITS_PER_SWEEP = 3, -- observed working aura: up to three distinct target Hits per Attack
@@ -132,6 +136,8 @@ local toolUnequippedEvents = 0
 local playerHealthCurrent = nil
 local playerHealthMax = nil
 local playerDeathEvents = 0
+local lowHealthStopTriggered = false
+local stopFarm = nil
 local currentStatus = "Initializing"
 local lastAlienKillAt = os.clock()
 local lastLabelText = {}
@@ -143,6 +149,9 @@ local activeRoot = nil
 local activeHumanoid = nil
 local flyVelocity = nil
 local flyGyro = nil
+local hoverTetherConnection = nil
+local hoverTetherEntry = nil
+local hoverTetherAnchor = nil
 local originalLighting = {}
 local fullbrightApplied = false
 local safeCameraState = nil
@@ -742,10 +751,11 @@ end
 local function buildDiagnosticReport()
     local lines = {
         "LAST STOP ALIEN FARMER - DIAGNOSTICS",
-        "Version: HF9.7-SAFER-TORSO-HOVER-TOOL-RETRY-ANTIAFK",
+        "Version: HF9.9-CENTERED-UNDERBODY-TETHER-NEAREST-CONTACT-TARGET-ROTATION-HEALTH-GUARD-ANTIAFK",
         "GameId: " .. tostring(game.GameId) .. " | PlaceId: " .. tostring(game.PlaceId),
         "Status: " .. tostring(currentStatus) .. " | Running=" .. tostring(running) .. " | Paused=" .. tostring(paused),
         "Current target: " .. tostring(currentTarget) .. " | Equipped tool: " .. tostring(equippedToolName),
+        "Underbody tether: Active=" .. tostring(hoverTetherConnection ~= nil) .. " | Target=" .. tostring(hoverTetherEntry and hoverTetherEntry.model and hoverTetherEntry.model.Name or "None") .. " | Vertical=" .. tostring(CONFIG.HOVER_BELOW) .. " | HorizontalOffset=" .. tostring(CONFIG.TORSO_HORIZONTAL_STANDOFF),
         "Player health: " .. tostring(playerHealthCurrent) .. "/" .. tostring(playerHealthMax) .. " | Death events=" .. tostring(playerDeathEvents),
         "Tool cycle: EquipAttempts=" .. tostring(toolEquipAttempts) .. " | EquippedEvents=" .. tostring(toolEquippedEvents) .. " | UnequippedEvents=" .. tostring(toolUnequippedEvents),
         "Lap: " .. tostring(lap) .. " | ScanZ: " .. tostring(scanZ),
@@ -760,6 +770,8 @@ local function buildDiagnosticReport()
         "ReplicaController: " .. tostring(replicaControllerPath) .. " | GUID-tagged replicas indexed=" .. tostring(replicaRegistryIndexed),
         "Manual input: MouseDown=" .. tostring(manualMouseDownCount) .. " | MouseUp=" .. tostring(manualMouseUpCount) .. " | Touch=" .. tostring(manualTouchCount) .. " | Tool.Activated=" .. tostring(nativeToolActivations) .. " | Last=" .. tostring(lastManualInputKind),
         "Survivor deferral: disabled | Tracked cluster: full-clear",
+        "Combat recovery: Target stall=" .. tostring(CONFIG.TARGET_STALL_TIMEOUT) .. "s | Retry cooldown=" .. tostring(CONFIG.TARGET_RETRY_COOLDOWN) .. "s | Contact range=" .. tostring(getMeleeHitRange()) .. " | Collateral guard=" .. tostring(CONFIG.COLLATERAL_GUARD_RADIUS),
+        "Low-health safety stop: " .. tostring(CONFIG.LOW_HEALTH_STOP_PERCENT) .. "% (restores player control; no bus teleport)",
         "Movement observer: Samples=" .. tostring(movementSamples) .. " | Unexpected displacement candidates=" .. tostring(movementAnomalyCount) .. " | Fall candidates=" .. tostring(fallWarningCount),
         "Camera follows the character during physical under-alien hover; camera/root offset alone is informational and is not classified as a movement error.",
         "Token attempts: " .. tostring(tokenAttempts) .. " | Confirmed pickups: " .. tostring(tokenPickupsConfirmed),
@@ -895,7 +907,7 @@ if type(identifyexecutor) == "function" then
         executorName = tostring(value)
     end
 end
-recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.7 | Base=HF9.5 full-clear/token/anti-AFK systems | CombatProfile=HF9.0 close torso-relative hover, 10-stud contact, up to 3 alien targets, corrected part hierarchy and collateral guard | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
+recordEvent("SYSTEM", "Diagnostics initialized", "Version=HF9.9 | Base=HF9.8 full-clear/token/anti-AFK systems | CombatProfile=HF9.0 close torso-relative hover, 10-stud contact, up to 3 alien targets, corrected part hierarchy and collateral guard | ReplicaIdentity=live ReplicaController registry GUID match; no fixed ID fallback | Transport=original ReplicaSignal RemoteEvent | Executor=" .. executorName .. " | GameId=" .. tostring(game.GameId) .. " | PlaceId=" .. tostring(game.PlaceId))
 
 pcall(function()
     LogService.MessageOut:Connect(function(message, messageType)
@@ -1910,9 +1922,20 @@ local function getClosestMeleeContact(model, origin, maxDistance)
             end
 
             if (maxDistance == nil or distance <= maxDistance) then
-                if not bestContact
-                    or priority < bestContact.priority
-                    or (priority == bestContact.priority and distance < bestContact.distance) then
+                -- Contact distance is the primary constraint. Prefer a torso only
+                -- when it is nearly as close as the nearest limb; otherwise a
+                -- farther torso can move outside the 10-stud limit during the
+                -- measured Attack -> Hit delay while a nearer leg was usable.
+                local replaceContact = not bestContact
+                if bestContact then
+                    local distanceAdvantage = bestContact.distance - distance
+                    if distanceAdvantage > 0.75 then
+                        replaceContact = true
+                    elseif math.abs(distanceAdvantage) <= 0.75 and priority < bestContact.priority then
+                        replaceContact = true
+                    end
+                end
+                if replaceContact then
                     bestContact = {
                         part = descendant,
                         position = partPosition,
@@ -2144,32 +2167,25 @@ local function moveBelowAlien(entry, hoverBelowOverride)
     local _, playerRoot = getCharacter()
     if not playerRoot then return false end
 
-    local approachVector = Vector3.new(anchorPosition.X - playerRoot.Position.X, 0, anchorPosition.Z - playerRoot.Position.Z)
-    if approachVector.Magnitude < 0.001 then
-        local fallbackLook = entry.root.CFrame.LookVector
-        approachVector = Vector3.new(fallbackLook.X, 0, fallbackLook.Z)
+    -- Keep the root on the torso anchor's exact X/Z. Facing is preserved separately;
+    -- it must never create a lateral standoff from the alien.
+    local facingVector = Vector3.new(playerRoot.CFrame.LookVector.X, 0, playerRoot.CFrame.LookVector.Z)
+    if facingVector.Magnitude < 0.001 then
+        facingVector = Vector3.new(0, 0, -1)
+    else
+        facingVector = facingVector.Unit
     end
-    if approachVector.Magnitude < 0.001 then approachVector = Vector3.new(0, 0, -1) else approachVector = approachVector.Unit end
 
-    -- Measure the hover gap from the torso anchor. The old build measured from
-    -- the lower model root, leaving the torso about 12.2 studs vertically away.
     local hoverBelow = tonumber(hoverBelowOverride) or CONFIG.HOVER_BELOW
-    local hoverPosition = Vector3.new(
-        anchorPosition.X - approachVector.X * CONFIG.TORSO_HORIZONTAL_STANDOFF,
-        anchorPosition.Y - hoverBelow,
-        anchorPosition.Z - approachVector.Z * CONFIG.TORSO_HORIZONTAL_STANDOFF
-    )
-    local horizontalLookAt = Vector3.new(anchorPosition.X, hoverPosition.Y, anchorPosition.Z)
+    local hoverPosition = Vector3.new(anchorPosition.X, anchorPosition.Y - hoverBelow, anchorPosition.Z)
+    local horizontalLookAt = hoverPosition + facingVector
     currentTarget = entry.variant .. " / " .. entry.model.Name
 
     local beforeDistance = (playerRoot.Position - anchorPosition).Magnitude
     local requestedDelta = (playerRoot.Position - hoverPosition).Magnitude
     local moved = true
     if requestedDelta > CONFIG.HOVER_REPOSITION_THRESHOLD then
-        local moveReason = hoverBelow > CONFIG.HOVER_BELOW
-            and "TOOL_COOLDOWN_SAFE_HOVER"
-            or "SAFE_HOVER_CLOSE_TORSO_APPROACH"
-        moved = moveCharacter(hoverPosition, horizontalLookAt, moveReason)
+        moved = moveCharacter(hoverPosition, horizontalLookAt, "SAFE_HOVER_CENTERED_UNDERBODY")
     end
 
     local _, actualRoot = getCharacter()
@@ -2178,23 +2194,147 @@ local function moveBelowAlien(entry, hoverBelowOverride)
     local actualRootOffset = actualPosition.Y - targetRootPosition.Y
     local actualRootDistance = (actualPosition - targetRootPosition).Magnitude
     local actualAnchorDistance = (actualPosition - anchorPosition).Magnitude
+    local horizontalError = Vector3.new(actualPosition.X - anchorPosition.X, 0, actualPosition.Z - anchorPosition.Z).Magnitude
     local camera = Workspace.CurrentCamera
     local cameraType = camera and tostring(camera.CameraType) or "unknown"
 
-    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Torso-relative hover maintained", string.format(
-        "Variant=%s | Model=%s | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualTorsoVerticalOffset=%.2f | ActualRootVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalStandoff=%.2f | ApproachDirection=(%.3f, %.3f) | HoverBelowTorso=%.2f | PreviousAnchorDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
+    recordThrottled("close-hover-position:" .. tostring(entry.model.Name), 0.35, "TARGET", "Centered underbody hover maintained", string.format(
+        "Variant=%s | Model=%s | TorsoAnchor=%s | AnchorPosition=(%.2f, %.2f, %.2f) | RequestedPlayerRoot=(%.2f, %.2f, %.2f) | ActualPlayerRoot=(%.2f, %.2f, %.2f) | ActualTorsoVerticalOffset=%.2f | ActualRootVerticalOffset=%.2f | ActualRootDistance=%.2f | ActualTorsoAnchorDistance=%.2f | HorizontalOffset=%.2f | HorizontalError=%.3f | HoverBelowTorso=%.2f | PreviousAnchorDistance=%.2f | RepositionDelta=%.2f | CharacterMove=%s | CameraType=%s",
         entry.variant, entry.model.Name, torsoAnchor and torsoAnchor:GetFullName() or "root-fallback",
         anchorPosition.X, anchorPosition.Y, anchorPosition.Z,
         hoverPosition.X, hoverPosition.Y, hoverPosition.Z,
         actualPosition.X, actualPosition.Y, actualPosition.Z,
         actualTorsoOffset, actualRootOffset, actualRootDistance, actualAnchorDistance,
-        CONFIG.TORSO_HORIZONTAL_STANDOFF, approachVector.X, approachVector.Z,
+        CONFIG.TORSO_HORIZONTAL_STANDOFF, horizontalError,
         hoverBelow, beforeDistance, requestedDelta, tostring(moved), cameraType
     ))
     return moved
 end
 
+local function stopHoverTether(reason)
+    local wasActive = hoverTetherConnection ~= nil or hoverTetherEntry ~= nil
+    if hoverTetherConnection then
+        pcall(function() hoverTetherConnection:Disconnect() end)
+    end
+    hoverTetherConnection = nil
+    hoverTetherEntry = nil
+    hoverTetherAnchor = nil
+    if wasActive then
+        recordEvent("MOVEMENT", "Centered underbody tether detached", "Reason=" .. tostring(reason or "unspecified"))
+    end
+end
+
+local function startHoverTether(entry)
+    if not entry or not entry.model or entry.model.Parent ~= ENTITY_CONTAINER
+        or not entry.root or not entry.root.Parent then
+        return false
+    end
+
+    local previousModel = hoverTetherEntry and hoverTetherEntry.model or nil
+    hoverTetherEntry = entry
+    if previousModel ~= entry.model or not hoverTetherAnchor or not hoverTetherAnchor.Parent then
+        hoverTetherAnchor = getPreferredTorsoAnchor(entry.model)
+    end
+
+    if hoverTetherConnection then
+        if previousModel ~= entry.model then
+            recordEvent("MOVEMENT", "Underbody tether target changed",
+                "Previous=" .. tostring(previousModel and previousModel.Name or "none")
+                    .. " | Current=" .. tostring(entry.model.Name)
+                    .. " | HorizontalOffset=0 | VerticalOffset=" .. tostring(CONFIG.HOVER_BELOW))
+        end
+        return true
+    end
+
+    hoverTetherConnection = RunService.Heartbeat:Connect(function()
+        if not running or paused then
+            stopHoverTether(not running and "FARMER_STOPPED" or "PAUSED")
+            return
+        end
+
+        local ok, tetherError = pcall(function()
+            local targetEntry = hoverTetherEntry
+            if not targetEntry or not targetEntry.model or targetEntry.model.Parent ~= ENTITY_CONTAINER then
+                stopHoverTether("TARGET_REMOVED")
+                return
+            end
+
+            local targetRoot = targetEntry.root
+            if not targetRoot or not targetRoot.Parent then
+                targetRoot = getModelRoot(targetEntry.model)
+                targetEntry.root = targetRoot
+            end
+            if not targetRoot or not targetRoot.Parent then
+                stopHoverTether("TARGET_ROOT_MISSING")
+                return
+            end
+
+            if not hoverTetherAnchor or not hoverTetherAnchor.Parent
+                or not hoverTetherAnchor:IsDescendantOf(targetEntry.model) then
+                hoverTetherAnchor = getPreferredTorsoAnchor(targetEntry.model)
+            end
+            local anchor = hoverTetherAnchor or targetRoot
+            local anchorPosition = anchor.Position
+            local desiredPosition = Vector3.new(
+                anchorPosition.X,
+                anchorPosition.Y - CONFIG.HOVER_BELOW,
+                anchorPosition.Z
+            )
+
+            if not activeRoot or not activeRoot.Parent then
+                if not setupFlight() then return end
+            end
+            local root = activeRoot
+            if not root or not root.Parent then return end
+
+            local drift = (root.Position - desiredPosition).Magnitude
+            if drift > CONFIG.HOVER_TETHER_DEADBAND then
+                local desiredCFrame = CFrame.new(desiredPosition) * root.CFrame.Rotation
+                expectedCharacterMove = {
+                    position = desiredPosition,
+                    at = os.clock(),
+                    reason = "ALIEN_UNDERBODY_TETHER",
+                }
+                root.CFrame = desiredCFrame
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                if flyVelocity and flyVelocity.Parent then
+                    flyVelocity.Velocity = Vector3.zero
+                end
+                if flyGyro and flyGyro.Parent then
+                    flyGyro.CFrame = desiredCFrame
+                end
+            end
+
+            local actualOffset = root.Position - anchorPosition
+            local horizontalError = Vector3.new(actualOffset.X, 0, actualOffset.Z).Magnitude
+            recordThrottled(
+                "underbody-tether:" .. tostring(targetEntry.model.Name),
+                0.75,
+                "MOVEMENT",
+                "Centered underbody tether active",
+                string.format(
+                    "Target=%s/%s | TorsoAnchor=%s | VerticalOffset=%.2f | HorizontalError=%.3f | DesiredVerticalOffset=%.2f | HeartbeatFollow=true | DriftCorrected=%s",
+                    tostring(targetEntry.variant), tostring(targetEntry.model.Name),
+                    anchor:GetFullName(), actualOffset.Y, horizontalError,
+                    -CONFIG.HOVER_BELOW, tostring(drift > CONFIG.HOVER_TETHER_DEADBAND)
+                )
+            )
+        end)
+        if not ok then
+            recordThrottled("underbody-tether-error", 1.0, "ERROR", "Underbody tether update failed", diagTraceback(tetherError))
+        end
+    end)
+
+    recordEvent("MOVEMENT", "Centered underbody tether attached",
+        "Target=" .. tostring(entry.variant) .. "/" .. tostring(entry.model.Name)
+            .. " | HorizontalOffset=0 | VerticalOffset=" .. tostring(CONFIG.HOVER_BELOW)
+            .. " | Update=RunService.Heartbeat | ActiveDuringToolCooldown=true")
+    return true
+end
+
 local function restoreMovement()
+    stopHoverTether("MOVEMENT_RESTORE")
     restoreSafeCamera()
     if activeHumanoid or flyVelocity or flyGyro then
         recordEvent("FLIGHT", "Restoring character movement and collision state", "Emergency stop / cleanup requested")
@@ -2753,6 +2893,8 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
     local lastKnownAlienDeaths = serverAlienDeathEvents
     local lastKnownKillCount = alienKills
     local lockedTargetModel = nil
+    local targetRetryUntil = {}
+    local targetLastProgressAt = os.clock()
     setStatus("Engaging alien cluster; scan held until clear")
 
     while running and not paused do
@@ -2762,7 +2904,8 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
         end
 
         local nearest = nil
-        if lockedTargetModel then
+        local selectionNow = os.clock()
+        if lockedTargetModel and (targetRetryUntil[lockedTargetModel] or 0) <= selectionNow then
             for _, entry in ipairs(entries) do
                 if entry.model == lockedTargetModel then
                     nearest = entry
@@ -2771,8 +2914,40 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
             end
         end
         if not nearest then
-            nearest = getNearestEntry(entries)
-            lockedTargetModel = nearest and nearest.model or nil
+            local _, playerRoot = getCharacter()
+            local bestDistance = math.huge
+            if playerRoot then
+                for _, entry in ipairs(entries) do
+                    local retryUntil = targetRetryUntil[entry.model] or 0
+                    if retryUntil <= selectionNow and entry.root and entry.root.Parent then
+                        local distance = (entry.root.Position - playerRoot.Position).Magnitude
+                        if distance < bestDistance then
+                            bestDistance = distance
+                            nearest = entry
+                        end
+                    end
+                end
+            end
+            if not nearest then
+                local earliestRetry = math.huge
+                for _, entry in ipairs(entries) do
+                    local retryUntil = targetRetryUntil[entry.model] or 0
+                    if retryUntil > selectionNow and retryUntil < earliestRetry then
+                        earliestRetry = retryUntil
+                    end
+                end
+                if earliestRetry < math.huge then
+                    recordThrottled("cluster-targets-cooling", 1.5, "TARGET",
+                        "All remaining aliens are temporarily on target-retry cooldown",
+                        "ScanAdvanceBlocked=true | WaitingForNextRetry=" .. string.format("%.2f", math.max(0, earliestRetry - selectionNow)) .. "s")
+                    task.wait(math.min(0.25, math.max(0.05, earliestRetry - selectionNow)))
+                    lockedTargetModel = nil
+                    continue
+                end
+                break
+            end
+            lockedTargetModel = nearest.model
+            targetLastProgressAt = os.clock()
         end
         if not nearest then
             break
@@ -2781,13 +2956,15 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
         recordThrottled("target-selection", 0.75, "TARGET", "Alien target locked",
             "Variant=" .. nearest.variant .. " | Model=" .. nearest.model.Name
                 .. " | ClusterTargets=" .. tostring(#entries) .. " | TargetLockUntilDeathOrRemoval=true | RemovalDoesNotClearCluster")
-        -- Do not keep the player at attack distance while the game has the shovel unequipped.
-        -- Equip is debounced and verified quickly; when unavailable, hold farther below the torso.
+        -- Attach to the exact torso X/Z before tool checks. Heartbeat keeps the
+        -- root centered under a moving alien through Attack -> Hit delay and cooldown.
+        startHoverTether(nearest)
+        moveBelowAlien(nearest, CONFIG.HOVER_BELOW)
         local toolReady = ensureToolEquipped()
-        if toolReady then
-            moveBelowAlien(nearest, CONFIG.HOVER_BELOW)
-        else
-            moveBelowAlien(nearest, CONFIG.COOLDOWN_HOVER_BELOW)
+        if not toolReady then
+            recordThrottled("tool-cooldown-hold:" .. tostring(nearest.model.Name), 0.75,
+                "WEAPON", "Centered underbody tether held during shovel re-equip delay",
+                "Heartbeat follow remains active | HorizontalOffset=0 | ScanAdvanceBlocked=true")
         end
         local targetRecordBefore = monitoredAliens[nearest.model]
         local targetHitCountBefore = targetRecordBefore and (targetRecordBefore.serverHitCount or 0) or 0
@@ -2804,12 +2981,34 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
             or (targetRecordAfter and targetRecordAfter.serverDead == true)
             or nearest.model.Parent ~= ENTITY_CONTAINER
         if targetResolved then
+            if hoverTetherEntry and hoverTetherEntry.model == nearest.model then
+                stopHoverTether("TARGET_RESOLVED")
+            end
             recordEvent("TARGET", "Locked alien resolved; selecting next cluster member",
                 "Variant=" .. tostring(nearest.variant) .. " | Model=" .. tostring(nearest.model.Name)
                     .. " | ServerDead=" .. tostring(serverDeadAlienModels[nearest.model] == true
                         or (targetRecordAfter and targetRecordAfter.serverDead == true))
                     .. " | Removed=" .. tostring(nearest.model.Parent ~= ENTITY_CONTAINER))
+            targetRetryUntil[nearest.model] = nil
             lockedTargetModel = nil
+            targetLastProgressAt = os.clock()
+            lastProgressTime = os.clock()
+        end
+
+        if targetHitCountAfter > targetHitCountBefore then
+            targetLastProgressAt = os.clock()
+        end
+
+        if not targetResolved and (os.clock() - targetLastProgressAt) >= CONFIG.TARGET_STALL_TIMEOUT then
+            local retryUntil = os.clock() + CONFIG.TARGET_RETRY_COOLDOWN
+            targetRetryUntil[nearest.model] = retryUntil
+            recordEvent("TARGET", "Target rotated after no server-confirmed hit",
+                "Target=" .. tostring(nearest.variant) .. "/" .. tostring(nearest.model.Name)
+                    .. " | NoConfirmedHitFor=" .. string.format("%.2f", os.clock() - targetLastProgressAt)
+                    .. "s | RetryAfter=" .. string.format("%.2f", CONFIG.TARGET_RETRY_COOLDOWN)
+                    .. "s | OtherTrackedAliensRemainEligible=true | ScanAdvanceBlocked=true")
+            lockedTargetModel = nil
+            targetLastProgressAt = os.clock()
             lastProgressTime = os.clock()
         end
 
@@ -2835,6 +3034,7 @@ local function engageAliens(seedEntries, clusterPosition, trackedMembers)
         task.wait(math.max(0, CONFIG.ATTACK_INTERVAL - CONFIG.MELEE_HIT_DELAY))
     end
 
+    stopHoverTether("ENGAGEMENT_PASS_ENDED")
     local remaining = getTrackedClusterEntries(clusterCenter, CONFIG.SCAN_DETECT_RADIUS, trackedMembers)
     local allTrackedMembersDeathConfirmed = true
     local trackedMemberCount = 0
@@ -2882,6 +3082,7 @@ local function getCurrentScanPosition()
 end
 
 local function advanceScan()
+    stopHoverTether("SCAN_ADVANCE")
     local oldZ = scanZ
     local oldLap = lap
     scanAdvanceCount = scanAdvanceCount + 1
@@ -2978,6 +3179,7 @@ local function mainLoop()
             pendingClusterNoProgressPasses = 0
             local nextTarget = getNearestEntry(stillPending or {})
             if nextTarget then
+                startHoverTether(nextTarget)
                 moveBelowAlien(nextTarget)
                 recordEvent("TARGET", "Cluster recovery re-approach completed",
                     "Target=" .. tostring(nextTarget.variant) .. "/" .. tostring(nextTarget.model.Name)
@@ -3373,6 +3575,17 @@ local function monitorCharacter(character)
             recordThrottled("health-heal", 0.5, "PLAYER", "Player health increased", string.format("Health=%.1f->%.1f", previousHealth, newHealth))
         end
         previousHealth = newHealth
+        local lowHealthThreshold = humanoid.MaxHealth * (CONFIG.LOW_HEALTH_STOP_PERCENT / 100)
+        if running and not lowHealthStopTriggered and humanoid.MaxHealth > 0 and newHealth <= lowHealthThreshold then
+            lowHealthStopTriggered = true
+            recordEvent("PLAYER", "Low-health safety threshold reached",
+                string.format("Health=%.1f/%.1f | Threshold=%.0f%% | Farming will stop and restore player control", newHealth, humanoid.MaxHealth, CONFIG.LOW_HEALTH_STOP_PERCENT))
+            task.defer(function()
+                if stopFarm and running then
+                    stopFarm("LOW_HEALTH")
+                end
+            end)
+        end
     end)
     humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
         playerHealthMax = humanoid.MaxHealth
@@ -3800,13 +4013,17 @@ local function exportDiagnostics()
     local jsonPayload = ""
     local jsonOk, jsonResult = pcall(function()
         return HttpService:JSONEncode({
-            version = "HF9.7-SAFER-TORSO-HOVER-TOOL-RETRY-ANTIAFK",
+            version = "HF9.9-CENTERED-UNDERBODY-TETHER-NEAREST-CONTACT-TARGET-ROTATION-HEALTH-GUARD-ANTIAFK",
             scanAdvanceCount = scanAdvanceCount,
             deferredAlienGuidCount = deferredAlienGuidCount,
             gameId = game.GameId,
             placeId = game.PlaceId,
             status = currentStatus,
             alienKills = alienKills,
+            hoverTetherActive = hoverTetherConnection ~= nil,
+            hoverTetherTarget = hoverTetherEntry and hoverTetherEntry.model and hoverTetherEntry.model.Name or "None",
+            hoverBelowTorso = CONFIG.HOVER_BELOW,
+            hoverHorizontalOffset = CONFIG.TORSO_HORIZONTAL_STANDOFF,
             serverDamageEvents = serverDamageEvents,
             serverOnDiedEvents = serverOnDiedEvents,
             serverMeleeEffects = serverMeleeEffects,
@@ -3909,8 +4126,14 @@ pauseButton.Activated:Connect(function()
     refreshGui()
 end)
 
-local function stopFarm()
-    recordEvent("SYSTEM", "Stop requested by user", "Emergency stop button activated")
+stopFarm = function(reason)
+    local lowHealthStop = reason == "LOW_HEALTH"
+    if lowHealthStop then
+        recordEvent("SYSTEM", "Automatic low-health emergency stop",
+            "Health threshold=" .. tostring(CONFIG.LOW_HEALTH_STOP_PERCENT) .. "% | Farming stopped; movement/collision state restored | No unverified bus teleport attempted")
+    else
+        recordEvent("SYSTEM", "Stop requested by user", "Emergency stop button activated")
+    end
     running = false
     paused = false
     stopAntiAfk()
@@ -3920,11 +4143,13 @@ local function stopFarm()
     serverMonitorConnections = {}
     restoreMovement()
     restoreFullbright()
-    setStatus("Stopped by user")
+    setStatus(lowHealthStop and "Emergency stopped at low health; escape/heal before restarting" or "Stopped by user")
     refreshGui()
 end
 
-stopButton.Activated:Connect(stopFarm)
+stopButton.Activated:Connect(function()
+    if stopFarm then stopFarm("USER") end
+end)
 
 diagButton.Activated:Connect(function()
     diagPanel.Visible = not diagPanel.Visible
@@ -4010,6 +4235,19 @@ local function startFarm()
     if running then
         return
     end
+    local _, _, startHumanoid = getCharacter()
+    if startHumanoid and startHumanoid.MaxHealth > 0 then
+        local startHealthPercent = (startHumanoid.Health / startHumanoid.MaxHealth) * 100
+        if startHealthPercent <= CONFIG.LOW_HEALTH_STOP_PERCENT then
+            lowHealthStopTriggered = true
+            recordEvent("PLAYER", "Automatic start blocked by low-health safety threshold",
+                string.format("Health=%.1f/%.1f | Current=%.1f%% | RequiredAbove=%.0f%%", startHumanoid.Health, startHumanoid.MaxHealth, startHealthPercent, CONFIG.LOW_HEALTH_STOP_PERCENT))
+            setStatus("Start blocked: heal above " .. tostring(CONFIG.LOW_HEALTH_STOP_PERCENT) .. "% health first")
+            refreshGui()
+            return
+        end
+    end
+    lowHealthStopTriggered = false
     running = true
     paused = false
     startAntiAfk()
@@ -4042,6 +4280,6 @@ task.delay(2, function()
     end
 end)
 
-recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target allowlist=AlienType1/2/3 | Zombie/Parasite marker exclusion + 10-stud non-alien collateral guard | MeleeContactRange=10 (hard ceiling 80) | ClusterPolicy=UNLIMITED; no survivor deferral | TokenCollection=death-position centered with retries | AntiAFK=" .. tostring(antiAfkAvailable) .. " | AttackDirection=nearest valid alien contact | Diagnostics=HF9.7 | Hooks=none")
+recordEvent("SYSTEM", "Script initialization complete", "Automatic start scheduled | Target allowlist=AlienType1/2/3 | Zombie/Parasite marker exclusion + 10-stud non-alien collateral guard | MeleeContactRange=10 (hard ceiling 80) | TargetRotation=" .. tostring(CONFIG.TARGET_STALL_TIMEOUT) .. "s stall / " .. tostring(CONFIG.TARGET_RETRY_COOLDOWN) .. "s retry | LowHealthStop=" .. tostring(CONFIG.LOW_HEALTH_STOP_PERCENT) .. "% | ClusterPolicy=UNLIMITED; no survivor deferral | TokenCollection=death-position centered with retries | AntiAFK=" .. tostring(antiAfkAvailable) .. " | AttackDirection=nearest valid alien contact | Diagnostics=HF9.9 | UnderbodyTether=Heartbeat, 6.5 below torso, zero lateral offset | Hooks=none")
 refreshDiagPanel()
-log("Loaded HF9.7. Automatic start scheduled. Close torso-relative combat, 10-stud contact, 3-target sweeps, full-cluster clearing, death-position token collection/retries, and anti-AFK enabled.")
+log("Loaded HF9.9. Automatic start scheduled. Continuous centered underbody tether (6.5 below torso, zero lateral offset), nearest valid contact selection, target rotation on no confirmed hits, 35% low-health stop, 10-stud collateral guard, full-cluster clearing, death-position token collection/retries, and anti-AFK enabled.")
