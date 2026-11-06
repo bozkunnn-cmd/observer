@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + HERB COLLECTION + AUTO BREW
-    Version: 0.5
+    Version: 0.6
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -52,7 +52,7 @@ if type(Env.__CUAutoCultivationStop) == "function" then
     pcall(Env.__CUAutoCultivationStop, "replaced")
 end
 if type(Env.__CUAutoBreakthroughStop) == "function" then
-    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.4")
+    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.6")
 end
 
 local running = true
@@ -63,7 +63,14 @@ local autoHerbsEnabled = false
 local autoBrewEnabled = false
 local autoBrewBusy = false
 local autoBrewTaskRunning = false
-local brewRecipeMode = "AUTO" -- AUTO, QiSpeed, BodySpeed, Damage, HP
+-- Multiple pill recipes can be queued. Qi + Body are enabled by default.
+local brewRecipeSelection = {
+    QiSpeed = true,
+    BodySpeed = true,
+    Damage = false,
+    HP = false,
+}
+local brewRecipeCursor = 1
 local cauldronState = nil
 local cauldronStartResult = nil
 local cauldronStartZone = nil
@@ -134,7 +141,10 @@ local herbButton = nil
 local herbInfoLabel = nil
 local brewButton = nil
 local brewRecipeButton = nil
+local brewRecipePicker = nil
+local brewRecipeToggleButtons = {}
 local pauseButton = nil
+local updateModeButtons = nil
 
 local COLORS = {
     bg = Color3.fromRGB(17, 20, 28),
@@ -211,7 +221,7 @@ local BREW_RECIPES = {
         },
     },
 }
-local BREW_RECIPE_CYCLE = {"AUTO", "QiSpeed", "BodySpeed", "Damage", "HP"}
+local BREW_RECIPE_ORDER = {"QiSpeed", "BodySpeed", "Damage", "HP"}
 local BREW_AGE_ORDER = {1000, 100, 10, 1}
 
 local function addConnection(signal, callback)
@@ -288,7 +298,12 @@ Env.__CUAutoCultivationState = {
             autoHerbsEnabled = autoHerbsEnabled,
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
-            brewRecipeMode = brewRecipeMode,
+            selectedBrewRecipes = {
+                QiSpeed = brewRecipeSelection.QiSpeed,
+                BodySpeed = brewRecipeSelection.BodySpeed,
+                Damage = brewRecipeSelection.Damage,
+                HP = brewRecipeSelection.HP,
+            },
             herbCollectorBusy = herbCollectorBusy,
             herbsCollected = herbCollectedCount,
             herbsFailed = herbFailedCount,
@@ -1579,20 +1594,26 @@ local function getCauldronUi()
     return cauldronGui, cauldronPanel, cauldronPanel:FindFirstChild("Body")
 end
 
-local function getBrewRecipeKey()
-    if brewRecipeMode ~= "AUTO" then
-        return brewRecipeMode
+local function getSelectedBrewRecipeKeys()
+    local selected = {}
+    local count = #BREW_RECIPE_ORDER
+    for offset = 0, count - 1 do
+        local index = ((brewRecipeCursor - 1 + offset) % count) + 1
+        local key = BREW_RECIPE_ORDER[index]
+        if brewRecipeSelection[key] then
+            table.insert(selected, key)
+        end
     end
-    local mode = selectedAutoMode
-    if not mode then
-        mode = select(1, getActiveMode())
+    return selected
+end
+
+local function advanceBrewRecipeCursor(recipeKey)
+    for index, key in ipairs(BREW_RECIPE_ORDER) do
+        if key == recipeKey then
+            brewRecipeCursor = (index % #BREW_RECIPE_ORDER) + 1
+            return
+        end
     end
-    if mode == "Qi" then
-        return "QiSpeed"
-    elseif mode == "Body" then
-        return "BodySpeed"
-    end
-    return nil
 end
 
 local function brewWaitFor(predicate, timeout)
@@ -1812,6 +1833,35 @@ local function fillBrewSlots(panel, body, recipe)
     return true, planText
 end
 
+local function fillNextSelectedBrewRecipe(panel, body)
+    local keys = getSelectedBrewRecipeKeys()
+    if #keys == 0 then
+        return nil, "No pill recipes selected. Open PILLS and select at least one recipe."
+    end
+
+    local missing = {}
+    for _, key in ipairs(keys) do
+        local recipe = BREW_RECIPES[key]
+        if recipe then
+            local filled, result = fillBrewSlots(panel, body, recipe)
+            if filled then
+                return key, result
+            end
+            local reason = tostring(result or "Unknown recipe error")
+            if string.find(reason, "Not enough ", 1, true) then
+                table.insert(missing, reason)
+            else
+                return nil, reason
+            end
+        end
+    end
+
+    if #missing > 0 then
+        return nil, "Waiting for ingredients for selected pills. " .. table.concat(missing, " | ")
+    end
+    return nil, "No selected pill recipe is currently available."
+end
+
 local function getStokeGeometry(stoke)
     local bar = stoke and stoke:FindFirstChild("HeatBar", true)
     local flame = bar and bar:FindFirstChild("Flame", true)
@@ -1907,27 +1957,58 @@ local function processAutoStoke(stoke)
     return true
 end
 
-local function clickBrewDismiss(body, expectedValid)
-    local brew = body and body:FindFirstChild("Brew")
-    if not brew or not brew:IsA("GuiButton") or brew.Text ~= "Dismiss" or not brew.Visible then
-        return false, "Dismiss button is not ready."
+local function cauldronUiReturnedToIdle(body)
+    local status = body and body:FindFirstChild("Status")
+    local slots = body and body:FindFirstChild("Slots")
+    if not status or not slots or status.Text ~= "Choose 3 herbs to brew a pill." then
+        return false
     end
-    local sent, backend = clickGuiButton(brew)
+    for index = 1, 3 do
+        local slot = slots:FindFirstChild("Slot" .. tostring(index))
+        local nameLabel = slot and slot:FindFirstChild("HerbName")
+        if not nameLabel or nameLabel.Text ~= "Add herb" then
+            return false
+        end
+    end
+    return true
+end
+
+local function clickBrewClaim(body, expectedValid)
+    local claimButton = body and body:FindFirstChild("Brew")
+    if not claimButton or not claimButton:IsA("GuiButton")
+        or claimButton.Text ~= "Claim" or not claimButton.Visible then
+        return false, "The cauldron's actual Claim button is not ready."
+    end
+    if expectedValid ~= true then
+        return false, "The server has not validated this brew as a valid pill; Claim was not clicked."
+    end
+
+    local inventoryRevisionBefore = cauldronPillInventoryRevision
+    cauldronClaimResult = nil
+    local sent, backend = clickGuiButton(claimButton)
     if not sent then
-        return false, "Could not dismiss brew result: " .. tostring(backend)
+        return false, "Could not activate the actual Claim button: " .. tostring(backend)
     end
-    local reset = brewWaitFor(function()
-        local status = body:FindFirstChild("Status")
-        local slots = body:FindFirstChild("Slots")
-        local first = slots and slots:FindFirstChild("Slot1")
-        local firstName = first and first:FindFirstChild("HerbName")
-        return status and status.Text == "Choose 3 herbs to brew a pill."
-            and firstName and firstName.Text == "Add herb"
-    end, 3)
-    if not reset then
-        return false, "Cauldron did not return to idle after Dismiss."
+
+    local confirmed = brewWaitFor(function()
+        if cauldronClaimResult and cauldronClaimResult.success == false then
+            return true
+        end
+        local serverConfirmed = cauldronClaimResult and cauldronClaimResult.success == true
+        local inventoryConfirmed = cauldronPillInventoryRevision > inventoryRevisionBefore
+        return (serverConfirmed or inventoryConfirmed) and cauldronUiReturnedToIdle(body)
+    end, 5)
+
+    if not confirmed then
+        return false, "Claim was clicked, but server/inventory confirmation and empty slots were not both observed. Auto Brew will stop to prevent duplicate claims."
     end
-    return true, expectedValid and "claimed" or "invalid result dismissed"
+    if cauldronClaimResult and cauldronClaimResult.success == false then
+        return false, "Server rejected the Claim: " .. tostring(cauldronClaimResult.message or "unknown reason")
+    end
+    if not cauldronUiReturnedToIdle(body) then
+        return false, "Claim response arrived, but the cauldron has not returned to its empty-slot state."
+    end
+    return true, "claimed and verified"
 end
 
 local function runAutoBrew()
@@ -1963,25 +2044,21 @@ local function runAutoBrew()
                             if string.find(statusText, "Brewing", 1, true) then
                                 setStatus(statusText .. " | Auto Brew waiting.", COLORS.muted)
                                 task.wait(0.15)
-                            elseif brew and brew:IsA("GuiButton") and brew.Visible and brew.Text == "Dismiss" then
+                            elseif brew and brew:IsA("GuiButton") and brew.Visible and brew.Text == "Claim" then
                                 local record = type(cauldronState) == "table" and cauldronState.record or nil
-                                local valid = type(record) == "table" and record.valid == true
+                                local readyText = statusText
+                                -- The ready-state UI is also authoritative if the script was
+                                -- attached after CauldronStateUpdate had already fired.
+                                local readyFromUi = string.find(readyText, " is ready!", 1, true) ~= nil
+                                local valid = (type(record) == "table" and record.valid == true) or readyFromUi
                                 local tier = type(record) == "table" and tonumber(record.tier) or nil
-                                local pillKey = type(record) == "table" and tostring(record.pillKey or "Pill") or "Pill"
-                                local dismissed, dismissMessage = clickBrewDismiss(body, valid)
-                                if dismissed then
-                                    if valid then
-                                        cauldronLastTier = tier
-                                        setStatus("Claimed " .. pillKey .. (tier and (" | Tier " .. tostring(tier)) or "") .. ". Preparing next batch.", COLORS.success)
-                                    else
-                                        autoBrewEnabled = false
-                                        autoBrewBusy = false
-                                        if brewButton then
-                                            brewButton.Text = "BREW: OFF"
-                                            brewButton.BackgroundColor3 = COLORS.panel2
-                                        end
-                                        setStatus("Game rejected the recipe. Auto Brew stopped to protect remaining herbs.", COLORS.danger)
-                                    end
+                                tier = tier or tonumber(string.match(readyText, "Tier%s+(%d+)"))
+                                local pillKey = type(record) == "table" and tostring(record.pillKey or "Pill") or nil
+                                pillKey = pillKey or string.match(readyText, "^(.-)%s*%(") or "Pill"
+                                local claimed, claimMessage = clickBrewClaim(body, valid)
+                                if claimed then
+                                    cauldronLastTier = tier
+                                    setStatus("Claimed " .. pillKey .. (tier and (" | Tier " .. tostring(tier)) or "") .. ". Inventory and cauldron reset verified; moving to next selected pill.", COLORS.success)
                                     cauldronState = nil
                                     cauldronStartResult = nil
                                     cauldronStartZone = nil
@@ -1990,55 +2067,56 @@ local function runAutoBrew()
                                     cauldronClaimResult = nil
                                     task.wait(0.3)
                                 else
-                                    setStatus(dismissMessage, COLORS.danger)
-                                    task.wait(0.25)
+                                    autoBrewEnabled = false
+                                    autoBrewBusy = false
+                                    updateModeButtons()
+                                    setStatus(claimMessage .. " BREW switched OFF; claim manually if needed.", COLORS.danger)
+                                    task.wait(0.3)
                                 end
+                            elseif brew and brew:IsA("GuiButton") and brew.Visible and brew.Text == "Dismiss" then
+                                autoBrewEnabled = false
+                                autoBrewBusy = false
+                                updateModeButtons()
+                                setStatus("The cauldron returned Dismiss instead of Claim. Auto Brew stopped; no pill was counted as claimed.", COLORS.danger)
+                                task.wait(0.3)
                             elseif brew and brew:IsA("GuiButton") and brew.Visible and brew.Text == "Brew"
                                 and string.find(statusText, "Choose 3 herbs", 1, true) then
-                                local recipeKey = getBrewRecipeKey()
+                                local recipeKey, fillResult = fillNextSelectedBrewRecipe(cauldronPanel, body)
                                 local recipe = recipeKey and BREW_RECIPES[recipeKey] or nil
                                 if not recipe then
-                                    setStatus("PILL: AUTO needs Qi or Body mode selected, or choose a specific pill type.", COLORS.warning)
-                                    task.wait(0.3)
+                                    setStatus(tostring(fillResult), COLORS.warning)
+                                    task.wait(0.7)
                                 else
-                                    local filled, fillResult = fillBrewSlots(cauldronPanel, body, recipe)
-                                    if not filled then
-                                        setStatus(tostring(fillResult), COLORS.warning)
-                                        task.wait(0.45)
+                                    -- Exact recipe and each selected herb age were verified before the irreversible Brew click.
+                                    cauldronState = nil
+                                    cauldronStartResult = nil
+                                    cauldronStartZone = nil
+                                    cauldronStokeResult = nil
+                                    cauldronBrewComplete = nil
+                                    cauldronClaimResult = nil
+                                    local sent, backend = clickGuiButton(brew)
+                                    if not sent then
+                                        setStatus("Brew button activation failed: " .. tostring(backend), COLORS.danger)
+                                        task.wait(0.4)
                                     else
-                                        -- Exact recipe and each selected herb age were verified before this click.
-                                        cauldronState = nil
-                                        cauldronStartResult = nil
-                                        cauldronStartZone = nil
-                                        cauldronStokeResult = nil
-                                        cauldronBrewComplete = nil
-                                        cauldronClaimResult = nil
-                                        local sent, backend = clickGuiButton(brew)
-                                        if not sent then
-                                            setStatus("Brew button activation failed: " .. tostring(backend), COLORS.danger)
-                                            task.wait(0.4)
+                                        setStatus("Started " .. recipe.name .. " using the oldest available herbs. Waiting for game validation.", COLORS.success)
+                                        local gotRecord = brewWaitFor(function()
+                                            return type(cauldronState) == "table" and type(cauldronState.record) == "table"
+                                        end, 3)
+                                        if not gotRecord then
+                                            autoBrewEnabled = false
+                                            autoBrewBusy = false
+                                            updateModeButtons()
+                                            setStatus("No CauldronStateUpdate record received. Auto Brew stopped safely.", COLORS.danger)
+                                        elseif cauldronState.record.valid ~= true then
+                                            setStatus("Game rejected the selected recipe. Waiting for result; no further batch will start.", COLORS.danger)
                                         else
-                                            setStatus("Started " .. recipe.name .. " with oldest available herbs. Waiting for game validation.", COLORS.success)
-                                            local gotRecord = brewWaitFor(function()
-                                                return type(cauldronState) == "table" and type(cauldronState.record) == "table"
-                                            end, 3)
-                                            if not gotRecord then
-                                                autoBrewEnabled = false
-                                                autoBrewBusy = false
-                                                if brewButton then
-                                                    brewButton.Text = "BREW: OFF"
-                                                    brewButton.BackgroundColor3 = COLORS.panel2
-                                                end
-                                                setStatus("No CauldronStateUpdate record received. Auto Brew stopped safely.", COLORS.danger)
-                                            elseif cauldronState.record.valid ~= true then
-                                                setStatus("Game rejected the selected recipe. Waiting for result to finish; no further batch will start.", COLORS.danger)
-                                            else
-                                                local tier = tonumber(cauldronState.record.tier)
-                                                local pillKey = tostring(cauldronState.record.pillKey or recipeKey)
-                                                setStatus("Recipe validated: " .. pillKey .. (tier and (" | Tier " .. tostring(tier)) or "") .. ". Waiting for Stoke and brew completion.", COLORS.success)
-                                            end
-                                            task.wait(0.2)
+                                            advanceBrewRecipeCursor(recipeKey)
+                                            local tier = tonumber(cauldronState.record.tier)
+                                            local pillKey = tostring(cauldronState.record.pillKey or recipeKey)
+                                            setStatus("Recipe validated: " .. pillKey .. (tier and (" | Tier " .. tostring(tier)) or "") .. ". Waiting for Stoke and brew completion.", COLORS.success)
                                         end
+                                        task.wait(0.2)
                                     end
                                 end
                             else
@@ -2055,19 +2133,35 @@ local function runAutoBrew()
     end)
 end
 
-local function cycleBrewRecipeMode()
-    local index = 1
-    for i, value in ipairs(BREW_RECIPE_CYCLE) do
-        if value == brewRecipeMode then
-            index = i
-            break
+local function getBrewRecipeSummary()
+    local selected = {}
+    for _, key in ipairs(BREW_RECIPE_ORDER) do
+        if brewRecipeSelection[key] then
+            table.insert(selected, BREW_RECIPES[key].short)
         end
     end
-    index = index % #BREW_RECIPE_CYCLE + 1
-    brewRecipeMode = BREW_RECIPE_CYCLE[index]
+    if #selected == 0 then
+        return "PILLS: NONE"
+    elseif #selected == 1 then
+        return "PILLS: " .. selected[1]
+    elseif #selected == 2 then
+        return "PILLS: " .. selected[1] .. "+" .. selected[2]
+    end
+    return "PILLS: " .. tostring(#selected) .. " ON"
 end
 
-local function updateModeButtons()
+local function updateBrewRecipePicker()
+    for key, button in pairs(brewRecipeToggleButtons) do
+        local selected = brewRecipeSelection[key] == true
+        local short = BREW_RECIPES[key] and BREW_RECIPES[key].short or key
+        if button then
+            button.Text = (selected and "[ON] " or "[  ] ") .. short
+            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
+        end
+    end
+end
+
+updateModeButtons = function()
     if qiButton then
         qiButton.Text = selectedAutoMode == "Qi" and "QI AUTO: ON" or "QI AUTO: OFF"
         qiButton.BackgroundColor3 = selectedAutoMode == "Qi" and COLORS.qi or COLORS.panel2
@@ -2093,10 +2187,16 @@ local function updateModeButtons()
         brewButton.BackgroundColor3 = autoBrewEnabled and COLORS.success or COLORS.panel2
     end
     if brewRecipeButton then
-        local recipeLabel = brewRecipeMode == "AUTO" and "AUTO"
-            or (BREW_RECIPES[brewRecipeMode] and BREW_RECIPES[brewRecipeMode].short or "AUTO")
-        brewRecipeButton.Text = "PILL: " .. recipeLabel
+        local selectedCount = 0
+        for _, key in ipairs(BREW_RECIPE_ORDER) do
+            if brewRecipeSelection[key] then
+                selectedCount = selectedCount + 1
+            end
+        end
+        brewRecipeButton.Text = getBrewRecipeSummary()
+        brewRecipeButton.BackgroundColor3 = selectedCount > 0 and COLORS.panel2 or COLORS.danger
     end
+    updateBrewRecipePicker()
     if herbInfoLabel then
         herbInfoLabel.Text = string.format("Herbs: %d collected | %s", herbCollectedCount, herbActiveName)
     end
@@ -2104,7 +2204,7 @@ end
 
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoCultivation_v05")
+    local old = parent:FindFirstChild("CUAutoCultivation_v06")
     if old then
         pcall(function()
             old:Destroy()
@@ -2112,7 +2212,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v05",
+        Name = "CUAutoCultivation_v06",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -2137,7 +2237,7 @@ local function createGui()
         Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CU AUTO CULTIVATION  v0.5",
+        Text = "CU AUTO CULTIVATION  v0.6",
         TextColor3 = COLORS.text,
         TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -2239,7 +2339,81 @@ local function createGui()
     }, panel)
 
     brewButton = makeButton("BREW: OFF", 10, 207, 94, COLORS.panel2)
-    brewRecipeButton = makeButton("PILL: AUTO", 110, 207, 112, COLORS.panel2)
+    brewRecipeButton = makeButton("PILLS: QI+BODY", 110, 207, 112, COLORS.panel2)
+
+    brewRecipePicker = make("Frame", {
+        Name = "BrewRecipePicker",
+        Position = UDim2.fromOffset(338, 126),
+        Size = UDim2.fromOffset(190, 174),
+        BackgroundColor3 = COLORS.bg,
+        BackgroundTransparency = 0.02,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 20,
+    }, panel)
+    round(brewRecipePicker, 8)
+    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, brewRecipePicker)
+    make("TextLabel", {
+        Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -18, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT MULTIPLE PILLS",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 21,
+    }, brewRecipePicker)
+
+    local recipePickerRows = {
+        {key = "QiSpeed", y = 27},
+        {key = "BodySpeed", y = 54},
+        {key = "Damage", y = 81},
+        {key = "HP", y = 108},
+    }
+    for _, row in ipairs(recipePickerRows) do
+        local key = row.key
+        local recipe = BREW_RECIPES[key]
+        local toggle = make("TextButton", {
+            Position = UDim2.fromOffset(8, row.y),
+            Size = UDim2.new(1, -16, 0, 23),
+            BackgroundColor3 = COLORS.panel2,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = recipe.short,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+            ZIndex = 21,
+        }, brewRecipePicker)
+        round(toggle, 5)
+        brewRecipeToggleButtons[key] = toggle
+        addConnection(toggle.MouseButton1Click, function()
+            brewRecipeSelection[key] = not brewRecipeSelection[key]
+            updateModeButtons()
+            setStatus(recipe.name .. (brewRecipeSelection[key] and " added to the brew queue." or " removed from the brew queue."), COLORS.success)
+        end)
+    end
+    local doneButton = make("TextButton", {
+        Position = UDim2.fromOffset(8, 137),
+        Size = UDim2.new(1, -16, 0, 25),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "DONE",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 21,
+    }, brewRecipePicker)
+    round(doneButton, 5)
+    addConnection(doneButton.MouseButton1Click, function()
+        brewRecipePicker.Visible = false
+    end)
 
     addConnection(brewButton.MouseButton1Click, function()
         autoBrewEnabled = not autoBrewEnabled
@@ -2253,11 +2427,11 @@ local function createGui()
     end)
 
     addConnection(brewRecipeButton.MouseButton1Click, function()
-        cycleBrewRecipeMode()
+        if brewRecipePicker then
+            brewRecipePicker.Visible = not brewRecipePicker.Visible
+        end
         updateModeButtons()
-        local label = brewRecipeMode == "AUTO" and "current Qi/Body mode"
-            or (BREW_RECIPES[brewRecipeMode] and BREW_RECIPES[brewRecipeMode].name or brewRecipeMode)
-        setStatus("Auto Brew recipe preference: " .. label .. ".", COLORS.success)
+        setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes when ingredients are available.", COLORS.success)
     end)
 
     addConnection(qiButton.MouseButton1Click, function()
@@ -2518,8 +2692,7 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v0.5 loaded.")
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] Auto Breakthrough and Anti-AFK are ON; Auto Herbs and Auto Brew are OFF.")
-print("[CU AutoCultivation] Auto Brew uses exact recipe validation, oldest available herbs first, and the Perfect-band center.")
+print("[CU AutoCultivation] v0.6 loaded. Auto Breakthrough and Anti-AFK are ON; Auto Herbs and Auto Brew are OFF.")
+print("[CU AutoCultivation] Auto Brew supports multiple selected pill recipes, confirmed Claim handling, oldest herbs first, and Perfect-band timing.")
 setStatus("Loaded. Select Qi Auto, Body Auto, HERBS, or BREW to begin.", COLORS.success)
