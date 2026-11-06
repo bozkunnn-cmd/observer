@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 0.9.1
+    Version: 1.0.0
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -26,7 +26,10 @@
         session deltas, and Destiny reroll probability/cost estimates.
       - Auto Silver: targets eligible non-boss cultivators in Workspace.CultivatorCamps
         using normal client-side weapon input; no fabricated reward remotes.
-      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings.
+      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics.
+      - Integrated bounded diagnostics for module actions, server confirmations, errors, and fast-progress rate sampling.
+      - Manual Destiny reroll audit: records displayed odds, click category/batch, balances, and server result updates.
+      - Optional Quick Interact probe for real herb/chest prompts; requires server/prompt-state confirmation and falls back to configured hold duration.
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
@@ -44,6 +47,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -92,6 +96,7 @@ local CHEST = {
     tierOrder = {Celestial = 4, Jade = 3, Bronze = 2, Wooden = 1},
 }
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0}
+local QUICK_INTERACT = {enabled = false, attempts = 0, successes = 0, fallbacks = 0}
 
 -- Currency tracking is passive: values come from player attributes and the
 -- game's inbound UpdateMoney / UpdatePrimordialStones events.
@@ -337,6 +342,166 @@ local function setStatus(message, color)
     end
 end
 
+
+-- Integrated diagnostics: bounded, passive, and limited to this suite's modules.
+-- It observes inbound server confirmations and local action outcomes; it never
+-- fabricates or fires reward, reroll, combat, or progression remotes.
+local DIAG = {
+    enabled = true,
+    events = {},
+    sequence = 0,
+    maxEvents = 1200,
+    errorCount = 0,
+    warningCount = 0,
+    lastRefresh = 0,
+    lastFlush = 0,
+    fileName = "CU_AutoCultivation_Diagnostics_" .. os.date("%Y%m%d_%H%M%S") .. ".jsonl",
+    progressSamples = {},
+    lastZoneByMode = {},
+    lastTrainingState = {},
+    rewardFingerprints = {},
+    progressRates = {
+        Qi = {uiPercentPerSecond = 0, rawPerSecond = 0, zoneMultiplier = nil},
+        Body = {uiPercentPerSecond = 0, rawPerSecond = 0, zoneMultiplier = nil},
+    },
+    rerollWatched = setmetatable({}, {__mode = "k"}),
+}
+
+local function diagClean(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    local kind = typeof(value)
+    if kind == "Instance" then
+        local ok, fullName = pcall(function() return value:GetFullName() end)
+        return {type = "Instance", class = value.ClassName, path = ok and fullName or value.Name}
+    elseif kind == "Vector2" then
+        return {type = "Vector2", x = value.X, y = value.Y}
+    elseif kind == "Vector3" then
+        return {type = "Vector3", x = value.X, y = value.Y, z = value.Z}
+    elseif kind == "Color3" then
+        return {type = "Color3", r = value.R, g = value.G, b = value.B}
+    elseif kind == "CFrame" then
+        return {type = "CFrame", components = {value:GetComponents()}}
+    elseif kind == "EnumItem" then
+        return tostring(value)
+    end
+    if type(value) == "string" then return string.sub(value, 1, 500) end
+    if type(value) == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then return tostring(value) end
+        return value
+    end
+    if type(value) == "boolean" or value == nil then return value end
+    if type(value) == "table" then
+        if depth >= 4 then return "[max-depth]" end
+        if seen[value] then return "[cycle]" end
+        seen[value] = true
+        local out, count = {}, 0
+        for k, v in pairs(value) do
+            count = count + 1
+            if count > 50 then out.truncated = true break end
+            out[tostring(k)] = diagClean(v, depth + 1, seen)
+        end
+        seen[value] = nil
+        return out
+    end
+    return tostring(value)
+end
+
+DIAG.log = function(level, moduleName, eventName, data)
+    if not DIAG.enabled then return end
+    DIAG.sequence = DIAG.sequence + 1
+    local row = {
+        seq = DIAG.sequence,
+        unix_ms = DateTime.now().UnixTimestampMillis,
+        elapsed = math.floor((os.clock() - ECONOMY.startedAt) * 1000) / 1000,
+        level = tostring(level or "INFO"),
+        module = tostring(moduleName or "SYSTEM"),
+        event = tostring(eventName or "event"),
+        data = diagClean(data or {}, 0, {}),
+    }
+    table.insert(DIAG.events, row)
+    if #DIAG.events > DIAG.maxEvents then table.remove(DIAG.events, 1) end
+    if row.level == "ERROR" then DIAG.errorCount = DIAG.errorCount + 1 end
+    if row.level == "WARN" then DIAG.warningCount = DIAG.warningCount + 1 end
+    DIAG.lastEvent = row
+    DIAG.refreshUI(false)
+end
+
+DIAG.refreshUI = function(force)
+    if not UI.diagEventLabel then return end
+    local now = os.clock()
+    if not force and now - DIAG.lastRefresh < 0.45 then return end
+    DIAG.lastRefresh = now
+    local lines = {}
+    local first = math.max(1, #DIAG.events - 11)
+    for i = #DIAG.events, first, -1 do
+        local row = DIAG.events[i]
+        local timeText = os.date("%H:%M:%S", math.floor(row.unix_ms / 1000))
+        local detail = ""
+        if type(row.data) == "table" then
+            detail = tostring(row.data.reason or row.data.result or row.data.status or row.data.target or row.data.prompt or "")
+        end
+        table.insert(lines, string.format("[%s] %s/%s: %s", timeText, row.module, row.event, string.sub(detail, 1, 70)))
+    end
+    if #lines == 0 then table.insert(lines, "No automation events recorded yet.") end
+    UI.diagEventLabel.Text = table.concat(lines, "\n")
+    if UI.diagSummaryLabel then
+        UI.diagSummaryLabel.Text = string.format(
+            "Observer ON | Events %d/%d | Warnings %d | Errors %d | Quick interact %s (%d/%d verified)",
+            #DIAG.events, DIAG.maxEvents, DIAG.warningCount, DIAG.errorCount,
+            QUICK_INTERACT.enabled and "ON" or "OFF", QUICK_INTERACT.successes, QUICK_INTERACT.attempts
+        )
+    end
+    if UI.diagProgressLabel then
+        local q = DIAG.progressRates.Qi
+        local b = DIAG.progressRates.Body
+        UI.diagProgressLabel.Text = string.format(
+            "Qi UI %.3f%%/s | raw qi %.1f/s | zone %.2fx\nBody UI %.3f%%/s | raw EXP %.1f/s | zone %.2fx",
+            q.uiPercentPerSecond or 0, q.rawPerSecond or 0, q.zoneMultiplier or 0,
+            b.uiPercentPerSecond or 0, b.rawPerSecond or 0, b.zoneMultiplier or 0
+        )
+    end
+end
+
+DIAG.export = function()
+    local lines = {}
+    for _, row in ipairs(DIAG.events) do
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(row) end)
+        if ok then table.insert(lines, encoded) end
+    end
+    local content = table.concat(lines, "\n") .. (#lines > 0 and "\n" or "")
+    if type(writefile) == "function" then
+        local ok, err = pcall(writefile, DIAG.fileName, content)
+        if ok then
+            DIAG.log("INFO", "DIAGNOSTICS", "exported", {file = DIAG.fileName, events = #DIAG.events})
+            if UI.diagSummaryLabel then UI.diagSummaryLabel.Text = "Exported " .. tostring(#DIAG.events) .. " events: " .. DIAG.fileName end
+            return true, DIAG.fileName
+        end
+        if type(setclipboard) == "function" then pcall(setclipboard, content) end
+        return false, tostring(err)
+    end
+    if type(setclipboard) == "function" then
+        local ok = pcall(setclipboard, content)
+        return ok, ok and "copied to clipboard" or "clipboard failed"
+    end
+    print("[CU Diagnostics] No writefile/setclipboard API. Recent events:")
+    for _, row in ipairs(DIAG.events) do print(row.seq, row.module, row.event) end
+    return false, "executor has no file or clipboard API"
+end
+
+DIAG.flush = function()
+    if type(writefile) ~= "function" then return false end
+    local now = os.clock()
+    if now - DIAG.lastFlush < 8 then return true end
+    DIAG.lastFlush = now
+    local lines = {}
+    for _, row in ipairs(DIAG.events) do
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(row) end)
+        if ok then table.insert(lines, encoded) end
+    end
+    return pcall(writefile, DIAG.fileName, table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
+end
+
 ECONOMY.formatNumber = function(value)
     value = tonumber(value)
     if not value then return "--" end
@@ -409,6 +574,8 @@ local function stop(reason)
     if not running then
         return
     end
+    DIAG.log("INFO", "SYSTEM", "stop", {reason = tostring(reason or "manual")})
+    DIAG.export()
     running = false
     autoHerbsEnabled = false
     autoBrewEnabled = false
@@ -440,6 +607,11 @@ Env.__CUAutoCultivationState = {
             autoMode = selectedAutoMode,
             breakthroughEnabled = breakthroughEnabled,
             antiAfkEnabled = antiAfkEnabled,
+            quickInteractEnabled = QUICK_INTERACT.enabled,
+            diagnosticsEnabled = DIAG.enabled,
+            diagnosticEvents = #DIAG.events,
+            diagnosticErrors = DIAG.errorCount,
+            diagnosticWarnings = DIAG.warningCount,
             autoHerbsEnabled = autoHerbsEnabled,
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
@@ -764,6 +936,72 @@ local function getModeProgress(mode, frame)
     return percent, signature, realmText
 end
 
+
+DIAG.sampleProgress = function()
+    local mode, frame = getActiveMode()
+    if not mode or not frame then return end
+    local percent, signature = getModeProgress(mode, frame)
+    local state
+    if mode == "Qi" then state = qiState else state = bodyState end
+    if type(state) ~= "table" then return end
+    local rawValue, rawMax, zoneMultiplier
+    if mode == "Qi" then
+        rawValue = tonumber(state.qi)
+        rawMax = tonumber(state.maxQi)
+        zoneMultiplier = tonumber(state.zoneMultiplier)
+    else
+        rawValue = tonumber(state.bodyExp)
+        rawMax = tonumber(state.maxBodyExp)
+        zoneMultiplier = tonumber(state.bodyZoneMultiplier)
+    end
+    local active = mode == "Qi" and state.isMeditating == true or mode == "Body" and state.isPushingUp == true
+    local speedText = nil
+    for _, node in ipairs(frame:GetDescendants()) do
+        if node:IsA("TextLabel") and string.find(string.lower(tostring(node.Text or "")), "speed", 1, true) then
+            speedText = tostring(node.Text)
+            break
+        end
+    end
+    local now = os.clock()
+    local previous = DIAG.progressSamples[mode]
+    local uiRate, rawRate = 0, 0
+    if previous and previous.signature == signature then
+        local dt = math.max(0.05, now - previous.time)
+        if percent ~= nil and previous.percent ~= nil then
+            local delta = percent - previous.percent
+            if delta >= 0 then uiRate = delta / dt end
+        end
+        if rawValue ~= nil and previous.rawValue ~= nil then
+            local delta = rawValue - previous.rawValue
+            if delta >= 0 then rawRate = delta / dt end
+        end
+    elseif previous then
+        DIAG.log("INFO", "PROGRESS", "layer_or_realm_changed", {mode = mode, from = previous.signature, to = signature})
+    end
+    DIAG.progressSamples[mode] = {time = now, percent = percent, rawValue = rawValue, rawMax = rawMax, signature = signature}
+    DIAG.progressRates[mode] = {
+        uiPercentPerSecond = uiRate,
+        rawPerSecond = rawRate,
+        zoneMultiplier = zoneMultiplier,
+    }
+    DIAG.log("INFO", "PROGRESS", "rate_sample", {
+        mode = mode, signature = signature, uiPercent = percent,
+        uiPercentPerSecond = uiRate, rawValue = rawValue, rawMax = rawMax,
+        rawPerSecond = rawRate, active = active,
+        isMeditating = state.isMeditating, isPushingUp = state.isPushingUp,
+        zone = state.currentZone or state.bodyCurrentZone, zoneMultiplier = zoneMultiplier,
+        speedText = speedText, serverSpeedMultiplier = state.speedMultiplier or state.qiSpeedMultiplier or state.bodySpeedMultiplier,
+        stoneMultiplier = state.stoneMultiplier, groupBonus = state.groupBonus,
+        premiumBonus = state.premiumBonus, weightMultiplier = state.weightMultiplier,
+    })
+    -- Flag only unusually large observed jumps for later review. This is a
+    -- diagnostic hint, not proof of an exploit or a server validation flaw.
+    if previous and previous.signature == signature and uiRate > 15 then
+        DIAG.log("WARN", "PROGRESS", "large_ui_progress_jump_candidate", {mode = mode, rate = uiRate, signature = signature})
+    end
+    DIAG.refreshUI(true)
+end
+
 local function getScoreInfo(trialGui)
     local header = trialGui:FindFirstChild("TrialHeader", true)
     local scorePill = header and header:FindFirstChild("ScorePill", true)
@@ -967,6 +1205,7 @@ local function processTrial()
                     .. " (" .. backend .. ").",
                 COLORS.success
             )
+            DIAG.log("INFO", "TRIBULATION", "tap_activated", {prompt = promptKey, ringRatio = ratio, backend = backend})
             print("[CU AutoCultivation] Trial click: " .. promptKey .. " ratio=" .. string.format("%.3f", ratio))
         else
             setStatus("Trial click failed: " .. tostring(backend), COLORS.danger)
@@ -1097,8 +1336,10 @@ local function processBreakthrough()
             mode .. " at 100%; activated BreakthroughBanner (attempt " .. tostring(breakthroughAttempts) .. ").",
             COLORS.success
         )
+        DIAG.log("INFO", "BREAKTHROUGH", "button_activated", {mode = mode, realm = realmText, signature = signature, percent = percent, backend = backend, attempt = breakthroughAttempts})
         print("[CU AutoCultivation] " .. mode .. " 100% -> Breakthrough click, " .. tostring(realmText) .. " via " .. backend)
     else
+        DIAG.log("ERROR", "BREAKTHROUGH", "button_activation_failed", {mode = mode, realm = realmText, reason = tostring(backend), signature = signature})
         setStatus("Breakthrough click failed: " .. tostring(backend), COLORS.danger)
     end
 end
@@ -1211,6 +1452,7 @@ local function teleportToZone(mode, zone)
     teleporting = true
     lastTeleportAt = os.clock()
     lastTeleportTarget = zone.name
+    DIAG.log("INFO", "CULTIVATION", "zone_travel_started", {mode = mode, zone = zone.name, target = target, size = size, realm = getRealmNumber(mode), multiplier = zone.multiplier})
     setStatus("Travelling to " .. zone.name .. "...", COLORS.warning)
 
     task.spawn(function()
@@ -1236,6 +1478,7 @@ local function teleportToZone(mode, zone)
         end)
 
         if not ok then
+            DIAG.log("ERROR", "CULTIVATION", "zone_teleport_failed", {mode = mode, zone = zone.name, reason = tostring(err)})
             setStatus("Teleport failed: " .. tostring(err), COLORS.danger)
             teleporting = false
             return
@@ -1246,8 +1489,10 @@ local function teleportToZone(mode, zone)
         local arrived = verifyRoot and isInsideZone(verifyRoot, target, size)
         if selectedAutoMode == mode and running then
             if arrived then
+                DIAG.log("INFO", "CULTIVATION", "zone_arrival_verified_locally", {mode = mode, zone = zone.name, position = verifyRoot.Position, target = target})
                 setStatus("Arrived at " .. zone.name .. "; checking the server zone bonus.", COLORS.success)
             else
+                DIAG.log("WARN", "CULTIVATION", "zone_teleport_not_retained", {mode = mode, zone = zone.name, position = verifyRoot and verifyRoot.Position or nil, target = target})
                 setStatus("Teleport was not retained by the game. Server may be correcting CFrame movement.", COLORS.danger)
             end
         end
@@ -1329,8 +1574,10 @@ local function activateTraining(mode)
     trainingToggleAttempts = trainingToggleAttempts + 1
     if sent then
         autoStartedTrainingMode = mode
+        DIAG.log("INFO", "CULTIVATION", "training_start_input_sent", {mode = mode, backend = backend, key = mode == "Qi" and "M" or "P"})
         setStatus("Starting " .. (mode == "Qi" and "Qi meditation" or "Body push-ups") .. " via " .. tostring(backend) .. ".", COLORS.success)
     else
+        DIAG.log("ERROR", "CULTIVATION", "training_start_input_failed", {mode = mode, backend = backend})
         setStatus("Could not send the " .. (mode == "Qi" and "M" or "P") .. " training input: " .. tostring(backend), COLORS.danger)
     end
 end
@@ -1352,6 +1599,7 @@ local function stopAutomationOwnedTraining(mode)
     end
 
     autoStartedTrainingMode = nil
+    DIAG.log("INFO", "CULTIVATION", "automation_owned_training_stopped", {mode = mode, backend = backend})
     return true, true, backend
 end
 
@@ -1377,6 +1625,11 @@ local function processAutoCultivation()
     if not zone then
         setStatus("Could not determine your " .. mode .. " realm yet.", COLORS.warning)
         return
+    end
+
+    if DIAG.lastZoneByMode[mode] ~= zone.name then
+        DIAG.lastZoneByMode[mode] = zone.name
+        DIAG.log("INFO", "CULTIVATION", "best_zone_selected", {mode = mode, zone = zone.name, realm = realmNumber, requiredRealm = zone.realm, multiplier = zone.multiplier, coordinates = {x = zone.x, y = zone.y, z = zone.z}})
     end
 
     local frame = getFrameForMode(mode)
@@ -1419,8 +1672,16 @@ local function processAutoCultivation()
 
     if isTrainingActive(mode) then
         trainingToggleAttempts = 0
+        if DIAG.lastTrainingState[mode] ~= true then
+            DIAG.lastTrainingState[mode] = true
+            DIAG.log("INFO", "CULTIVATION", "training_active_verified", {mode = mode, zone = zone.name, multiplier = zone.multiplier, state = mode == "Qi" and qiState or bodyState})
+        end
         setStatus(mode .. " training active at " .. zone.name .. " (" .. string.format("%.2fx", zone.multiplier) .. ").", COLORS.success)
         return
+    end
+    if DIAG.lastTrainingState[mode] ~= false then
+        DIAG.lastTrainingState[mode] = false
+        DIAG.log("WARN", "CULTIVATION", "training_not_active", {mode = mode, zone = zone.name, multiplierVerified = verified})
     end
 
     activateTraining(mode)
@@ -1600,8 +1861,37 @@ local function herbWait(seconds)
     return true
 end
 
-local function holdHerbPrompt(prompt)
+local function holdHerbPrompt(prompt, inventoryBefore)
     local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 2.5, 0.1, 5)
+
+    -- Optional quick-interaction probe: fires the actual ProximityPrompt through
+    -- the executor helper, then requires a real inventory/prompt-state confirmation.
+    -- If the server enforces HoldDuration, it falls back to the normal hold.
+    if QUICK_INTERACT.enabled and type(fireproximityprompt) == "function" then
+        QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
+        DIAG.log("INFO", "HERBS", "quick_interact_attempt", {prompt = prompt:GetFullName(), species = getHerbPromptName(prompt), age = select(2, getHerbMetadata(prompt)), holdDuration = holdDuration})
+        local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
+        if quickOk then
+            local deadline = os.clock() + 0.55
+            while os.clock() < deadline do
+                local picked = false
+                pcall(function() picked = prompt.Parent and prompt.Parent:GetAttribute("Picked") == true end)
+                if herbInventoryRevision > (inventoryBefore or 0) or not prompt.Parent or not prompt.Enabled or picked then
+                    QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
+                    DIAG.log("INFO", "HERBS", "quick_interact_verified", {prompt = prompt.Name, species = getHerbPromptName(prompt), age = select(2, getHerbMetadata(prompt))})
+                    return true, "quick prompt (verified)"
+                end
+                task.wait(0.05)
+            end
+        else
+            DIAG.log("WARN", "HERBS", "quick_interact_api_failed", {reason = tostring(quickErr)})
+        end
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "HERBS", "quick_interact_not_confirmed_fallback", {prompt = prompt.Name, holdDuration = holdDuration})
+    elseif QUICK_INTERACT.enabled then
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "HERBS", "quick_interact_api_unavailable", {prompt = prompt.Name, fallback = "normal hold"})
+    end
 
     -- Prefer the real ProximityPrompt hold lifecycle. It respects the game's
     -- HoldDuration and lets the server validate the normal interaction.
@@ -1751,7 +2041,8 @@ local function collectHerbPrompt(prompt, position, herbName, herbAge)
     end
 
     local inventoryBefore = herbInventoryRevision
-    local sent, backend = holdHerbPrompt(prompt)
+    DIAG.log("INFO", "HERBS", "collect_attempt", {species = herbName, age = herbAge, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, distance = distance, quickInteract = QUICK_INTERACT.enabled})
+    local sent, backend = holdHerbPrompt(prompt, inventoryBefore)
     if not sent then
         if backend == "cancelled" then
             return false, "cancelled"
@@ -1771,11 +2062,13 @@ local function collectHerbPrompt(prompt, position, herbName, herbAge)
         end
         local ageText = herbAge and (tostring(herbAge) .. "-year") or "age unknown"
         setHerbStatus("collected " .. herbName .. " (" .. ageText .. ")")
+        DIAG.log("INFO", "HERBS", "collect_verified", {species = herbName, age = herbAge, backend = backend, inventoryRevision = herbInventoryRevision})
         print("[CU AutoCultivation] Collected " .. herbName .. " (" .. ageText .. ") via " .. tostring(backend))
         return true, "collected"
     end
 
     herbFailedCount = herbFailedCount + 1
+    DIAG.log("WARN", "HERBS", "collect_not_verified", {species = herbName, age = herbAge, backend = backend, promptEnabled = prompt and prompt.Enabled, inventoryRevision = herbInventoryRevision})
     return false, "no inventory/prompt confirmation; will retry later"
 end
 
@@ -1845,6 +2138,7 @@ SILVER.basicAttack = function(targetRoot)
     local drawnSword = character:FindFirstChild("DrawnSword")
     local weaponValue = character:FindFirstChild("EquippedWeapon")
     if not drawnSword and not (weaponValue and tostring(weaponValue.Value or "") ~= "") then
+        DIAG.log("WARN", "SILVER", "attack_preflight_failed", {reason = "weapon_not_drawn", equippedWeapon = weaponValue and tostring(weaponValue.Value) or nil})
         return false, "draw your weapon before enabling Auto Silver"
     end
 
@@ -1852,7 +2146,10 @@ SILVER.basicAttack = function(targetRoot)
     local vinput = nil
     local okService, service = pcall(function() return game:GetService("VirtualInputManager") end)
     if okService then vinput = service end
-    if not vinput then return false, "VirtualInputManager unavailable for normal M1 input" end
+    if not vinput then
+        DIAG.log("ERROR", "SILVER", "attack_preflight_failed", {reason = "VirtualInputManager unavailable"})
+        return false, "VirtualInputManager unavailable for normal M1 input"
+    end
 
     local screenPoint, onScreen
     local oldCamera = nil
@@ -1867,6 +2164,7 @@ SILVER.basicAttack = function(targetRoot)
             screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
             if not onScreen then
                 pcall(function() camera.CFrame = oldCamera end)
+                DIAG.log("WARN", "SILVER", "target_not_on_screen", {target = targetRoot.Parent and targetRoot.Parent.Name})
                 return false, "target is not on screen; move camera toward the NPC"
             end
         end
@@ -1883,6 +2181,7 @@ SILVER.basicAttack = function(targetRoot)
             for _, object in ipairs(objects) do
                 if object:IsA("GuiButton") or object:IsA("TextBox") then
                     if cameraChanged and oldCamera then pcall(function() camera.CFrame = oldCamera end) end
+                    DIAG.log("WARN", "SILVER", "target_covered_by_gui", {target = targetRoot.Parent and targetRoot.Parent.Name, gui = object:GetFullName()})
                     return false, "an interactive GUI covers the target; close menus before farming"
                 end
             end
@@ -1895,6 +2194,7 @@ SILVER.basicAttack = function(targetRoot)
         pcall(function() camera.CFrame = oldCamera end)
     end
     local ok = downOk and upOk
+    DIAG.log(ok and "INFO" or "ERROR", "SILVER", "m1_input_sent", {target = targetRoot.Parent and targetRoot.Parent.Name, screenX = x, screenY = y, mouseDown = downOk, mouseUp = upOk, cameraAdjusted = cameraChanged})
     return ok, ok and "normal left-click" or "M1 input failed"
 end
 
@@ -1931,6 +2231,7 @@ SILVER.run = function()
                         SILVER.currentTarget = target
                         SILVER.currentTargetRealm = targetRealm
                         SILVER.setStatus("targeting " .. target.Name .. " (Qi " .. tostring(targetRealm) .. ")")
+                        DIAG.log("INFO", "SILVER", "target_selected", {target = target.Name, realm = targetRealm, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, distance = (playerRoot.Position - targetRoot.Position).Magnitude, playerRealm = playerRealm})
 
                         if selectedAutoMode then
                             stopAutomationOwnedTraining(selectedAutoMode)
@@ -1946,10 +2247,12 @@ SILVER.run = function()
                                 playerRoot.CFrame = CFrame.lookAt(destination, look)
                             end)
                             if not moved or not SILVER.wait(1.25) then
+                                DIAG.log("ERROR", "SILVER", "teleport_failed", {target = target.Name, moved = moved})
                                 SILVER.busy = false
                                 break
                             end
                             playerRoot = getCharacterParts()
+                            DIAG.log("INFO", "SILVER", "arrived_near_target", {target = target.Name, playerPosition = playerRoot and playerRoot.Position or nil, targetPosition = targetRoot.Position, distance = playerRoot and (playerRoot.Position - targetRoot.Position).Magnitude or nil})
                             if not playerRoot or (playerRoot.Position - targetRoot.Position).Magnitude > 20 then
                                 SILVER.blacklist[target] = os.clock() + 12
                                 SILVER.failed = SILVER.failed + 1
@@ -1984,11 +2287,14 @@ SILVER.run = function()
                                 task.wait(0.28)
                                 local healthNow = targetHumanoid.Health
                                 if healthNow < lastHealth - 0.1 then
+                                    local previousHealth = lastHealth
                                     lastHealth = healthNow
                                     lastDamageAt = os.clock()
                                     SILVER.setStatus("attacking " .. target.Name .. " | HP " .. ECONOMY.formatNumber(healthNow) .. "/" .. ECONOMY.formatNumber(targetHumanoid.MaxHealth))
+                                    DIAG.log("INFO", "SILVER", "damage_observed", {target = target.Name, previousHp = previousHealth, currentHp = healthNow, damage = previousHealth - healthNow})
                                 elseif os.clock() - lastDamageAt > 4.5 then
                                     SILVER.setStatus("no damage registered on " .. target.Name .. "; skipping")
+                                    DIAG.log("ERROR", "SILVER", "no_damage_timeout", {target = target.Name, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, elapsedWithoutDamage = os.clock() - lastDamageAt})
                                     SILVER.blacklist[target] = os.clock() + 20
                                     break
                                 end
@@ -2369,6 +2675,30 @@ CHEST.holdPrompt = function(prompt, spot, tier, revisionBefore)
         return stateChanged(), stateChanged() and "prompt state changed" or "no trigger/state change"
     end
 
+    -- Optional instant/quick interaction probe. It targets the real prompt and
+    -- is accepted only if the opened state or server ChestWorldOpened event changes.
+    -- If the server enforces its hold duration, normal prompt methods are tried next.
+    if QUICK_INTERACT.enabled and type(fireproximityprompt) == "function" then
+        QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
+        DIAG.log("INFO", "CHEST", "quick_interact_attempt", {chest = spot and spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance})
+        local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
+        if quickOk then
+            local confirmed, reason = waitForState(0.75)
+            if confirmed then
+                QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
+                DIAG.log("INFO", "CHEST", "quick_interact_verified", {chest = spot and spot.Name, tier = tier, reason = reason})
+                return true, "quick prompt (verified)"
+            end
+        else
+            DIAG.log("WARN", "CHEST", "quick_interact_api_failed", {chest = spot and spot.Name, tier = tier, reason = tostring(quickErr)})
+        end
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "CHEST", "quick_interact_not_confirmed_fallback", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration})
+    elseif QUICK_INTERACT.enabled then
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "CHEST", "quick_interact_api_unavailable", {chest = spot and spot.Name, tier = tier, fallback = "normal hold"})
+    end
+
     -- First try Roblox's real prompt hold lifecycle. A successful pcall only
     -- means the method did not throw; it is NOT treated as proof of opening.
     local began = pcall(function()
@@ -2552,7 +2882,9 @@ CHEST.collect = function(spot, prompt, position, tier)
     end
 
     local revisionBefore = CHEST.worldOpenedRevision
+    DIAG.log("INFO", "CHEST", "open_attempt", {chest = spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, maxDistance = maxDistance, distance = distance, quickInteract = QUICK_INTERACT.enabled})
     local sent, backend = CHEST.holdPrompt(prompt, spot, tier, revisionBefore)
+    DIAG.log(sent and "INFO" or "WARN", "CHEST", "prompt_input_result", {chest = spot.Name, tier = tier, sent = sent, backend = backend})
     if not sent then
         return false, "chest interaction did not register: " .. tostring(backend)
     end
@@ -2567,6 +2899,7 @@ CHEST.collect = function(spot, prompt, position, tier)
         if event then
             CHEST.openedByScript[spot] = os.clock() + 30
             CHEST.openedCount = CHEST.openedCount + 1
+            DIAG.log("INFO", "CHEST", "open_verified", {chest = spot.Name, tier = tier, reward = CHEST.describeReward(event), rewards = event.rewards})
             return true, "opened " .. tier .. " chest | " .. CHEST.describeReward(event)
         end
         if CHEST.isOpened(spot) or not prompt.Enabled or not prompt.Parent then
@@ -2577,8 +2910,10 @@ CHEST.collect = function(spot, prompt, position, tier)
 
     if stateChanged then
         CHEST.openedByScript[spot] = os.clock() + 30
+        DIAG.log("WARN", "CHEST", "state_changed_without_reward_event", {chest = spot.Name, tier = tier, promptEnabled = prompt.Enabled})
         return false, "chest state changed, but no local ChestWorldOpened reward confirmation was received"
     end
+    DIAG.log("ERROR", "CHEST", "open_not_verified", {chest = spot.Name, tier = tier, promptEnabled = prompt.Enabled, distance = distance, holdDuration = prompt.HoldDuration})
     return false, "no ChestWorldOpened or opened-state confirmation"
 end
 
@@ -3326,6 +3661,10 @@ updateModeButtons = function()
         UI.silverButton.Text = SILVER.autoEnabled and "AUTO SILVER: ON" or "AUTO SILVER: OFF"
         UI.silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
     end
+    if UI.quickInteractButton then
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "QUICK INTERACT: ON (VERIFY + FALLBACK)" or "QUICK INTERACT: OFF (HERBS + CHESTS)"
+        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
+    end
     if brewRecipeButton then
         local selectedCount = 0
         for _, key in ipairs(BREW_RECIPE_ORDER) do
@@ -3355,10 +3694,11 @@ local function createGui()
     local old = parent:FindFirstChild("CUAutoCultivation_v08")
         or parent:FindFirstChild("CUAutoCultivation_v09")
         or parent:FindFirstChild("CUAutoCultivation_v091")
+        or parent:FindFirstChild("CUAutoCultivation_v10")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v091",
+        Name = "CUAutoCultivation_v10",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -3418,7 +3758,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v0.9.1",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.0",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -3453,7 +3793,7 @@ local function createGui()
         UI.setPanelVisible(false)
     end)
 
-    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings"}
+    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings", "Diagnostics"}
     local pageFrames = {}
     for _, name in ipairs(pageNames) do
         local page = make("Frame", {
@@ -3472,11 +3812,11 @@ local function createGui()
         UI.pages[name] = page
     end
 
-    local tabWidth = 98
+    local tabWidth = 86
     for index, name in ipairs(pageNames) do
         local tab = make("TextButton", {
             Name = name .. "Tab",
-            Position = UDim2.fromOffset(12 + (index - 1) * 105, 46),
+            Position = UDim2.fromOffset(12 + (index - 1) * 90, 46),
             Size = UDim2.fromOffset(tabWidth, 28),
             BackgroundColor3 = name == "Overview" and COLORS.accent or COLORS.panel2,
             BorderSizePixel = 0,
@@ -3484,7 +3824,7 @@ local function createGui()
             Font = Enum.Font.GothamBold,
             Text = string.upper(name),
             TextColor3 = COLORS.text,
-            TextSize = 9,
+            TextSize = 8,
             Active = true,
             Selectable = true,
             ZIndex = 10,
@@ -3599,13 +3939,21 @@ local function createGui()
     UI.chestButton = makeButton(chestCard, "CHESTS: OFF", 12, 28, 128, COLORS.panel2, 28)
     UI.chestFilterButton = makeButton(chestCard, "CHEST FILTER: ALL", 148, 28, 132, COLORS.panel2, 28)
     UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 65, 268, 18, 9, COLORS.muted)
-    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 91, 268, 35, 9, COLORS.muted)
+    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 91, 268, 22, 9, COLORS.muted)
 
     local silverCardFarm = makeCard(farmingPage, 16, 204, 598, 160, "AUTO SILVER - CULTIVATOR CAMPS", COLORS.warning)
     UI.silverButton = makeButton(silverCardFarm, "AUTO SILVER: OFF", 12, 29, 180, COLORS.panel2, 30)
     UI.silverInfoLabel = makeLabel(silverCardFarm, "Auto Silver: idle", 204, 29, 370, 28, 10, COLORS.muted)
     UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 12, 70, 570, 20, 10, COLORS.text)
     makeLabel(silverCardFarm, "Targets non-boss CultivatorCamps NPCs at or below your Qi realm. Requires your sword drawn; uses normal M1 input.", 12, 99, 570, 44, 9, COLORS.muted)
+    UI.quickInteractButton = makeButton(farmingPage, "QUICK INTERACT: OFF (HERBS + CHESTS)", 16, 374, 598, COLORS.panel2, 27)
+    addConnection(UI.quickInteractButton.MouseButton1Click, function()
+        QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "QUICK INTERACT: ON (VERIFY + FALLBACK)" or "QUICK INTERACT: OFF (HERBS + CHESTS)"
+        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
+        DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
+        setStatus(QUICK_INTERACT.enabled and "Quick interaction enabled: prompt bypass is attempted, then server confirmation is required; normal hold is fallback." or "Quick interaction disabled; configured prompt hold durations will be used.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
+    end)
 
     -- ALCHEMY PAGE
     local alchemyPage = pageFrames.Alchemy
@@ -3641,6 +3989,43 @@ local function createGui()
     local stopButton = makeButton(safetyCard, "STOP ALL", 12, 76, 562, COLORS.danger, 32)
     makeLabel(safetyCard, "Ctrl + Home: show/hide   |   Ctrl + P: pause/resume   |   Ctrl + End: stop   |   Floating CU icon restores the panel", 12, 128, 570, 35, 9, COLORS.muted)
     makeLabel(safetyCard, "Anti-AFK handles Roblox's normal Idled event only. Game-specific server AFK checks may still apply.", 12, 169, 570, 28, 9, COLORS.muted)
+
+    -- DIAGNOSTICS PAGE: only logs actions and server confirmations related to this suite.
+    local diagnosticsPage = pageFrames.Diagnostics
+    makeLabel(diagnosticsPage, "INTEGRATED OBSERVER | ACTIONS + SERVER-ACCEPTED RESULTS ONLY", 16, 10, 600, 20, 10, COLORS.success, Enum.Font.GothamBold)
+    local diagStatusCard = makeCard(diagnosticsPage, 16, 38, 598, 72, "OBSERVER STATUS", COLORS.success)
+    UI.diagSummaryLabel = makeLabel(diagStatusCard, "Observer ON | waiting for events", 12, 28, 570, 18, 10, COLORS.text)
+    local diagProgressCard = makeCard(diagnosticsPage, 16, 118, 598, 88, "FAST PROGRESS AUDIT (OBSERVED RATES)", COLORS.qi)
+    UI.diagProgressLabel = makeLabel(diagProgressCard, "Qi UI --%/s | raw qi --/s\nBody UI --%/s | raw EXP --/s", 12, 28, 570, 48, 10, COLORS.text, Enum.Font.Code)
+    local diagLogCard = makeCard(diagnosticsPage, 16, 214, 598, 150, "RECENT MODULE EVENTS (NEWEST FIRST)", COLORS.accent)
+    local diagScroll = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(10, 28), Size = UDim2.new(1, -20, 1, -36),
+        BackgroundColor3 = COLORS.bg, BorderSizePixel = 0, ScrollBarThickness = 5,
+        CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ZIndex = 3,
+    }, diagLogCard)
+    UI.diagEventLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(7, 5), Size = UDim2.new(1, -17, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "No automation events recorded yet.",
+        TextColor3 = COLORS.text, TextSize = 9, TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        ZIndex = 4,
+    }, diagScroll)
+    UI.diagExportButton = makeButton(diagnosticsPage, "EXPORT DIAGNOSTICS", 16, 374, 290, COLORS.accent, 27)
+    UI.diagClearButton = makeButton(diagnosticsPage, "CLEAR BUFFER", 322, 374, 292, COLORS.panel2, 27)
+    addConnection(UI.diagExportButton.MouseButton1Click, function()
+        local ok, message = DIAG.export()
+        setStatus(ok and ("Diagnostics exported: " .. tostring(message)) or ("Diagnostics export failed: " .. tostring(message)), ok and COLORS.success or COLORS.warning)
+    end)
+    addConnection(UI.diagClearButton.MouseButton1Click, function()
+        DIAG.events = {}
+        DIAG.errorCount = 0
+        DIAG.warningCount = 0
+        DIAG.sequence = 0
+        DIAG.log("INFO", "DIAGNOSTICS", "buffer_cleared", {})
+        DIAG.refreshUI(true)
+    end)
 
     -- FILTER PICKERS: placed inside their relevant tabs so they never spill
     -- outside the redesigned panel.
@@ -3760,6 +4145,7 @@ local function createGui()
                 if not ok then setStatus("Could not stop script-started Body training; Qi was not enabled: " .. tostring(backend), COLORS.danger); return end
             end
             selectedAutoMode = "Qi"
+            DIAG.log("INFO", "CULTIVATION", "qi_auto_enabled", {})
             setStatus("Qi Auto Cultivation ON. Selecting the best unlocked Qi zone.", COLORS.success)
         end
         trainingToggleAttempts = 0
@@ -3781,6 +4167,7 @@ local function createGui()
                 if not ok then setStatus("Could not stop script-started Qi meditation; Body was not enabled: " .. tostring(backend), COLORS.danger); return end
             end
             selectedAutoMode = "Body"
+            DIAG.log("INFO", "CULTIVATION", "body_auto_enabled", {})
             setStatus("Body Auto Cultivation ON. Selecting the best unlocked Body zone.", COLORS.success)
         end
         trainingToggleAttempts = 0
@@ -3791,6 +4178,7 @@ local function createGui()
 
     addConnection(herbButton.MouseButton1Click, function()
         autoHerbsEnabled = not autoHerbsEnabled
+        DIAG.log("INFO", "HERBS", "auto_toggle", {enabled = autoHerbsEnabled})
         updateModeButtons()
         if autoHerbsEnabled then
             setHerbStatus("scanning enabled prompts")
@@ -3812,6 +4200,7 @@ local function createGui()
 
     addConnection(UI.chestButton.MouseButton1Click, function()
         CHEST.autoEnabled = not CHEST.autoEnabled
+        DIAG.log("INFO", "CHEST", "auto_toggle", {enabled = CHEST.autoEnabled})
         updateModeButtons()
         if CHEST.autoEnabled then
             CHEST.setStatus("scanning; Celestial > Jade > Bronze > Wooden")
@@ -3852,6 +4241,7 @@ local function createGui()
 
     addConnection(UI.silverButton.MouseButton1Click, function()
         SILVER.autoEnabled = not SILVER.autoEnabled
+        DIAG.log("INFO", "SILVER", "auto_toggle", {enabled = SILVER.autoEnabled})
         updateModeButtons()
         if SILVER.autoEnabled then
             SILVER.setStatus("scanning eligible non-boss cultivators")
@@ -3912,6 +4302,7 @@ do
                     if ECONOMY.silver == nil then ECONOMY.silverStart = newValue end
                     ECONOMY.silver = newValue
                     ECONOMY.updateUI()
+                    DIAG.log("INFO", "ECONOMY", "silver_balance_update", {silver = newValue})
                 end
             end)
         end
@@ -3931,6 +4322,7 @@ do
                     end
                     ECONOMY.stones = newValue
                     ECONOMY.updateUI()
+                    DIAG.log("INFO", "ECONOMY", "primordial_stone_balance_update", {stones = newValue, delta = oldValue and (newValue - oldValue) or nil})
                 end
             end)
         end
@@ -3947,6 +4339,7 @@ do
                         SILVER.earned = SILVER.earned + amount
                     end
                     ECONOMY.updateUI()
+                    DIAG.log("INFO", "SILVER", "server_kill_reward", {amount = amount, target = SILVER.currentTarget and SILVER.currentTarget.Name or nil, total = ECONOMY.silver})
                     if SILVER.busy then SILVER.setStatus("Silver reward +" .. ECONOMY.formatNumber(amount) .. " received") end
                 end
             end)
@@ -3957,6 +4350,7 @@ do
             addConnection(qiRemote.OnClientEvent, function(data)
                 if type(data) == "table" then
                     qiState = data
+                    DIAG.lastQiStateAt = os.clock()
                 end
             end)
         end
@@ -3966,6 +4360,7 @@ do
             addConnection(bodyRemote.OnClientEvent, function(data)
                 if type(data) == "table" then
                     bodyState = data
+                    DIAG.lastBodyStateAt = os.clock()
                 end
             end)
         end
@@ -3979,6 +4374,7 @@ do
                     lastAction = "Herb inventory update received."
                 end
                 setHerbStatus("inventory updated")
+                DIAG.log("INFO", "HERBS", "server_inventory_update", {revision = herbInventoryRevision, inventory = data})
             end)
         end
 
@@ -3998,6 +4394,7 @@ do
         if cauldronStartRemote and cauldronStartRemote:IsA("RemoteEvent") then
             addConnection(cauldronStartRemote.OnClientEvent, function(success, message, extra)
                 cauldronStartResult = {success = success, message = message, extra = extra}
+                DIAG.log(success and "INFO" or "WARN", "ALCHEMY", "brew_start_result", {success = success, message = message, extra = extra})
                 cauldronStartZone = type(extra) == "table" and tonumber(extra.zone) or nil
                 cauldronBrewSerial = cauldronBrewSerial + 1
                 cauldronStokeHandledSerial = 0
@@ -4011,6 +4408,7 @@ do
         if cauldronStokeRemote and cauldronStokeRemote:IsA("RemoteEvent") then
             addConnection(cauldronStokeRemote.OnClientEvent, function(result, message)
                 cauldronStokeResult = {result = tostring(result or "unknown"), message = tostring(message or "")}
+                DIAG.log("INFO", "ALCHEMY", "stoke_result", {result = result, message = message, target = cauldronStartZone})
                 setStatus("Stoke result: " .. cauldronStokeResult.result .. " - " .. cauldronStokeResult.message, COLORS.success)
             end)
         end
@@ -4026,6 +4424,7 @@ do
         if cauldronClaimRemote and cauldronClaimRemote:IsA("RemoteEvent") then
             addConnection(cauldronClaimRemote.OnClientEvent, function(success, message)
                 cauldronClaimResult = {success = success, message = message}
+                DIAG.log(success and "INFO" or "WARN", "ALCHEMY", "claim_result", {success = success, message = message})
             end)
         end
 
@@ -4043,7 +4442,17 @@ do
                     playerName = playerName,
                     rewards = type(rewards) == "table" and rewards or nil,
                 }
+                DIAG.log("INFO", "CHEST", "server_world_opened_event", {chest = chestName, tier = tier, player = playerName, rewards = rewards})
                 if playerName == LocalPlayer.Name then
+                    local fingerprint = tostring(chestName) .. "|" .. tostring(tier)
+                        .. "|" .. tostring(type(rewards) == "table" and rewards.rare or false)
+                        .. "|" .. tostring(type(rewards) == "table" and rewards.bonus or false)
+                        .. "|" .. tostring(type(rewards) == "table" and rewards.rareLine or "")
+                    local priorAt = DIAG.rewardFingerprints[fingerprint]
+                    if priorAt and os.clock() - priorAt < 2 then
+                        DIAG.log("WARN", "ECONOMY_AUDIT", "duplicate_chest_reward_event_candidate", {chest = chestName, tier = tier, secondsSincePrevious = os.clock() - priorAt})
+                    end
+                    DIAG.rewardFingerprints[fingerprint] = os.clock()
                     CHEST.activeName = "reward event received: " .. tostring(tier or "chest")
                 end
             end)
@@ -4070,6 +4479,120 @@ do
     end
 end
 
+-- Destiny reroll audit: observe manual UI clicks and server completion events.
+-- This records samples only; it does not automate rolls or modify RNG requests.
+local function getRerollContext(button)
+    local rerollGui = PlayerGui:FindFirstChild("RerollGui")
+    local window = rerollGui and rerollGui:FindFirstChild("DestinyRerollWindow")
+    local activeCategory = "Unknown"
+    local tabBar = window and window:FindFirstChild("TabBar")
+    if tabBar then
+        for _, tab in ipairs(tabBar:GetChildren()) do
+            if tab:IsA("GuiButton") then
+                local style = tab:GetAttribute("UiStyle")
+                if style == "tabActive" then
+                    activeCategory = string.gsub(tab.Name, "Tab$", "")
+                    break
+                end
+            end
+        end
+    end
+    local bulk = "Unknown"
+    local column = window and window:FindFirstChild("Body") and window.Body:FindFirstChild("Column1")
+    if column then
+        for _, name in ipairs({"Bulk1", "Bulk10", "Bulk100"}) do
+            local item = column:FindFirstChild(name)
+            if item and item:IsA("GuiButton") then
+                local selected = item:GetAttribute("UiStyle") == "buttonActive" or item.BackgroundColor3 == COLORS.success
+                if selected then bulk = name break end
+            end
+        end
+    end
+    local displayedOdds = {}
+    if window then
+        for _, node in ipairs(window:GetDescendants()) do
+            if node:IsA("TextLabel") then
+                local text = tostring(node.Text or "")
+                local lower = string.lower(text)
+                if string.find(lower, "common", 1, true)
+                    or string.find(lower, "uncommon", 1, true)
+                    or string.find(lower, "rare", 1, true)
+                    or string.find(lower, "legendary", 1, true)
+                    or string.find(lower, "mythical", 1, true)
+                    or string.find(lower, "divine", 1, true)
+                    or string.find(lower, "beginner luck", 1, true)
+                    or string.find(lower, "2x luck", 1, true)
+                    or string.find(lower, "cost", 1, true) then
+                    table.insert(displayedOdds, text)
+                end
+            end
+        end
+    end
+    return {
+        category = activeCategory, button = button and button.Name,
+        text = button and button.Text, bulk = bulk, displayedOdds = displayedOdds,
+        silver = tonumber(LocalPlayer:GetAttribute("Silver")),
+        stones = tonumber(LocalPlayer:GetAttribute("PrimordialStones")),
+    }
+end
+
+local function watchRerollButton(object)
+    if not object or DIAG.rerollWatched[object] then return end
+    if not object:IsA("GuiButton") then return end
+    local fullName = ""
+    pcall(function() fullName = object:GetFullName() end)
+    if not string.find(fullName, "DestinyRerollWindow", 1, true) then return end
+    if object.Name ~= "RerollButton" and object.Name ~= "FreeRollButton" and object.Name ~= "Bulk1" and object.Name ~= "Bulk10" and object.Name ~= "Bulk100" then return end
+    DIAG.rerollWatched[object] = true
+    addConnection(object.MouseButton1Click, function()
+        DIAG.log("INFO", "RNG", "manual_reroll_click", getRerollContext(object))
+    end)
+end
+
+local function watchRerollGui()
+    local rerollGui = PlayerGui:FindFirstChild("RerollGui")
+    if not rerollGui then return end
+    for _, object in ipairs(rerollGui:GetDescendants()) do watchRerollButton(object) end
+end
+watchRerollGui()
+addConnection(PlayerGui.DescendantAdded, function(object)
+    if string.find(object.Name, "Reroll", 1, true) or object:IsA("GuiButton") then
+        task.defer(watchRerollButton, object)
+    end
+end)
+
+local rerollResultNames = {
+    "ClanRerollComplete", "SpiritualRootRerollComplete", "QiColourRerollComplete",
+    "BodyConstitutionRerollComplete", "RaceRerollComplete",
+}
+local eventsFolderForAudit = ReplicatedStorage:FindFirstChild("CultivationEvents")
+if eventsFolderForAudit then
+    for _, remoteName in ipairs(rerollResultNames) do
+        local remote = eventsFolderForAudit:FindFirstChild(remoteName)
+        if remote and remote:IsA("RemoteEvent") then
+            addConnection(remote.OnClientEvent, function(...)
+                local args = {}
+                for i = 1, select("#", ...) do args[i] = diagClean(select(i, ...), 0, {}) end
+                DIAG.log("INFO", "RNG", "server_reroll_result", {
+                    remote = remoteName, args = args,
+                    silver = tonumber(LocalPlayer:GetAttribute("Silver")),
+                    stones = tonumber(LocalPlayer:GetAttribute("PrimordialStones")),
+                })
+            end)
+        end
+    end
+    for _, remoteName in ipairs({"BreakthroughEffect", "BreakthroughMinigameResult", "HitFeedback", "CombatLogNotice", "WeaponStateSync", "FieldBossReward", "QuestRewardGranted", "OrbBonusGranted", "CoinCollected", "ClanUpdateAll", "SpiritualRootUpdateAll", "QiColourUpdateAll", "BodyConstitutionUpdateAll", "RaceUpdateAll"}) do
+        local remote = eventsFolderForAudit:FindFirstChild(remoteName)
+        if remote and remote:IsA("RemoteEvent") then
+            addConnection(remote.OnClientEvent, function(...)
+                local args = {}
+                for i = 1, select("#", ...) do args[i] = diagClean(select(i, ...), 0, {}) end
+                DIAG.log("INFO", "SERVER_EVENT", remoteName, {args = args})
+            end)
+        end
+    end
+end
+
 -- Standard Roblox idle notification. This only addresses the normal Idled event;
 -- game-specific server AFK systems may still disconnect the player.
 addConnection(LocalPlayer.Idled, function()
@@ -4081,9 +4604,11 @@ addConnection(LocalPlayer.Idled, function()
         VirtualUser:ClickButton2(Vector2.new(0, 0))
     end)
     if ok then
+        DIAG.log("INFO", "ANTI_AFK", "idle_input_sent", {})
         print("[CU AutoCultivation] Anti-AFK input sent.")
     else
         lastError = tostring(err)
+        DIAG.log("ERROR", "ANTI_AFK", "idle_input_failed", {reason = lastError})
         warn("[CU AutoCultivation] Anti-AFK failed: " .. lastError)
     end
 end)
@@ -4116,6 +4641,20 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.0", placeId = game.PlaceId, player = LocalPlayer.Name, quickInteract = QUICK_INTERACT.enabled})
+DIAG.refreshUI(true)
+
+task.spawn(function()
+    while running do
+        task.wait(1)
+        if running then
+            local ok, err = pcall(DIAG.sampleProgress)
+            if not ok then DIAG.log("ERROR", "PROGRESS", "sampler_error", {reason = tostring(err)}) end
+            DIAG.flush()
+            DIAG.refreshUI(true)
+        end
+    end
+end)
 
 task.spawn(function()
     while running do
@@ -4211,8 +4750,11 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v0.9.1 loaded. Fixed UI initialization, Auto Silver toggle, chest prompt verification, and floating restore icon.")
+print("[CU AutoCultivation] v1.0.0 loaded. Integrated diagnostics + fast-progress sampling + optional quick interaction are enabled.")
 print("[CU AutoCultivation] Auto Chest prioritizes Celestial > Jade > Bronze > Wooden and verifies ChestWorldOpened for the local player.")
-print("[CU AutoCultivation] Auto Silver uses normal M1 input against non-boss CultivatorCamps NPCs at or below the current Qi realm; no reward remotes are fired.")
+print("[CU AutoCultivation] Auto Silver still uses normal M1 input; diagnostics now record input, target HP, and server reward confirmations.")
+print("[CU AutoCultivation] Quick Interact is OFF by default; if enabled it tries the actual prompt instantly, verifies server state, then falls back to normal hold.")
+print("[CU AutoCultivation] Diagnostics never fires fake reward, reroll, chest, herb, combat, or progression remotes.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-setStatus("Loaded. Use the tabs to manage cultivation, farming, alchemy, economy and settings. Auto Silver is OFF.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.0"})
+setStatus("Loaded v1.0.0. Integrated diagnostics are ON; Quick Interact is OFF until enabled in Farming.", COLORS.success)
