@@ -1,6 +1,6 @@
 --[[
-    CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 0.9
+    CULTIVATION UNBOUND - AUTO CULTIVATION + HERBS + BREW + CHESTS
+    Version: 0.8
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -22,11 +22,6 @@
         Celestial > Jade > Bronze > Wooden, and verifies ChestWorldOpened.
       - Herb Monitor: live age counts split between normal and SpiritWorld nodes,
         including disabled/locked prompt counts.
-      - Economy dashboard: Silver and Primordial Stone balances, NPC Silver rewards,
-        session deltas, and Destiny reroll probability/cost estimates.
-      - Auto Silver: targets eligible non-boss cultivators in Workspace.CultivatorCamps
-        using normal client-side weapon input; no fabricated reward remotes.
-      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings.
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
@@ -63,7 +58,7 @@ if type(Env.__CUAutoCultivationStop) == "function" then
     pcall(Env.__CUAutoCultivationStop, "replaced")
 end
 if type(Env.__CUAutoBreakthroughStop) == "function" then
-    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.9")
+    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.7")
 end
 
 local running = true
@@ -92,37 +87,6 @@ local CHEST = {
     tierOrder = {Celestial = 4, Jade = 3, Bronze = 2, Wooden = 1},
 }
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0}
-
--- Currency tracking is passive: values come from player attributes and the
--- game's inbound UpdateMoney / UpdatePrimordialStones events.
-local ECONOMY = {
-    silver = tonumber(LocalPlayer:GetAttribute("Silver")),
-    stones = tonumber(LocalPlayer:GetAttribute("PrimordialStones")),
-    silverStart = tonumber(LocalPlayer:GetAttribute("Silver")),
-    stonesStart = tonumber(LocalPlayer:GetAttribute("PrimordialStones")),
-    silverNetChange = 0,
-    npcSilverEarned = 0,
-    npcKillCount = 0,
-    stonesEarned = 0,
-    lastStoneDelta = 0,
-    lastStoneChangeAt = nil,
-    lastStoneChangeClock = nil,
-    startedAt = os.clock(),
-}
-local SILVER = {
-    autoEnabled = false,
-    taskRunning = false,
-    busy = false,
-    activeName = "idle",
-    currentTarget = nil,
-    currentTargetRealm = nil,
-    kills = 0,
-    earned = 0,
-    failed = 0,
-    lastReward = 0,
-    lastTargetAt = 0,
-    blacklist = setmetatable({}, {__mode = "k"}),
-}
 -- Multiple pill recipes can be queued. Qi + Body are enabled by default.
 local brewRecipeSelection = {
     QiSpeed = true,
@@ -155,7 +119,7 @@ local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
 local herbFilterButton = nil
-local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}}
+local UI = {chestFilterToggleButtons = {}}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -219,8 +183,6 @@ local brewRecipePicker = nil
 local brewRecipeToggleButtons = {}
 local pauseButton = nil
 local updateModeButtons = nil
-local footerStatusLabel = nil
-local silverButton = nil
 
 local COLORS = {
     bg = Color3.fromRGB(17, 20, 28),
@@ -327,56 +289,6 @@ local function setStatus(message, color)
         statusLabel.Text = lastAction
         statusLabel.TextColor3 = color or COLORS.muted
     end
-    if footerStatusLabel then
-        footerStatusLabel.Text = lastAction
-        footerStatusLabel.TextColor3 = color or COLORS.muted
-    end
-end
-
-local function formatNumber(value)
-    value = tonumber(value)
-    if not value then return "--" end
-    local sign = value < 0 and "-" or ""
-    local n = math.floor(math.abs(value) + 0.5)
-    local text = tostring(n)
-    local result = text:reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    if string.sub(result, 1, 1) == "," then result = string.sub(result, 2) end
-    return sign .. result
-end
-
-local function updateEconomyUI()
-    local elapsedMinutes = math.max(0.01, (os.clock() - ECONOMY.startedAt) / 60)
-    local silverRate = ECONOMY.npcSilverEarned / elapsedMinutes
-    if UI.currencySilverLabel then UI.currencySilverLabel.Text = "Silver  " .. formatNumber(ECONOMY.silver) end
-    if UI.currencyStoneLabel then UI.currencyStoneLabel.Text = "Primordial Stones  " .. formatNumber(ECONOMY.stones) end
-    if UI.economySilverDetail then
-        UI.economySilverDetail.Text = "NPC Silver earned this session: " .. formatNumber(ECONOMY.npcSilverEarned) .. "  |  NPC kill rewards: " .. tostring(ECONOMY.npcKillCount)
-    end
-    if UI.economyRateDetail then
-        UI.economyRateDetail.Text = "Observed NPC reward rate: " .. formatNumber(silverRate) .. " Silver/min (session average)"
-    end
-    if UI.economyStoneDetail then
-        local changeText = "Source unverified. Prior recording showed two +1 updates about 10m10s apart; a timed reward is only a hypothesis."
-        if ECONOMY.lastStoneChangeAt then
-            local delta = ECONOMY.lastStoneDelta
-            changeText = "Last balance update: " .. (delta >= 0 and "+" or "") .. tostring(delta) .. " at " .. os.date("%H:%M:%S", ECONOMY.lastStoneChangeAt) .. " | source not identified"
-        end
-        UI.economyStoneDetail.Text = changeText
-    end
-    if UI.overviewSilverLabel then UI.overviewSilverLabel.Text = formatNumber(ECONOMY.silver) end
-    if UI.overviewStoneLabel then UI.overviewStoneLabel.Text = formatNumber(ECONOMY.stones) end
-end
-
-SILVER.setStatus = function(message)
-    SILVER.activeName = tostring(message or "idle")
-    if UI.silverInfoLabel then
-        UI.silverInfoLabel.Text = "Auto Silver: " .. SILVER.activeName
-    end
-    if UI.silverTargetLabel then
-        local targetName = SILVER.currentTarget and SILVER.currentTarget.Name or "none"
-        local realmText = SILVER.currentTargetRealm and (" | Qi Realm " .. tostring(SILVER.currentTargetRealm)) or ""
-        UI.silverTargetLabel.Text = "Target: " .. targetName .. realmText .. " | Kills: " .. tostring(SILVER.kills) .. " | Earned: " .. formatNumber(SILVER.earned)
-    end
 end
 
 local function setHerbStatus(message)
@@ -410,8 +322,6 @@ local function stop(reason)
     autoBrewEnabled = false
     autoBrewBusy = false
     CHEST.autoEnabled = false
-    SILVER.autoEnabled = false
-    SILVER.busy = false
     disconnectAll()
     if gui then
         pcall(function()
@@ -440,13 +350,6 @@ Env.__CUAutoCultivationState = {
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
             autoChestEnabled = CHEST.autoEnabled,
-            autoSilverEnabled = SILVER.autoEnabled,
-            silverBusy = SILVER.busy,
-            silverKills = SILVER.kills,
-            silverEarned = SILVER.earned,
-            silverBalance = ECONOMY.silver,
-            primordialStones = ECONOMY.stones,
-            npcSilverEarned = ECONOMY.npcSilverEarned,
             chestCollectorBusy = CHEST.busy,
             chestsOpened = CHEST.openedCount,
             chestsFailed = CHEST.failedCount,
@@ -1352,7 +1255,7 @@ local function stopAutomationOwnedTraining(mode)
 end
 
 local function processAutoCultivation()
-    if herbCollectorBusy or CHEST.busy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
+    if herbCollectorBusy or CHEST.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
         return
     end
     -- Never relocate or restart training while a breakthrough/tribulation is
@@ -1787,236 +1690,6 @@ local function isBreakthroughPending()
     return percent ~= nil and percent >= 99.95
 end
 
--- Auto Silver uses visible CultivatorCamps NPCs and normal weapon input only.
--- It never fires NpcKillSilver or any reward/update RemoteEvent.
-local function getSilverNpcRoot(model)
-    if not model then return nil end
-    return model:FindFirstChild("HumanoidRootPart")
-        or model:FindFirstChild("UpperTorso")
-        or model:FindFirstChild("Torso")
-        or model.PrimaryPart
-end
-
-local function findSilverTarget()
-    local playerRoot = getCharacterParts()
-    local playerRealm = getRealmNumber("Qi")
-    if not playerRoot or not playerRealm then return nil, nil, nil, nil end
-    local camps = Workspace:FindFirstChild("CultivatorCamps")
-    if not camps then return nil, nil, nil, nil end
-
-    local bestModel, bestHumanoid, bestRoot, bestRealm = nil, nil, nil, nil
-    local bestDistance = math.huge
-    for _, model in ipairs(camps:GetChildren()) do
-        if model:IsA("Model") and model:GetAttribute("IsCultivator") == true
-            and model:GetAttribute("IsBoss") ~= true then
-            local realm = tonumber(model:GetAttribute("QiRealm"))
-            local humanoid = model:FindFirstChildOfClass("Humanoid")
-            local npcRoot = getSilverNpcRoot(model)
-            local blockedUntil = SILVER.blacklist[model]
-            local blocked = blockedUntil and os.clock() < blockedUntil
-            if realm and realm <= playerRealm and humanoid and humanoid.Health > 0 and npcRoot and not blocked then
-                local distance = (playerRoot.Position - npcRoot.Position).Magnitude
-                -- Prefer the strongest non-boss cultivator the player's Qi realm can face.
-                if not bestModel or realm > bestRealm or (realm == bestRealm and distance < bestDistance) then
-                    bestModel, bestHumanoid, bestRoot, bestRealm, bestDistance = model, humanoid, npcRoot, realm, distance
-                end
-            end
-        end
-    end
-    return bestModel, bestHumanoid, bestRoot, bestRealm
-end
-
-local function silverWait(seconds)
-    local untilTime = os.clock() + seconds
-    while os.clock() < untilTime do
-        if not running or not SILVER.autoEnabled or paused then return false end
-        task.wait(0.05)
-    end
-    return true
-end
-
-local function silverBasicAttack(targetRoot)
-    local character = LocalPlayer.Character
-    if not character or not targetRoot then return false, "character or target unavailable" end
-    local drawnSword = character:FindFirstChild("DrawnSword")
-    local weaponValue = character:FindFirstChild("EquippedWeapon")
-    if not drawnSword and not (weaponValue and tostring(weaponValue.Value or "") ~= "") then
-        return false, "draw your weapon before enabling Auto Silver"
-    end
-
-    local camera = Workspace.CurrentCamera
-    local vinput = nil
-    local okService, service = pcall(function() return game:GetService("VirtualInputManager") end)
-    if okService then vinput = service end
-    if not vinput then return false, "VirtualInputManager unavailable for normal M1 input" end
-
-    local screenPoint, onScreen
-    local oldCamera = nil
-    local cameraChanged = false
-    if camera then
-        screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
-        if not onScreen then
-            oldCamera = camera.CFrame
-            cameraChanged = true
-            pcall(function() camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetRoot.Position) end)
-            task.wait(0.08)
-            screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
-            if not onScreen then
-                pcall(function() camera.CFrame = oldCamera end)
-                return false, "target is not on screen; move camera toward the NPC"
-            end
-        end
-    else
-        return false, "camera unavailable"
-    end
-
-    local x, y = math.floor(screenPoint.X), math.floor(screenPoint.Y)
-    -- Do not click through an active UI overlay.
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if playerGui then
-        local okGui, objects = pcall(function() return playerGui:GetGuiObjectsAtPosition(x, y) end)
-        if okGui and type(objects) == "table" then
-            for _, object in ipairs(objects) do
-                if object:IsA("GuiButton") or object:IsA("TextBox") then
-                    if cameraChanged and oldCamera then pcall(function() camera.CFrame = oldCamera end) end
-                    return false, "an interactive GUI covers the target; close menus before farming"
-                end
-            end
-        end
-    end
-    local downOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
-    task.wait(0.06)
-    local upOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
-    if cameraChanged and oldCamera then
-        pcall(function() camera.CFrame = oldCamera end)
-    end
-    local ok = downOk and upOk
-    return ok, ok and "normal left-click" or "M1 input failed"
-end
-
-local function runAutoSilver()
-    if SILVER.taskRunning then return end
-    SILVER.taskRunning = true
-    task.spawn(function()
-        while running and SILVER.autoEnabled do
-            if paused then
-                SILVER.setStatus("paused")
-                task.wait(0.25)
-            elseif herbCollectorBusy or CHEST.busy or autoBrewBusy or cauldronPanelIsOpen()
-                or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
-                SILVER.setStatus("waiting for herb/chest/brew/breakthrough")
-                task.wait(0.3)
-            else
-                local playerRoot, playerHumanoid = getCharacterParts()
-                local playerRealm = getRealmNumber("Qi")
-                if not playerRoot or not playerHumanoid then
-                    SILVER.setStatus("waiting for character")
-                    task.wait(0.5)
-                elseif not playerRealm then
-                    SILVER.setStatus("waiting for Qi realm data")
-                    task.wait(0.5)
-                else
-                    local target, targetHumanoid, targetRoot, targetRealm = findSilverTarget()
-                    if not target then
-                        SILVER.currentTarget = nil
-                        SILVER.currentTargetRealm = nil
-                        SILVER.setStatus("no eligible non-boss CultivatorCamps NPC for Qi Realm " .. tostring(playerRealm))
-                        task.wait(2.0)
-                    else
-                        SILVER.busy = true
-                        SILVER.currentTarget = target
-                        SILVER.currentTargetRealm = targetRealm
-                        SILVER.setStatus("targeting " .. target.Name .. " (Qi " .. tostring(targetRealm) .. ")")
-
-                        if selectedAutoMode then
-                            stopAutomationOwnedTraining(selectedAutoMode)
-                        end
-
-                        local distance = (playerRoot.Position - targetRoot.Position).Magnitude
-                        if distance > 11 then
-                            local destination = targetRoot.Position + Vector3.new(0, 0, 7)
-                            local look = targetRoot.Position
-                            local moved = pcall(function()
-                                playerRoot.AssemblyLinearVelocity = Vector3.zero
-                                playerRoot.AssemblyAngularVelocity = Vector3.zero
-                                playerRoot.CFrame = CFrame.lookAt(destination, look)
-                            end)
-                            if not moved or not silverWait(1.25) then
-                                SILVER.busy = false
-                                break
-                            end
-                            playerRoot = getCharacterParts()
-                            if not playerRoot or (playerRoot.Position - targetRoot.Position).Magnitude > 20 then
-                                SILVER.blacklist[target] = os.clock() + 12
-                                SILVER.failed = SILVER.failed + 1
-                                SILVER.setStatus("could not reach " .. target.Name .. "; skipping for 12s")
-                                SILVER.busy = false
-                                task.wait(0.25)
-                            end
-                        end
-
-                        if SILVER.busy and running and SILVER.autoEnabled and target.Parent and targetHumanoid.Health > 0 then
-                            local lastHealth = targetHumanoid.Health
-                            local lastDamageAt = os.clock()
-                            local startRewardCount = ECONOMY.npcKillCount
-                            local attackDeadline = os.clock() + 35
-                            while running and SILVER.autoEnabled and not paused and target.Parent and targetHumanoid.Health > 0 and os.clock() < attackDeadline do
-                                if activeTrialGui or getActiveTrialGui() or CHEST.busy or herbCollectorBusy or autoBrewBusy then break end
-                                local okAttack, backend = silverBasicAttack(targetRoot)
-                                if not okAttack then
-                                    SILVER.setStatus("attack stopped: " .. tostring(backend))
-                                    if string.find(string.lower(tostring(backend)), "draw your weapon", 1, true)
-                                        or string.find(string.lower(tostring(backend)), "virtualinputmanager unavailable", 1, true) then
-                                        SILVER.autoEnabled = false
-                                        updateModeButtons()
-                                        break
-                                    end
-                                    SILVER.blacklist[target] = os.clock() + 20
-                                    break
-                                end
-                                task.wait(0.28)
-                                local healthNow = targetHumanoid.Health
-                                if healthNow < lastHealth - 0.1 then
-                                    lastHealth = healthNow
-                                    lastDamageAt = os.clock()
-                                    SILVER.setStatus("attacking " .. target.Name .. " | HP " .. formatNumber(healthNow) .. "/" .. formatNumber(targetHumanoid.MaxHealth))
-                                elseif os.clock() - lastDamageAt > 4.5 then
-                                    SILVER.setStatus("no damage registered on " .. target.Name .. "; skipping")
-                                    SILVER.blacklist[target] = os.clock() + 20
-                                    break
-                                end
-                            end
-
-                            if targetHumanoid.Health <= 0 then
-                                local rewardDeadline = os.clock() + 4
-                                while running and os.clock() < rewardDeadline and ECONOMY.npcKillCount <= startRewardCount do
-                                    task.wait(0.1)
-                                end
-                                if ECONOMY.npcKillCount > startRewardCount then
-                                    SILVER.kills = SILVER.kills + 1
-                                    SILVER.setStatus("defeated " .. target.Name .. " | +" .. formatNumber(SILVER.lastReward) .. " Silver")
-                                else
-                                    SILVER.setStatus("defeated " .. target.Name .. "; waiting for Silver reward confirmation")
-                                end
-                            end
-                        end
-                        SILVER.busy = false
-                        SILVER.currentTarget = nil
-                        SILVER.currentTargetRealm = nil
-                        if SILVER.autoEnabled then task.wait(0.35) end
-                    end
-                end
-            end
-        end
-        SILVER.busy = false
-        SILVER.currentTarget = nil
-        SILVER.currentTargetRealm = nil
-        SILVER.taskRunning = false
-        SILVER.setStatus(SILVER.autoEnabled and "waiting" or "OFF")
-        updateModeButtons()
-    end)
-end
-
 local function runHerbCollector()
     if herbCollectorTaskRunning then
         return
@@ -2028,7 +1701,7 @@ local function runHerbCollector()
             if paused then
                 setHerbStatus("paused")
                 task.wait(0.25)
-            elseif CHEST.busy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif CHEST.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 setHerbStatus("waiting for breakthrough")
                 task.wait(0.25)
             else
@@ -2550,7 +2223,7 @@ CHEST.run = function()
             if paused then
                 CHEST.setStatus("paused")
                 task.wait(0.2)
-            elseif herbCollectorBusy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif herbCollectorBusy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 if CHEST.busy then
                     CHEST.finishSweep("pausing chest sweep for another activity")
                 end
@@ -3041,8 +2714,8 @@ local function runAutoBrew()
         while running and autoBrewEnabled do
             if paused then
                 task.wait(0.15)
-            elseif CHEST.busy or SILVER.busy then
-                setStatus("Auto Brew waiting for chest or Silver farming to finish.", COLORS.warning)
+            elseif CHEST.busy then
+                setStatus("Auto Brew waiting for Auto Chest to finish.", COLORS.warning)
                 task.wait(0.2)
             else
                 local cauldronGui, cauldronPanel, body = getCauldronUi()
@@ -3280,10 +2953,6 @@ updateModeButtons = function()
         UI.chestButton.Text = CHEST.autoEnabled and "CHESTS: ON" or "CHESTS: OFF"
         UI.chestButton.BackgroundColor3 = CHEST.autoEnabled and COLORS.success or COLORS.panel2
     end
-    if silverButton then
-        silverButton.Text = SILVER.autoEnabled and "AUTO SILVER: ON" or "AUTO SILVER: OFF"
-        silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
-    end
     if brewRecipeButton then
         local selectedCount = 0
         for _, key in ipairs(BREW_RECIPE_ORDER) do
@@ -3304,17 +2973,19 @@ updateModeButtons = function()
         UI.chestInfoLabel.Text = string.format("Chests: %d opened | %s", CHEST.openedCount, CHEST.activeName)
     end
     HERB_MONITOR.update(false)
-    updateEconomyUI()
-    if SILVER.setStatus then SILVER.setStatus(SILVER.activeName) end
 end
 
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoCultivation_v08") or parent:FindFirstChild("CUAutoCultivation_v09")
-    if old then pcall(function() old:Destroy() end) end
+    local old = parent:FindFirstChild("CUAutoCultivation_v08")
+    if old then
+        pcall(function()
+            old:Destroy()
+        end)
+    end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v09",
+        Name = "CUAutoCultivation_v08",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -3323,280 +2994,214 @@ local function createGui()
 
     panel = make("Frame", {
         Name = "Panel",
-        Position = UDim2.new(0, 14, 0, 72),
-        Size = UDim2.fromOffset(660, 540),
+        Position = UDim2.new(0, 14, 0, 82),
+        Size = UDim2.fromOffset(330, 330),
         BackgroundColor3 = COLORS.bg,
-        BackgroundTransparency = 0.03,
+        BackgroundTransparency = 0.06,
         BorderSizePixel = 0,
         Active = true,
         Draggable = true,
-        ClipsDescendants = false,
     }, gui)
-    round(panel, 12)
-    make("UIStroke", {Color = Color3.fromRGB(118, 91, 42), Thickness = 1.2}, panel)
+    round(panel, 10)
+    make("UIStroke", {Color = Color3.fromRGB(62, 76, 98), Thickness = 1}, panel)
 
-    local header = make("Frame", {
-        Name = "Header",
-        Position = UDim2.fromOffset(0, 0),
-        Size = UDim2.new(1, 0, 0, 40),
-        BackgroundColor3 = Color3.fromRGB(29, 25, 21),
-        BorderSizePixel = 0,
-        Active = true,
-        Draggable = true,
-    }, panel)
-    round(header, 12)
     make("TextLabel", {
-        Position = UDim2.fromOffset(14, 7),
-        Size = UDim2.new(1, -110, 0, 25),
+        Position = UDim2.fromOffset(11, 7),
+        Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v0.9",
-        TextColor3 = Color3.fromRGB(246, 218, 157),
-        TextSize = 14,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ZIndex = 10,
-    }, header)
-    local headerState = make("TextLabel", {
-        Position = UDim2.new(1, -112, 0, 8),
-        Size = UDim2.fromOffset(64, 22),
-        BackgroundColor3 = COLORS.success,
-        BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold,
-        Text = "RUNNING",
-        TextColor3 = Color3.fromRGB(15, 25, 20),
-        TextSize = 9,
-        ZIndex = 10,
-    }, header)
-    round(headerState, 6)
-    UI.headerState = headerState
-    local minimizeButton = make("TextButton", {
-        Position = UDim2.new(1, -42, 0, 7),
-        Size = UDim2.fromOffset(32, 25),
-        BackgroundColor3 = COLORS.panel2,
-        BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold,
-        Text = "_",
+        Text = "CU AUTO CULTIVATION  v0.8",
         TextColor3 = COLORS.text,
-        TextSize = 14,
-        ZIndex = 10,
-    }, header)
-    round(minimizeButton, 5)
-    addConnection(minimizeButton.MouseButton1Click, function()
-        panel.Visible = false
-    end)
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
 
-    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings"}
-    local pageFrames = {}
-    for _, name in ipairs(pageNames) do
-        local page = make("Frame", {
-            Name = name .. "Page",
-            Position = UDim2.fromOffset(12, 82),
-            Size = UDim2.new(1, -24, 1, -132),
-            BackgroundColor3 = Color3.fromRGB(23, 25, 31),
-            BackgroundTransparency = 0.12,
-            BorderSizePixel = 0,
-            Visible = name == "Overview",
-            ClipsDescendants = false,
-            ZIndex = 1,
-        }, panel)
-        round(page, 9)
-        pageFrames[name] = page
-        UI.pages[name] = page
-    end
+    modeLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 29),
+        Size = UDim2.new(1, -22, 0, 15),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "Mode: manual monitor",
+        TextColor3 = COLORS.qi,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
 
-    local tabWidth = 98
-    for index, name in ipairs(pageNames) do
-        local tab = make("TextButton", {
-            Name = name .. "Tab",
-            Position = UDim2.fromOffset(12 + (index - 1) * 105, 46),
-            Size = UDim2.fromOffset(tabWidth, 28),
-            BackgroundColor3 = name == "Overview" and COLORS.accent or COLORS.panel2,
-            BorderSizePixel = 0,
-            AutoButtonColor = true,
-            Font = Enum.Font.GothamBold,
-            Text = string.upper(name),
-            TextColor3 = COLORS.text,
-            TextSize = 9,
-            Active = true,
-            Selectable = true,
-            ZIndex = 10,
-        }, panel)
-        round(tab, 6)
-        UI.tabs[name] = tab
-        addConnection(tab.MouseButton1Click, function()
-            for pageName, page in pairs(pageFrames) do
-                page.Visible = pageName == name
-                local button = UI.tabs[pageName]
-                if button then
-                    button.BackgroundColor3 = pageName == name and COLORS.accent or COLORS.panel2
-                end
-            end
-            if herbFilterPicker then herbFilterPicker.Visible = false end
-            if brewRecipePicker then brewRecipePicker.Visible = false end
-            if UI.chestFilterPicker then UI.chestFilterPicker.Visible = false end
-        end)
-    end
+    progressLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 46),
+        Size = UDim2.new(1, -22, 0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Progress: --",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
 
-    local function makeLabel(parentFrame, text, x, y, w, h, size, color, font)
-        return make("TextLabel", {
-            Position = UDim2.fromOffset(x, y),
-            Size = UDim2.fromOffset(w, h),
-            BackgroundTransparency = 1,
-            Font = font or Enum.Font.Gotham,
-            Text = text,
-            TextColor3 = color or COLORS.text,
-            TextSize = size or 11,
-            TextWrapped = true,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Center,
-            ZIndex = 2,
-        }, parentFrame)
-    end
+    zoneLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 62),
+        Size = UDim2.new(1, -22, 0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Best zone: --",
+        TextColor3 = COLORS.muted,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
 
-    local function makeButton(parentFrame, text, x, y, width, color, height)
+    statusLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 78),
+        Size = UDim2.new(1, -22, 0, 28),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Waiting...",
+        TextColor3 = COLORS.muted,
+        TextSize = 9,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    }, panel)
+
+    trialLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 107),
+        Size = UDim2.new(1, -22, 0, 13),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Trial: idle",
+        TextColor3 = COLORS.warning,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
+
+    local function makeButton(text, x, y, width, color)
         local button = make("TextButton", {
             Position = UDim2.fromOffset(x, y),
-            Size = UDim2.fromOffset(width, height or 30),
+            Size = UDim2.fromOffset(width, 22),
             BackgroundColor3 = color or COLORS.panel2,
             BorderSizePixel = 0,
             AutoButtonColor = true,
             Font = Enum.Font.GothamBold,
             Text = text,
             TextColor3 = COLORS.text,
-            TextSize = 10,
+            TextSize = 9,
             Active = true,
             Selectable = true,
-            ZIndex = 3,
-        }, parentFrame)
-        round(button, 6)
+        }, panel)
+        round(button, 5)
         return button
     end
 
-    local function makeCard(parentFrame, x, y, w, h, titleText, accent)
-        local card = make("Frame", {
-            Position = UDim2.fromOffset(x, y),
-            Size = UDim2.fromOffset(w, h),
-            BackgroundColor3 = COLORS.panel,
-            BorderSizePixel = 0,
-            ZIndex = 2,
-        }, parentFrame)
-        round(card, 8)
-        make("UIStroke", {Color = accent or Color3.fromRGB(75, 78, 89), Thickness = 1}, card)
-        makeLabel(card, titleText, 11, 5, w - 22, 18, 10, COLORS.muted, Enum.Font.GothamBold)
-        return card
-    end
+    qiButton = makeButton("QI AUTO: OFF", 10, 126, 94, COLORS.panel2)
+    bodyButton = makeButton("BODY AUTO: OFF", 110, 126, 100, COLORS.panel2)
+    breakthroughButton = makeButton("BREAKTHROUGH: ON", 216, 126, 104, COLORS.success)
+    antiAfkButton = makeButton("ANTI-AFK: ON", 10, 153, 94, COLORS.success)
+    pauseButton = makeButton("PAUSE", 110, 153, 65, COLORS.panel2)
+    local hideButton = makeButton("HIDE", 181, 153, 55, COLORS.panel2)
+    local stopButton = makeButton("STOP", 242, 153, 78, COLORS.danger)
+    herbButton = makeButton("HERBS: OFF", 10, 180, 96, COLORS.panel2)
+    herbInfoLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(114, 182),
+        Size = UDim2.fromOffset(206, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Herbs: 0 collected | idle",
+        TextColor3 = COLORS.muted,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, panel)
 
-    -- OVERVIEW PAGE
-    local overview = pageFrames.Overview
-    makeLabel(overview, "LIVE STATUS", 16, 10, 260, 20, 11, COLORS.qi, Enum.Font.GothamBold)
-    modeLabel = makeLabel(overview, "Mode: manual monitor", 16, 39, 290, 18, 11, COLORS.qi, Enum.Font.GothamBold)
-    progressLabel = makeLabel(overview, "Progress: --", 16, 61, 290, 18, 10, COLORS.text)
-    zoneLabel = makeLabel(overview, "Best zone: --", 16, 83, 290, 18, 10, COLORS.muted)
-    statusLabel = makeLabel(overview, "Waiting...", 16, 108, 600, 34, 10, COLORS.muted)
-    trialLabel = makeLabel(overview, "Trial: idle", 16, 146, 600, 18, 9, COLORS.warning)
+    herbFilterButton = makeButton("HERB FILTER: ALL", 10, 207, 132, COLORS.panel2)
+    brewButton = makeButton("BREW: OFF", 10, 234, 94, COLORS.panel2)
+    brewRecipeButton = makeButton("PILLS: QI+BODY", 110, 234, 112, COLORS.panel2)
+    UI.chestButton = makeButton("CHESTS: OFF", 10, 261, 96, COLORS.panel2)
+    UI.chestFilterButton = makeButton("CHEST FILTER: ALL", 110, 261, 132, COLORS.panel2)
+    UI.chestInfoLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(10, 286),
+        Size = UDim2.fromOffset(310, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Chests: 0 opened | idle",
+        TextColor3 = COLORS.muted,
+        TextSize = 8,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, panel)
+    UI.herbMonitorLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(10, 303),
+        Size = UDim2.fromOffset(310, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Code,
+        Text = "Herb nodes N/S 1/10/100/1k: scanning...",
+        TextColor3 = COLORS.muted,
+        TextSize = 8,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, panel)
 
-    local silverCard = makeCard(overview, 330, 12, 282, 66, "SILVER", COLORS.warning)
-    UI.overviewSilverLabel = makeLabel(silverCard, formatNumber(ECONOMY.silver), 11, 26, 260, 28, 20, COLORS.text, Enum.Font.GothamBold)
-    local stoneCard = makeCard(overview, 330, 88, 282, 66, "PRIMORDIAL STONES", COLORS.qi)
-    UI.overviewStoneLabel = makeLabel(stoneCard, formatNumber(ECONOMY.stones), 11, 26, 260, 28, 20, COLORS.text, Enum.Font.GothamBold)
-
-    local overviewHint = makeCard(overview, 16, 184, 596, 150, "AUTOMATION STATUS", COLORS.accent)
-    makeLabel(overviewHint, "Cultivation, herbs, chests, brewing and Silver farming each have independent controls in their tabs.", 12, 30, 568, 34, 11, COLORS.text)
-    makeLabel(overviewHint, "Reroll odds are displayed in Economy. Primordial Stone farming remains unassigned until a repeatable reward source is verified.", 12, 70, 568, 42, 10, COLORS.muted)
-    makeLabel(overviewHint, "No client-forged currency or reward events are sent by this script.", 12, 116, 568, 20, 9, COLORS.warning)
-
-    -- CULTIVATION PAGE
-    local cultivationPage = pageFrames.Cultivation
-    makeLabel(cultivationPage, "QI AND BODY ARE INDEPENDENT MODES; ONE CHARACTER CAN TRAIN ONLY ONE AT A TIME.", 16, 12, 600, 26, 10, COLORS.muted, Enum.Font.GothamBold)
-    local qiCard = makeCard(cultivationPage, 16, 48, 292, 135, "QI CULTIVATION", COLORS.qi)
-    makeLabel(qiCard, "Reads Qi realm and mastery, selects the best eligible Qi zone, then meditates.", 12, 31, 266, 43, 10, COLORS.text)
-    qiButton = makeButton(qiCard, "QI AUTO: OFF", 12, 88, 266, COLORS.panel2, 32)
-    local bodyCard = makeCard(cultivationPage, 322, 48, 292, 135, "BODY CULTIVATION", COLORS.body)
-    makeLabel(bodyCard, "Reads Body realm and EXP, selects the best eligible Body zone, then trains.", 12, 31, 266, 43, 10, COLORS.text)
-    bodyButton = makeButton(bodyCard, "BODY AUTO: OFF", 12, 88, 266, COLORS.panel2, 32)
-    local breakCard = makeCard(cultivationPage, 16, 198, 598, 110, "BREAKTHROUGH ENGINE", COLORS.success)
-    makeLabel(breakCard, "Shared Qi + Body per-layer breakthrough and tribulation timing. Uses the actual Breakthrough and Tap buttons.", 12, 30, 570, 38, 10, COLORS.text)
-    breakthroughButton = makeButton(breakCard, "BREAKTHROUGH: ON", 12, 72, 570, COLORS.success, 28)
-
-    -- FARMING PAGE
-    local farmingPage = pageFrames.Farming
-    makeLabel(farmingPage, "WORLD COLLECTION AND NPC SILVER FARMING", 16, 10, 600, 20, 11, COLORS.success, Enum.Font.GothamBold)
-    local herbCard = makeCard(farmingPage, 16, 38, 292, 152, "HERB COLLECTION", COLORS.success)
-    herbButton = makeButton(herbCard, "HERBS: OFF", 12, 28, 128, COLORS.panel2, 28)
-    herbFilterButton = makeButton(herbCard, "HERB FILTER: ALL", 148, 28, 132, COLORS.panel2, 28)
-    herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 65, 268, 18, 9, COLORS.muted)
-    UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 91, 268, 45, 9, COLORS.muted, Enum.Font.Code)
-
-    local chestCard = makeCard(farmingPage, 322, 38, 292, 152, "WORLD CHESTS", COLORS.warning)
-    UI.chestButton = makeButton(chestCard, "CHESTS: OFF", 12, 28, 128, COLORS.panel2, 28)
-    UI.chestFilterButton = makeButton(chestCard, "CHEST FILTER: ALL", 148, 28, 132, COLORS.panel2, 28)
-    UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 65, 268, 18, 9, COLORS.muted)
-    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 91, 268, 35, 9, COLORS.muted)
-
-    local silverCardFarm = makeCard(farmingPage, 16, 204, 598, 160, "AUTO SILVER - CULTIVATOR CAMPS", COLORS.warning)
-    silverButton = makeButton(silverCardFarm, "AUTO SILVER: OFF", 12, 29, 180, COLORS.panel2, 30)
-    UI.silverInfoLabel = makeLabel(silverCardFarm, "Auto Silver: idle", 204, 29, 370, 28, 10, COLORS.muted)
-    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 12, 70, 570, 20, 10, COLORS.text)
-    makeLabel(silverCardFarm, "Targets non-boss CultivatorCamps NPCs at or below your Qi realm. Requires your sword drawn; uses normal M1 input.", 12, 99, 570, 44, 9, COLORS.muted)
-
-    -- ALCHEMY PAGE
-    local alchemyPage = pageFrames.Alchemy
-    makeLabel(alchemyPage, "ALCHEMY QUEUE", 16, 12, 600, 20, 11, COLORS.warning, Enum.Font.GothamBold)
-    local brewCard = makeCard(alchemyPage, 16, 44, 598, 220, "AUTO BREW", COLORS.warning)
-    brewButton = makeButton(brewCard, "BREW: OFF", 12, 31, 170, COLORS.panel2, 32)
-    brewRecipeButton = makeButton(brewCard, getBrewRecipeSummary(), 194, 31, 380, COLORS.panel2, 32)
-    makeLabel(brewCard, "Select multiple recipes. The queue checks ingredients, uses the oldest available herbs, Stoke timing, and verifies Claim before moving to the next pill.", 12, 82, 570, 55, 10, COLORS.text)
-    makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 146, 570, 42, 9, COLORS.muted)
-
-    -- ECONOMY PAGE
-    local economyPage = pageFrames.Economy
-    makeLabel(economyPage, "CURRENCY AND DESTINY REROLL PLANNER", 16, 10, 600, 20, 11, COLORS.warning, Enum.Font.GothamBold)
-    local economySilverCard = makeCard(economyPage, 16, 40, 292, 82, "SILVER BALANCE", COLORS.warning)
-    UI.currencySilverLabel = makeLabel(economySilverCard, formatNumber(ECONOMY.silver), 12, 27, 268, 32, 20, COLORS.text, Enum.Font.GothamBold)
-    local economyStoneCard = makeCard(economyPage, 322, 40, 292, 82, "PRIMORDIAL STONES", COLORS.qi)
-    UI.currencyStoneLabel = makeLabel(economyStoneCard, formatNumber(ECONOMY.stones), 12, 27, 268, 32, 20, COLORS.text, Enum.Font.GothamBold)
-    UI.economySilverDetail = makeLabel(economyPage, "NPC Silver earned this session: 0 | NPC kill rewards: 0", 16, 136, 598, 20, 10, COLORS.text)
-    UI.economyRateDetail = makeLabel(economyPage, "Observed NPC reward rate: -- Silver/min", 16, 160, 598, 20, 10, COLORS.muted)
-    UI.economyStoneDetail = makeLabel(economyPage, "Stone source not verified. Prior recording showed two +1 balance updates about 10m10s apart; this may be timed, but two samples are not proof.", 16, 184, 598, 38, 9, COLORS.muted)
-    local oddsCard = makeCard(economyPage, 16, 230, 598, 150, "DESTINY REROLLS - ODDS FROM YOUR SCREENSHOT", COLORS.accent)
-    makeLabel(oddsCard, "Common 69.89%   |   Uncommon 20%   |   Rare 8%   |   Legendary 2%", 12, 29, 570, 22, 10, COLORS.text)
-    makeLabel(oddsCard, "Mythical 0.1%   |   Divine 0.01%   |   Clan single-roll cost shown: 5,000 Silver", 12, 55, 570, 22, 10, COLORS.text)
-    UI.rerollOddsLabel = makeLabel(oddsCard, "At 5,000 Silver/roll: average Legendary 50 rolls / 250k; Mythical 1,000 / 5M; Divine 10,000 / 50M. About 50% chance: 35 / 693 / 6,932 rolls. Assumes no pity or batch discount.", 12, 83, 570, 54, 9, COLORS.warning)
-
-    -- SETTINGS PAGE
-    local settingsPage = pageFrames.Settings
-    makeLabel(settingsPage, "SAFETY AND CONTROL", 16, 12, 600, 20, 11, COLORS.accent, Enum.Font.GothamBold)
-    local safetyCard = makeCard(settingsPage, 16, 42, 598, 215, "AUTOMATION CONTROLS", COLORS.accent)
-    antiAfkButton = makeButton(safetyCard, "ANTI-AFK: ON", 12, 31, 180, COLORS.success, 30)
-    pauseButton = makeButton(safetyCard, "PAUSE", 204, 31, 170, COLORS.panel2, 30)
-    local hideButton = makeButton(safetyCard, "HIDE PANEL", 386, 31, 188, COLORS.panel2, 30)
-    local stopButton = makeButton(safetyCard, "STOP ALL", 12, 76, 562, COLORS.danger, 32)
-    makeLabel(safetyCard, "RightCtrl + Home: show/hide   |   RightCtrl + P: pause/resume   |   RightCtrl + End: stop", 12, 128, 570, 35, 9, COLORS.muted)
-    makeLabel(safetyCard, "Anti-AFK handles Roblox's normal Idled event only. Game-specific server AFK checks may still apply.", 12, 169, 570, 28, 9, COLORS.muted)
-
-    -- FILTER PICKERS: placed inside their relevant tabs so they never spill
-    -- outside the redesigned panel.
     herbFilterPicker = make("Frame", {
         Name = "HerbFilterPicker",
-        Position = UDim2.fromOffset(390, 12),
-        Size = UDim2.fromOffset(210, 218),
+        Position = UDim2.fromOffset(338, 126),
+        Size = UDim2.fromOffset(190, 218),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
         Visible = false,
         ZIndex = 22,
-    }, farmingPage)
+    }, panel)
     round(herbFilterPicker, 8)
     make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, herbFilterPicker)
-    makeLabel(herbFilterPicker, "SELECT HERB SPECIES", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
-    local allHerbsButton = makeButton(herbFilterPicker, "SELECT ALL", 8, 27, 194, COLORS.accent, 22)
+    make("TextLabel", {
+        Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -18, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT HERB SPECIES",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 23,
+    }, herbFilterPicker)
+
+    local allHerbsButton = make("TextButton", {
+        Position = UDim2.fromOffset(8, 27),
+        Size = UDim2.new(1, -16, 0, 22),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT ALL",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 23,
+    }, herbFilterPicker)
+    round(allHerbsButton, 5)
     addConnection(allHerbsButton.MouseButton1Click, function()
-        for _, species in ipairs(HERB_SPECIES) do herbSpeciesSelection[species] = true end
+        for _, species in ipairs(HERB_SPECIES) do
+            herbSpeciesSelection[species] = true
+        end
         updateModeButtons()
         setStatus("All five normal herb species enabled. Oldest available herbs are prioritized.", COLORS.success)
     end)
+
     for index, species in ipairs(HERB_SPECIES) do
-        local toggle = makeButton(herbFilterPicker, species, 8, 53 + (index - 1) * 27, 194, COLORS.success, 23)
+        local toggle = make("TextButton", {
+            Position = UDim2.fromOffset(8, 53 + (index - 1) * 27),
+            Size = UDim2.new(1, -16, 0, 23),
+            BackgroundColor3 = COLORS.success,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = species,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+            ZIndex = 23,
+        }, herbFilterPicker)
+        round(toggle, 5)
         herbFilterToggleButtons[species] = toggle
         addConnection(toggle.MouseButton1Click, function()
             herbSpeciesSelection[species] = not herbSpeciesSelection[species]
@@ -3604,22 +3209,50 @@ local function createGui()
             setStatus(species .. (herbSpeciesSelection[species] and " enabled for collection." or " excluded from collection."), COLORS.success)
         end)
     end
-    local herbFilterDone = makeButton(herbFilterPicker, "DONE", 8, 190, 194, COLORS.accent, 22)
-    addConnection(herbFilterDone.MouseButton1Click, function() herbFilterPicker.Visible = false end)
+
+    local herbFilterDone = make("TextButton", {
+        Position = UDim2.fromOffset(8, 190),
+        Size = UDim2.new(1, -16, 0, 22),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "DONE",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 23,
+    }, herbFilterPicker)
+    round(herbFilterDone, 5)
+    addConnection(herbFilterDone.MouseButton1Click, function()
+        herbFilterPicker.Visible = false
+    end)
 
     brewRecipePicker = make("Frame", {
         Name = "BrewRecipePicker",
-        Position = UDim2.fromOffset(390, 12),
-        Size = UDim2.fromOffset(210, 174),
+        Position = UDim2.fromOffset(338, 126),
+        Size = UDim2.fromOffset(190, 174),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
         Visible = false,
-        ZIndex = 22,
-    }, alchemyPage)
+        ZIndex = 20,
+    }, panel)
     round(brewRecipePicker, 8)
     make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, brewRecipePicker)
-    makeLabel(brewRecipePicker, "SELECT MULTIPLE PILLS", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
+    make("TextLabel", {
+        Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -18, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT MULTIPLE PILLS",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 21,
+    }, brewRecipePicker)
+
     local recipePickerRows = {
         {key = "QiSpeed", y = 27},
         {key = "BodySpeed", y = 54},
@@ -3627,38 +3260,110 @@ local function createGui()
         {key = "HP", y = 108},
     }
     for _, row in ipairs(recipePickerRows) do
-        local recipe = BREW_RECIPES[row.key]
-        local toggle = makeButton(brewRecipePicker, recipe.name, 8, row.y, 194, COLORS.success, 23)
-        brewRecipeToggleButtons[row.key] = toggle
+        local key = row.key
+        local recipe = BREW_RECIPES[key]
+        local toggle = make("TextButton", {
+            Position = UDim2.fromOffset(8, row.y),
+            Size = UDim2.new(1, -16, 0, 23),
+            BackgroundColor3 = COLORS.panel2,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = recipe.short,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+            ZIndex = 21,
+        }, brewRecipePicker)
+        round(toggle, 5)
+        brewRecipeToggleButtons[key] = toggle
         addConnection(toggle.MouseButton1Click, function()
-            brewRecipeSelection[row.key] = not brewRecipeSelection[row.key]
+            brewRecipeSelection[key] = not brewRecipeSelection[key]
             updateModeButtons()
+            setStatus(recipe.name .. (brewRecipeSelection[key] and " added to the brew queue." or " removed from the brew queue."), COLORS.success)
         end)
     end
-    local recipeDone = makeButton(brewRecipePicker, "DONE", 8, 145, 194, COLORS.accent, 22)
-    addConnection(recipeDone.MouseButton1Click, function() brewRecipePicker.Visible = false end)
+    local doneButton = make("TextButton", {
+        Position = UDim2.fromOffset(8, 137),
+        Size = UDim2.new(1, -16, 0, 25),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "DONE",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 21,
+    }, brewRecipePicker)
+    round(doneButton, 5)
+    addConnection(doneButton.MouseButton1Click, function()
+        brewRecipePicker.Visible = false
+    end)
 
     UI.chestFilterPicker = make("Frame", {
         Name = "ChestFilterPicker",
-        Position = UDim2.fromOffset(390, 220),
-        Size = UDim2.fromOffset(210, 174),
+        Position = UDim2.fromOffset(338, 126),
+        Size = UDim2.fromOffset(190, 190),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
         Visible = false,
-        ZIndex = 22,
-    }, farmingPage)
+        ZIndex = 24,
+    }, panel)
     round(UI.chestFilterPicker, 8)
     make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, UI.chestFilterPicker)
-    makeLabel(UI.chestFilterPicker, "SELECT CHEST TIERS", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
-    local allChestButton = makeButton(UI.chestFilterPicker, "SELECT ALL", 8, 27, 194, COLORS.accent, 22)
+    make("TextLabel", {
+        Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -18, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT CHEST TIERS",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 25,
+    }, UI.chestFilterPicker)
+    local allChestButton = make("TextButton", {
+        Position = UDim2.fromOffset(8, 27),
+        Size = UDim2.new(1, -16, 0, 22),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT ALL",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 25,
+    }, UI.chestFilterPicker)
+    round(allChestButton, 5)
     addConnection(allChestButton.MouseButton1Click, function()
-        for _, tier in ipairs(CHEST_TIER_ORDER) do CHEST.tierSelection[tier] = true end
+        for _, tier in ipairs(CHEST_TIER_ORDER) do
+            CHEST.tierSelection[tier] = true
+        end
         updateModeButtons()
         CHEST.setStatus("all chest tiers enabled; highest tier first")
     end)
     for index, tier in ipairs(CHEST_TIER_ORDER) do
-        local toggle = makeButton(UI.chestFilterPicker, tier, 8, 53 + (index - 1) * 25, 194, COLORS.success, 22)
+        local toggle = make("TextButton", {
+            Position = UDim2.fromOffset(8, 53 + (index - 1) * 25),
+            Size = UDim2.new(1, -16, 0, 22),
+            BackgroundColor3 = COLORS.success,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = tier,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+            ZIndex = 25,
+        }, UI.chestFilterPicker)
+        round(toggle, 5)
         UI.chestFilterToggleButtons[tier] = toggle
         addConnection(toggle.MouseButton1Click, function()
             CHEST.tierSelection[tier] = not CHEST.tierSelection[tier]
@@ -3666,30 +3371,82 @@ local function createGui()
             CHEST.setStatus(tier .. (CHEST.tierSelection[tier] and " enabled" or " excluded"))
         end)
     end
-    local chestDone = makeButton(UI.chestFilterPicker, "DONE", 8, 157, 194, COLORS.accent, 22)
-    addConnection(chestDone.MouseButton1Click, function() UI.chestFilterPicker.Visible = false end)
+    local chestFilterDone = make("TextButton", {
+        Position = UDim2.fromOffset(8, 157),
+        Size = UDim2.new(1, -16, 0, 24),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "DONE",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 25,
+    }, UI.chestFilterPicker)
+    round(chestFilterDone, 5)
+    addConnection(chestFilterDone.MouseButton1Click, function()
+        UI.chestFilterPicker.Visible = false
+    end)
 
-    for _, picker in ipairs({herbFilterPicker, brewRecipePicker, UI.chestFilterPicker}) do
-        for _, descendant in ipairs(picker:GetDescendants()) do
-            if descendant:IsA("GuiObject") then descendant.ZIndex = 23 end
+    addConnection(brewButton.MouseButton1Click, function()
+        autoBrewEnabled = not autoBrewEnabled
+        updateModeButtons()
+        if autoBrewEnabled then
+            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; oldest available herbs will be selected.", COLORS.success)
+            runAutoBrew()
+        else
+            setStatus("Auto Brew disabled. Current in-progress brew will be left untouched.", COLORS.warning)
         end
-    end
+    end)
 
-    -- Global footer status is visible on every tab.
-    footerStatusLabel = makeLabel(panel, "Ready.", 14, 510, 632, 18, 9, COLORS.muted)
+    addConnection(herbFilterButton.MouseButton1Click, function()
+        if herbFilterPicker then
+            herbFilterPicker.Visible = not herbFilterPicker.Visible
+        end
+        if brewRecipePicker then
+            brewRecipePicker.Visible = false
+        end
+        if UI.chestFilterPicker then
+            UI.chestFilterPicker.Visible = false
+        end
+        updateModeButtons()
+        setStatus("Choose which herb species Auto Herbs may collect. Within the selected species, older HerbYear values are collected first.", COLORS.success)
+    end)
 
-    -- BUTTON CALLBACKS ------------------------------------------------------
+    addConnection(brewRecipeButton.MouseButton1Click, function()
+        if brewRecipePicker then
+            brewRecipePicker.Visible = not brewRecipePicker.Visible
+        end
+        if herbFilterPicker then
+            herbFilterPicker.Visible = false
+        end
+        if UI.chestFilterPicker then
+            UI.chestFilterPicker.Visible = false
+        end
+        updateModeButtons()
+        setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes when ingredients are available.", COLORS.success)
+    end)
+
     addConnection(qiButton.MouseButton1Click, function()
         if selectedAutoMode == "Qi" then
             selectedAutoMode = nil
             local ok, stopped, backend = stopAutomationOwnedTraining("Qi")
-            if not ok then setStatus("Qi Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
-            elseif stopped then setStatus("Qi Auto OFF; script-started meditation stopped.", COLORS.warning)
-            else setStatus("Qi Auto OFF. Manually started meditation is left alone.", COLORS.warning) end
+            if not ok then
+                setStatus("Qi Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
+            elseif stopped then
+                setStatus("Qi Auto OFF; script-started meditation stopped.", COLORS.warning)
+            else
+                setStatus("Qi Auto OFF. Manually started meditation is left alone.", COLORS.warning)
+            end
         else
             if selectedAutoMode == "Body" then
                 local ok, _, backend = stopAutomationOwnedTraining("Body")
-                if not ok then setStatus("Could not stop script-started Body training; Qi was not enabled: " .. tostring(backend), COLORS.danger); return end
+                if not ok then
+                    setStatus("Could not stop script-started Body training; Qi was not enabled: " .. tostring(backend), COLORS.danger)
+                    return
+                end
             end
             selectedAutoMode = "Qi"
             setStatus("Qi Auto Cultivation ON. Selecting the best unlocked Qi zone.", COLORS.success)
@@ -3704,13 +3461,20 @@ local function createGui()
         if selectedAutoMode == "Body" then
             selectedAutoMode = nil
             local ok, stopped, backend = stopAutomationOwnedTraining("Body")
-            if not ok then setStatus("Body Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
-            elseif stopped then setStatus("Body Auto OFF; script-started push-ups stopped.", COLORS.warning)
-            else setStatus("Body Auto OFF. Manually started push-ups are left alone.", COLORS.warning) end
+            if not ok then
+                setStatus("Body Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
+            elseif stopped then
+                setStatus("Body Auto OFF; script-started push-ups stopped.", COLORS.warning)
+            else
+                setStatus("Body Auto OFF. Manually started push-ups are left alone.", COLORS.warning)
+            end
         else
             if selectedAutoMode == "Qi" then
                 local ok, _, backend = stopAutomationOwnedTraining("Qi")
-                if not ok then setStatus("Could not stop script-started Qi meditation; Body was not enabled: " .. tostring(backend), COLORS.danger); return end
+                if not ok then
+                    setStatus("Could not stop script-started Qi meditation; Body was not enabled: " .. tostring(backend), COLORS.danger)
+                    return
+                end
             end
             selectedAutoMode = "Body"
             setStatus("Body Auto Cultivation ON. Selecting the best unlocked Body zone.", COLORS.success)
@@ -3734,65 +3498,31 @@ local function createGui()
         end
     end)
 
-    addConnection(herbFilterButton.MouseButton1Click, function()
-        herbFilterPicker.Visible = not herbFilterPicker.Visible
-        brewRecipePicker.Visible = false
-        UI.chestFilterPicker.Visible = false
-        updateModeButtons()
-        setStatus("Choose which herb species Auto Herbs may collect. Oldest HerbYear is prioritized.", COLORS.success)
-    end)
-
     addConnection(UI.chestButton.MouseButton1Click, function()
         CHEST.autoEnabled = not CHEST.autoEnabled
         updateModeButtons()
         if CHEST.autoEnabled then
             CHEST.setStatus("scanning; Celestial > Jade > Bronze > Wooden")
-            setStatus("Auto Chest enabled. It pauses other farming activities, opens the highest selected tier, and verifies ChestWorldOpened.", COLORS.success)
+            setStatus("Auto Chest enabled. It will pause cultivation, open the highest available selected tier, verify the local reward event, then resume.", COLORS.success)
             CHEST.run()
         else
             CHEST.setStatus("turning off after current prompt hold")
-            setStatus("Auto Chest disabled; releasing any active prompt hold and restoring activity.", COLORS.warning)
+            setStatus("Auto Chest disabled; releasing any active prompt hold and restoring the previous activity.", COLORS.warning)
         end
     end)
 
     addConnection(UI.chestFilterButton.MouseButton1Click, function()
-        UI.chestFilterPicker.Visible = not UI.chestFilterPicker.Visible
-        herbFilterPicker.Visible = false
-        brewRecipePicker.Visible = false
+        if UI.chestFilterPicker then
+            UI.chestFilterPicker.Visible = not UI.chestFilterPicker.Visible
+        end
+        if herbFilterPicker then
+            herbFilterPicker.Visible = false
+        end
+        if brewRecipePicker then
+            brewRecipePicker.Visible = false
+        end
         updateModeButtons()
         CHEST.setStatus("select allowed tiers; highest enabled tier is opened first")
-    end)
-
-    addConnection(brewButton.MouseButton1Click, function()
-        autoBrewEnabled = not autoBrewEnabled
-        updateModeButtons()
-        if autoBrewEnabled then
-            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; oldest available herbs will be selected.", COLORS.success)
-            runAutoBrew()
-        else
-            setStatus("Auto Brew disabled. Current in-progress brew will be left untouched.", COLORS.warning)
-        end
-    end)
-
-    addConnection(brewRecipeButton.MouseButton1Click, function()
-        brewRecipePicker.Visible = not brewRecipePicker.Visible
-        herbFilterPicker.Visible = false
-        UI.chestFilterPicker.Visible = false
-        updateModeButtons()
-        setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
-    end)
-
-    addConnection(UI.silverButton.MouseButton1Click, function()
-        SILVER.autoEnabled = not SILVER.autoEnabled
-        updateModeButtons()
-        if SILVER.autoEnabled then
-            SILVER.setStatus("scanning eligible non-boss cultivators")
-            setStatus("Auto Silver enabled. It targets CultivatorCamps NPCs at or below your Qi realm using normal M1 input; no reward remotes are fired.", COLORS.success)
-            runAutoSilver()
-        else
-            SILVER.setStatus("stopping after current attack")
-            setStatus("Auto Silver disabled; it will stop after the current input and resume selected cultivation.", COLORS.warning)
-        end
     end)
 
     addConnection(breakthroughButton.MouseButton1Click, function()
@@ -3811,19 +3541,20 @@ local function createGui()
         paused = not paused
         pauseButton.Text = paused and "RESUME" or "PAUSE"
         pauseButton.BackgroundColor3 = paused and COLORS.warning or COLORS.panel2
-        if UI.headerState then
-            UI.headerState.Text = paused and "PAUSED" or "RUNNING"
-            UI.headerState.BackgroundColor3 = paused and COLORS.warning or COLORS.success
-        end
-        setStatus(paused and "Paused; automation actions suspended." or "Resumed.", paused and COLORS.warning or COLORS.success)
+        setStatus(paused and "Paused; cultivation and breakthrough actions suspended." or "Resumed.", paused and COLORS.warning or COLORS.success)
     end)
 
-    addConnection(hideButton.MouseButton1Click, function() panel.Visible = false end)
-    addConnection(stopButton.MouseButton1Click, function() stop("stop button") end)
+    addConnection(hideButton.MouseButton1Click, function()
+        if panel then
+            panel.Visible = false
+        end
+    end)
+
+    addConnection(stopButton.MouseButton1Click, function()
+        stop("stop button")
+    end)
 
     updateModeButtons()
-    updateEconomyUI()
-    SILVER.setStatus("idle")
 end
 
 -- Read replicated game state. These are inbound listeners only.
@@ -3836,54 +3567,6 @@ do
     end
 
     if eventsFolder then
-        local moneyRemote = eventsFolder:FindFirstChild("UpdateMoney")
-        if moneyRemote and moneyRemote:IsA("RemoteEvent") then
-            addConnection(moneyRemote.OnClientEvent, function(value)
-                local newValue = tonumber(value)
-                if newValue then
-                    if ECONOMY.silver == nil then ECONOMY.silverStart = newValue end
-                    ECONOMY.silver = newValue
-                    updateEconomyUI()
-                end
-            end)
-        end
-
-        local stonesRemote = eventsFolder:FindFirstChild("UpdatePrimordialStones")
-        if stonesRemote and stonesRemote:IsA("RemoteEvent") then
-            addConnection(stonesRemote.OnClientEvent, function(value)
-                local newValue = tonumber(value)
-                if newValue then
-                    local oldValue = ECONOMY.stones
-                    if oldValue == nil then ECONOMY.stonesStart = newValue end
-                    if oldValue ~= nil and newValue ~= oldValue then
-                        ECONOMY.lastStoneDelta = newValue - oldValue
-                        ECONOMY.lastStoneChangeAt = os.time()
-                        ECONOMY.lastStoneChangeClock = os.clock()
-                        if newValue > oldValue then ECONOMY.stonesEarned = ECONOMY.stonesEarned + (newValue - oldValue) end
-                    end
-                    ECONOMY.stones = newValue
-                    updateEconomyUI()
-                end
-            end)
-        end
-
-        local npcSilverRemote = eventsFolder:FindFirstChild("NpcKillSilver")
-        if npcSilverRemote and npcSilverRemote:IsA("RemoteEvent") then
-            addConnection(npcSilverRemote.OnClientEvent, function(value)
-                local amount = tonumber(value) or 0
-                if amount > 0 then
-                    ECONOMY.npcSilverEarned = ECONOMY.npcSilverEarned + amount
-                    ECONOMY.npcKillCount = ECONOMY.npcKillCount + 1
-                    SILVER.lastReward = amount
-                    if SILVER.busy and SILVER.currentTarget then
-                        SILVER.earned = SILVER.earned + amount
-                    end
-                    updateEconomyUI()
-                    if SILVER.busy then SILVER.setStatus("Silver reward +" .. formatNumber(amount) .. " received") end
-                end
-            end)
-        end
-
         local qiRemote = eventsFolder:FindFirstChild("UpdateClient")
         if qiRemote and qiRemote:IsA("RemoteEvent") then
             addConnection(qiRemote.OnClientEvent, function(data)
@@ -4020,31 +3703,6 @@ addConnection(LocalPlayer.Idled, function()
     end
 end)
 
--- Initial currency read and attribute-change fallbacks.
-local function refreshEconomyAttributes()
-    local silver = tonumber(LocalPlayer:GetAttribute("Silver"))
-    local stones = tonumber(LocalPlayer:GetAttribute("PrimordialStones"))
-    if silver ~= nil then
-        if ECONOMY.silverStart == nil then ECONOMY.silverStart = silver end
-        ECONOMY.silver = silver
-    end
-    if stones ~= nil then
-        if ECONOMY.stonesStart == nil then ECONOMY.stonesStart = stones end
-        local oldStones = ECONOMY.stones
-        if oldStones ~= nil and stones ~= oldStones then
-            ECONOMY.lastStoneDelta = stones - oldStones
-            ECONOMY.lastStoneChangeAt = os.time()
-            ECONOMY.lastStoneChangeClock = os.clock()
-            if stones > oldStones then ECONOMY.stonesEarned = ECONOMY.stonesEarned + (stones - oldStones) end
-        end
-        ECONOMY.stones = stones
-    end
-    updateEconomyUI()
-end
-refreshEconomyAttributes()
-addConnection(LocalPlayer:GetAttributeChangedSignal("Silver"), refreshEconomyAttributes)
-addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refreshEconomyAttributes)
-
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
@@ -4081,11 +3739,7 @@ addConnection(UserInputService.InputBegan, function(input, gameProcessed)
             pauseButton.Text = paused and "RESUME" or "PAUSE"
             pauseButton.BackgroundColor3 = paused and COLORS.warning or COLORS.panel2
         end
-        if UI.headerState then
-            UI.headerState.Text = paused and "PAUSED" or "RUNNING"
-            UI.headerState.BackgroundColor3 = paused and COLORS.warning or COLORS.success
-        end
-        setStatus(paused and "Paused; automation actions suspended." or "Resumed.", paused and COLORS.warning or COLORS.success)
+        setStatus(paused and "Paused; cultivation and breakthrough actions suspended." or "Resumed.", paused and COLORS.warning or COLORS.success)
     elseif input.KeyCode == Enum.KeyCode.End then
         stop("RightCtrl+End")
     end
@@ -4107,7 +3761,7 @@ addConnection(RunService.RenderStepped, function()
         return
     end
 
-    if not trialActiveOrError and not herbCollectorBusy and not CHEST.busy and not SILVER.busy and frameCounter % 6 == 0 then
+    if not trialActiveOrError and not herbCollectorBusy and not CHEST.busy and frameCounter % 6 == 0 then
         local okBreak, breakError = pcall(processBreakthrough)
         if not okBreak then
             lastError = tostring(breakError)
@@ -4115,7 +3769,7 @@ addConnection(RunService.RenderStepped, function()
         end
     end
 
-    if CHEST.pendingManualResume and not paused and not CHEST.busy and not SILVER.busy and not herbCollectorBusy and not autoBrewBusy then
+    if CHEST.pendingManualResume and not paused and not CHEST.busy and not herbCollectorBusy and not autoBrewBusy then
         local resumeMode = CHEST.pendingManualResume
         CHEST.pendingManualResume = nil
         if running and not isTrainingActive(resumeMode) then
@@ -4141,8 +3795,7 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v0.9 loaded. Redesigned tabbed UI, economy tracker and Auto Silver are available; Auto Silver is OFF until enabled.")
+print("[CU AutoCultivation] v0.8 loaded. Auto Chest and Auto Brew are OFF until enabled; Qi/Body toggles remain reversible.")
 print("[CU AutoCultivation] Auto Chest prioritizes Celestial > Jade > Bronze > Wooden and verifies ChestWorldOpened for the local player.")
-print("[CU AutoCultivation] Auto Silver uses normal M1 input against non-boss CultivatorCamps NPCs at or below the current Qi realm; no reward remotes are fired.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-setStatus("Loaded. Use the tabs to manage cultivation, farming, alchemy, economy and settings. Auto Silver is OFF.", COLORS.success)
+setStatus("Loaded. Auto Chest is OFF; chest filters default to all tiers, highest tier first.", COLORS.success)
