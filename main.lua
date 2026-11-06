@@ -1,34 +1,36 @@
 --[[
     CULTIVATION UNBOUND - FULL SESSION RECORDER
-    Version: 1.2
+    Version: 1.3
 
-    Purpose:
-      Record the client-visible state of a fresh Cultivation Unbound session.
+    Read-only client observer for a fresh progression session.
 
     Captures:
-      - Initial snapshot of DataModel descendants
-      - Instance creation/removal and selected attribute/property changes
-      - GUI text, colors, visibility and trial timing visuals
-      - Keyboard/mouse/touch/gamepad press and release (no mouse-move flood)
-      - Local character and player state
-      - Proximity prompts, click detectors, tools and bindable events
-      - Incoming RemoteEvent traffic; outbound remote hooks are disabled by default
-        because executor namecall hooks can interfere with client input/game behavior
-      - High-frequency sampling of visible Trial GUI elements during tribulations
-      - Periodic checkpoints of local player, character and PlayerGui
+      * Local player, character, PlayerGui, leaderstats, backpack and attributes
+      * Qi / Body cultivation, realms, layers, mastery, multipliers and progress UI
+      * Minimal breakthroughs and tribulation UI state
+      * Trial ring / glow / seal / tap geometry and visual changes at render rate
+      * GUI text, visibility, colors, buttons and button activations
+      * Relevant Workspace entities, NPCs, herbs, bosses, drops and prompts
+      * Tools, proximity prompts, click detectors and Humanoid state / health
+      * Input began / ended events (does not record text typed into TextBoxes)
+      * Relevant inbound RemoteEvent traffic where visible to the client
+      * Periodic compact checkpoints and local character position changes
 
-    This script is READ-ONLY. It does not click, fire remotes, change stats,
-    move the character, or automate cultivation.
+    Storage:
+      * appendfile available: rotates JSONL parts at a configurable size
+      * writefile only: writes bounded JSONL segment files
+      * Manifest lists every exported part and session totals
+      * No intentional event-count cap
 
-    Output:
-      CultivationUnbound_Logs/CU_Recorder_<timestamp>_<userid>.jsonl
-      JSONL = one JSON object per line.
-      Press EXPORT & STOP to finalize the complete session file.
+    Safety:
+      * Does not click, fire remotes, change stats, move the character or automate play
+      * Does not install namecall / metamethod hooks for outbound remote spying
+      * Does not record mouse movement or chat message contents
+      * GUI background is click-through; only its buttons receive clicks
 
-    Notes:
-      - No intentional event-count limit when file append is available.
-      - Full logging can create very large files and use additional CPU/disk.
-      - Server-only state that never replicates to the client cannot be observed.
+    IMPORTANT:
+      * Client-visible data only. Server-only state is not accessible.
+      * Executor must support appendfile or writefile for reliable disk export.
 ]]
 
 local Players = game:GetService("Players")
@@ -36,11 +38,12 @@ local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
-local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    warn("[CU Recorder] LocalPlayer is unavailable.")
+    warn("[CU Recorder] LocalPlayer is unavailable. Run from a client executor.")
     return
 end
 
@@ -52,9 +55,8 @@ if type(getgenv) == "function" then
     end
 end
 
--- Stop an earlier copy before starting a new session recorder.
 if type(sharedEnv.__CURecorderStop) == "function" then
-    pcall(sharedEnv.__CURecorderStop, "replaced_by_new_session")
+    pcall(sharedEnv.__CURecorderStop, "replaced_by_v1_3")
 end
 if sharedEnv.__CURecorderGui then
     pcall(function()
@@ -63,68 +65,99 @@ if sharedEnv.__CURecorderGui then
 end
 
 local CONFIG = {
-    FOLDER = "CultivationUnbound_Logs",
+    OUTPUT_FOLDER = "CultivationUnbound_Logs",
     FLUSH_INTERVAL = 1.0,
-    FLUSH_BATCH_SIZE = 300,
-    CHECKPOINT_INTERVAL = 45,
-    TRIAL_SAMPLE_RATE = "RenderStepped",
-    LOG_INPUT_CHANGED = false,
-    LOG_REMOTE_TRAFFIC = false,
-    LOG_RELEVANT_PROPERTY_CHANGES = true,
-    LOG_WORLD_PHYSICS_CHANGES = false,
+    FLUSH_BATCH_EVENTS = 800,
+    APPEND_PART_BYTES = 16 * 1024 * 1024,
+    WRITEFILE_SEGMENT_BYTES = 512 * 1024,
+    WRITEFILE_SEGMENT_SECONDS = 5,
+    CHECKPOINT_INTERVAL = 30,
+    CHARACTER_POSITION_INTERVAL = 1,
+    CHARACTER_POSITION_MIN_DELTA = 0.75,
+    TRIAL_SAMPLE_HZ = 60,
+    MAX_NORMALIZE_DEPTH = 6,
+    MAX_TABLE_ENTRIES = 600,
+    MAX_STRING_LENGTH = 2400,
+    LOG_RELEVANT_INBOUND_REMOTES = true,
+    LOG_ALL_INBOUND_REMOTES = true,
 }
 
 local running = true
 local paused = false
+local stopping = false
 local flushing = false
 local totalEvents = 0
 local totalInstances = 0
-local totalBytes = 0
 local droppedEvents = 0
+local sequence = 0
 local startedClock = os.clock()
 local startedUnix = os.time()
-local sequence = 0
 local queue = {}
-local memoryBatches = {}
 local connections = {}
 local uiConnections = {}
 local tracked = setmetatable({}, { __mode = "k" })
-local trialInstances = {}
+local trialSet = setmetatable({}, { __mode = "k" })
+local trialObjects = {}
 local trialSampleCache = setmetatable({}, { __mode = "k" })
-local trialWasActive = false
-local storageMode = "unavailable"
+local eventCounts = {}
+local partPaths = {}
+local partBytes = {}
+local partIndex = 0
+local currentPartPath = nil
+local currentPartBytes = 0
+local segmentBuffer = ""
+local segmentLastWrite = os.clock()
+local totalBytes = 0
+local storageMode = "checking"
 local storageError = nil
-local recoveryFilePath = nil
-local filePath = nil
+local outputFolder = CONFIG.OUTPUT_FOLDER
+local baseName = nil
+local manifestPath = nil
 local gui = nil
 local ui = {}
-local statusText = "Starting..."
+local trialWasActive = false
+local trialFrame = 0
+local lastTrialSample = 0
+local lastTrialPrune = 0
+local lastPositionSample = 0
+local lastCharacterPosition = nil
+local lastCheckpoint = 0
+local checkpointSignatures = {}
+local initialScanComplete = false
+local flushRequested = false
 
-local sessionStamp = os.date("%Y%m%d_%H%M%S")
-local sessionFile = "CU_Recorder_" .. sessionStamp .. "_" .. tostring(LocalPlayer.UserId) .. ".jsonl"
-filePath = CONFIG.FOLDER .. "/" .. sessionFile
+local sessionStamp = os.date("%Y%m%d_%H%M%S") .. "_" .. tostring(math.floor((os.clock() % 1) * 1000))
+baseName = "CU_Recorder_" .. sessionStamp .. "_" .. tostring(LocalPlayer.UserId)
+
+local function safeGet(instance, property)
+    local ok, value = pcall(function()
+        return instance[property]
+    end)
+    if ok then
+        return value
+    end
+    return nil
+end
+
+local function safeClass(instance)
+    local ok, value = pcall(function()
+        return instance.ClassName
+    end)
+    return ok and tostring(value) or "Unknown"
+end
 
 local function safePath(instance)
     if not instance then
         return "<nil>"
     end
-    local ok, result = pcall(function()
+    local ok, value = pcall(function()
         return instance:GetFullName()
     end)
-    if ok and result then
-        return result
+    if ok and value then
+        return tostring(value)
     end
-    local nameOk, name = pcall(function()
-        return instance.Name
-    end)
-    return nameOk and tostring(name) or "<unparented>"
-end
-
-local function safeClass(instance)
-    local ok, result = pcall(function()
-        return instance.ClassName
-    end)
-    return ok and tostring(result) or "Unknown"
+    local name = safeGet(instance, "Name")
+    return name and tostring(name) or "<unparented>"
 end
 
 local function safeIsA(instance, className)
@@ -134,24 +167,38 @@ local function safeIsA(instance, className)
     return ok and result == true
 end
 
-local safeGet
+local function safeDescendantOf(instance, ancestor)
+    if not instance or not ancestor then
+        return false
+    end
+    local ok, result = pcall(function()
+        return instance == ancestor or instance:IsDescendantOf(ancestor)
+    end)
+    return ok and result == true
+end
+
+local function truncateString(value, maxLength)
+    local text = tostring(value)
+    if #text > maxLength then
+        return string.sub(text, 1, maxLength - 3) .. "..."
+    end
+    return text
+end
 
 local function normalize(value, depth, seen)
     depth = depth or 0
     seen = seen or {}
-
     if value == nil then
         return nil
     end
 
     local valueType = typeof(value)
-
     if valueType == "Instance" then
         return {
             __type = "Instance",
             class = safeClass(value),
-            name = safeGet(value, "Name") or "?",
-            path = safePath(value),
+            name = truncateString(safeGet(value, "Name") or "?", 120),
+            path = truncateString(safePath(value), 360),
         }
     elseif valueType == "Vector2" then
         return { __type = "Vector2", x = value.X, y = value.Y }
@@ -201,107 +248,97 @@ local function normalize(value, depth, seen)
         if value == math.huge then return "Infinity" end
         if value == -math.huge then return "-Infinity" end
         return value
-    elseif type(value) == "string" or type(value) == "boolean" then
+    elseif type(value) == "string" then
+        return truncateString(value, CONFIG.MAX_STRING_LENGTH)
+    elseif type(value) == "boolean" then
         return value
     elseif type(value) == "function" then
         return "<function>"
     elseif type(value) == "thread" then
         return "<thread>"
     elseif type(value) == "userdata" then
-        return tostring(value)
+        return truncateString(tostring(value), 300)
     elseif type(value) == "table" then
-        if depth >= 6 then
+        if depth >= CONFIG.MAX_NORMALIZE_DEPTH then
             return "<max_depth>"
         end
         if seen[value] then
             return "<cycle>"
         end
         seen[value] = true
-
         local result = {}
         local count = 0
         for key, item in pairs(value) do
             count = count + 1
-            if count > 300 then
+            if count > CONFIG.MAX_TABLE_ENTRIES then
                 result.__truncated = true
                 break
             end
-            result[tostring(key)] = normalize(item, depth + 1, seen)
+            result[truncateString(key, 100)] = normalize(item, depth + 1, seen)
         end
         seen[value] = nil
         return result
     end
 
-    return tostring(value)
+    return truncateString(tostring(value), 300)
 end
 
-local function packArguments(...)
-    local count = select("#", ...)
-    local values = {}
-    for index = 1, count do
-        values[index] = normalize(select(index, ...))
+local function pathContainsAny(path, words)
+    local lower = string.lower(tostring(path or ""))
+    for _, word in ipairs(words) do
+        if string.find(lower, word, 1, true) then
+            return true
+        end
     end
-    return { n = count, values = values }
+    return false
 end
+
+local MECHANIC_WORDS = {
+    "cultivat", "qi", "body", "realm", "trial", "tribulation", "breakthrough",
+    "quest", "inventory", "backpack", "skill", "boss", "enemy", "herb", "pill",
+    "sect", "event", "silver", "stone", "soul", "leaderstat", "npc", "merchant",
+    "reward", "stats", "trait", "race", "clan", "manual", "training", "weight",
+    "meditat", "aura", "sense", "zone", "shop", "currency", "party", "spirit",
+    "map", "teleport", "resource", "drop", "chest", "treasure", "dialog", "tracker",
+    "title", "potion", "elixir", "pvp", "arena", "damage", "health", "combat",
+    "fight", "refin", "meridian", "dantian", "mastery", "progress", "multiplier",
+    "speed", "realmdisplay", "worldboss", "worldevent", "qisense", "qi_sense",
+}
+
+local TRIAL_WORDS = { "trial", "tribulation", "breakthrough", "breakthroughmg", "breakthroughgui" }
+local REMOTE_WORDS = {
+    "cultivat", "qi", "body", "realm", "trial", "breakthrough", "quest", "inventory",
+    "skill", "boss", "herb", "pill", "sect", "event", "reward", "shop", "purchase",
+    "player", "character", "stat", "progress", "update", "sync", "state", "notify",
+    "action", "data", "world", "spirit", "soul",
+}
 
 local function classifyPath(path)
     local lower = string.lower(tostring(path or ""))
     local tags = {}
-    local terms = {
-        { "qi", "qi" },
-        { "body", "body" },
-        { "trial", "trial" },
-        { "breakthrough", "breakthrough" },
-        { "cultivat", "cultivation" },
-        { "realm", "realm" },
-        { "quest", "quest" },
-        { "inventory", "inventory" },
-        { "backpack", "inventory" },
-        { "tool", "tool" },
-        { "skill", "skill" },
-        { "boss", "boss" },
-        { "enemy", "enemy" },
-        { "herb", "herb" },
-        { "pill", "pill" },
-        { "sect", "sect" },
-        { "event", "world_event" },
-        { "silver", "currency" },
-        { "stone", "currency" },
-        { "soul", "soul" },
-        { "leaderstat", "leaderstats" },
+    local map = {
+        { "qi", "qi" }, { "body", "body" }, { "trial", "trial" },
+        { "tribulation", "tribulation" }, { "breakthrough", "breakthrough" },
+        { "cultivat", "cultivation" }, { "realm", "realm" }, { "quest", "quest" },
+        { "inventory", "inventory" }, { "backpack", "inventory" }, { "skill", "skill" },
+        { "boss", "boss" }, { "enemy", "enemy" }, { "herb", "herb" },
+        { "pill", "pill" }, { "sect", "sect" }, { "event", "world_event" },
+        { "silver", "currency" }, { "stone", "currency" }, { "soul", "soul" },
+        { "trait", "trait" }, { "npc", "npc" }, { "merchant", "merchant" },
+        { "party", "party" }, { "leaderstat", "leaderstats" },
     }
-    local seenTags = {}
-    for _, pair in ipairs(terms) do
-        if string.find(lower, pair[1], 1, true) and not seenTags[pair[2]] then
-            seenTags[pair[2]] = true
+    local seen = {}
+    for _, pair in ipairs(map) do
+        if string.find(lower, pair[1], 1, true) and not seen[pair[2]] then
+            seen[pair[2]] = true
             table.insert(tags, pair[2])
         end
     end
     return tags
 end
 
-local function addConnection(connection)
-    if connection then
-        table.insert(connections, connection)
-    end
-    return connection
-end
-
-local function addUiConnection(connection)
-    if connection then
-        table.insert(uiConnections, connection)
-    end
-    return connection
-end
-
-safeGet = function(instance, property)
-    local ok, value = pcall(function()
-        return instance[property]
-    end)
-    if ok then
-        return value
-    end
-    return nil
+local function isTrialPath(path)
+    return pathContainsAny(path, TRIAL_WORDS)
 end
 
 local function getAttributes(instance)
@@ -318,263 +355,303 @@ local function getTags(instance)
     local ok, tags = pcall(function()
         return CollectionService:GetTags(instance)
     end)
-    if ok then
+    if ok and type(tags) == "table" then
         return tags
     end
     return {}
 end
 
-local function propertiesFor(instance)
-    local props = { "Name", "ClassName", "Archivable" }
-    local function add(list)
-        for _, property in ipairs(list) do
-            table.insert(props, property)
-        end
+local function getTimestampMillis()
+    local ok, result = pcall(function()
+        return DateTime.now().UnixTimestampMillis
+    end)
+    if ok and result then
+        return result
     end
-
-    if safeIsA(instance, "GuiObject") then
-        add({
-            "Visible", "Active", "Selectable", "Position", "Size",
-            "AbsolutePosition", "AbsoluteSize", "AnchorPoint", "Rotation",
-            "ZIndex", "LayoutOrder", "BackgroundColor3",
-            "BackgroundTransparency", "BorderColor3", "BorderSizePixel",
-            "ClipsDescendants",
-        })
-    end
-
-    if safeIsA(instance, "LayerCollector") then
-        add({ "Enabled", "DisplayOrder", "ZIndexBehavior" })
-    end
-
-    if safeIsA(instance, "TextLabel") or safeIsA(instance, "TextButton") or safeIsA(instance, "TextBox") then
-        add({
-            "Text", "TextColor3", "TextTransparency", "TextStrokeColor3",
-            "TextStrokeTransparency", "TextSize", "TextScaled", "TextWrapped",
-            "TextTruncate", "RichText", "Font", "FontFace", "TextXAlignment",
-            "TextYAlignment", "LineHeight", "PlaceholderText",
-            "PlaceholderColor3", "ClearTextOnFocus", "MultiLine",
-        })
-    end
-
-    if safeIsA(instance, "ImageLabel") or safeIsA(instance, "ImageButton") then
-        add({ "Image", "ImageColor3", "ImageTransparency", "ImageRectOffset", "ImageRectSize", "ScaleType", "SliceCenter", "TileSize" })
-    end
-
-    if safeIsA(instance, "UIStroke") then
-        add({ "Color", "Thickness", "Transparency", "Enabled", "ApplyStrokeMode", "LineJoinMode" })
-    end
-
-    if safeIsA(instance, "UIGradient") then
-        add({ "Color", "Transparency", "Rotation", "Offset", "Enabled" })
-    end
-
-    if safeIsA(instance, "UIListLayout") or safeIsA(instance, "UIGridLayout") or safeIsA(instance, "UITableLayout") then
-        add({ "FillDirection", "HorizontalAlignment", "VerticalAlignment", "SortOrder", "Padding", "CellSize", "CellPadding", "StartCorner", "FillDirectionMaxCells" })
-    end
-
-    if safeIsA(instance, "ValueBase") then
-        add({ "Value" })
-    end
-
-    if safeIsA(instance, "BasePart") then
-        -- Keep spatial details for likely gameplay objects and the local character.
-        -- Static map geometry still gets its name/class/path/attributes, but does not
-        -- generate thousands of unnecessary transform reads in the initial snapshot.
-        local lowerPath = string.lower(safePath(instance))
-        local spatialRelevant = string.find(lowerPath, "npc", 1, true)
-            or string.find(lowerPath, "herb", 1, true)
-            or string.find(lowerPath, "boss", 1, true)
-            or string.find(lowerPath, "quest", 1, true)
-            or string.find(lowerPath, "merchant", 1, true)
-            or string.find(lowerPath, "event", 1, true)
-            or string.find(lowerPath, "trial", 1, true)
-            or string.find(lowerPath, "cultivation", 1, true)
-            or string.find(lowerPath, "spawn", 1, true)
-            or string.find(lowerPath, "resource", 1, true)
-            or string.find(lowerPath, "drop", 1, true)
-            or string.find(lowerPath, "zone", 1, true)
-        local character = LocalPlayer.Character
-        if character then
-            local ok, insideCharacter = pcall(function()
-                return instance:IsDescendantOf(character)
-            end)
-            spatialRelevant = spatialRelevant or (ok and insideCharacter)
-        end
-        if spatialRelevant then
-            add({
-                "CFrame", "Position", "Orientation", "Size", "Anchored", "CanCollide",
-                "CanTouch", "CanQuery", "Transparency", "Color", "Material",
-            })
-        end
-    end
-
-    if safeIsA(instance, "Model") then
-        add({ "PrimaryPart", "WorldPivot", "LevelOfDetail" })
-    end
-
-    if safeIsA(instance, "Humanoid") then
-        add({
-            "Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight",
-            "UseJumpPower", "HipHeight", "Sit", "PlatformStand", "MoveDirection",
-            "FloorMaterial", "AutoRotate", "RigType", "DisplayName", "NameDisplayDistance",
-        })
-    end
-
-    if safeIsA(instance, "Tool") then
-        add({ "Enabled", "CanBeDropped", "RequiresHandle", "ToolTip" })
-    end
-
-    if safeIsA(instance, "ProximityPrompt") then
-        add({
-            "ActionText", "ObjectText", "Enabled", "HoldDuration",
-            "MaxActivationDistance", "RequiresLineOfSight", "KeyboardKeyCode",
-            "GamepadKeyCode", "ClickablePrompt", "Exclusivity",
-        })
-    end
-
-    if safeIsA(instance, "ClickDetector") then
-        add({ "MaxActivationDistance", "CursorIcon" })
-    end
-
-    if safeIsA(instance, "Sound") then
-        add({ "SoundId", "PlaybackSpeed", "Volume", "TimePosition", "Playing", "Looped", "RollOffMaxDistance" })
-    end
-
-    if safeIsA(instance, "ParticleEmitter") then
-        add({ "Enabled", "Rate", "Lifetime", "Speed", "SpreadAngle", "Texture", "Color", "Transparency", "Size" })
-    end
-
-    if safeIsA(instance, "Camera") then
-        add({ "CFrame", "Focus", "FieldOfView", "CameraType", "CameraSubject", "ViewportSize" })
-    end
-
-    if safeIsA(instance, "Lighting") then
-        add({ "Brightness", "ClockTime", "TimeOfDay", "FogEnd", "FogStart", "FogColor", "Ambient", "OutdoorAmbient", "ExposureCompensation", "GlobalShadows" })
-    end
-
-    if safeIsA(instance, "Animation") then
-        add({ "AnimationId" })
-    end
-
-    if safeIsA(instance, "Animator") then
-        add({ "Parent" })
-    end
-
-    local unique = {}
-    local output = {}
-    for _, property in ipairs(props) do
-        if not unique[property] then
-            unique[property] = true
-            table.insert(output, property)
-        end
-    end
-    return output
+    return os.time() * 1000
 end
 
-local function snapshotProperties(instance)
-    local result = {}
-    for _, property in ipairs(propertiesFor(instance)) do
-        local value = safeGet(instance, property)
-        if value ~= nil then
-            result[property] = normalize(value)
-        end
+local function getPartPath(index)
+    return outputFolder .. "/" .. baseName .. "_part" .. string.format("%03d", index) .. ".jsonl"
+end
+
+local function getManifestData(finalState)
+    return {
+        recorder = "Cultivation Unbound Full Session Recorder",
+        version = "1.3",
+        place_id = game.PlaceId,
+        game_id = game.GameId,
+        job_id = game.JobId,
+        player_name = LocalPlayer.Name,
+        display_name = LocalPlayer.DisplayName,
+        user_id = LocalPlayer.UserId,
+        started_unix = startedUnix,
+        ended_unix = finalState and os.time() or nil,
+        status = finalState and "stopped" or "recording",
+        storage_mode = storageMode,
+        total_events = totalEvents,
+        total_instances = totalInstances,
+        dropped_events = droppedEvents,
+        total_bytes = totalBytes,
+        parts = partPaths,
+        event_counts = eventCounts,
+        storage_error = storageError,
+    }
+end
+
+local function writeManifest(finalState)
+    local manifest = getManifestData(finalState)
+    local okEncode, encoded = pcall(function()
+        return HttpService:JSONEncode(manifest)
+    end)
+    if not okEncode then
+        return false, tostring(encoded)
     end
-    return result
+
+    if type(writefile) == "function" then
+        local ok, err = pcall(writefile, manifestPath, encoded)
+        if ok then
+            return true
+        end
+        storageError = "Manifest write failed: " .. tostring(err)
+    end
+
+    if type(appendfile) == "function" then
+        local appendPath = manifestPath:gsub("%.json$", ".jsonl")
+        local ok, err = pcall(appendfile, appendPath, encoded .. "\n")
+        if ok then
+            manifestPath = appendPath
+            return true
+        end
+        storageError = "Manifest append failed: " .. tostring(err)
+    end
+
+    return false, storageError or "No manifest file API"
+end
+
+local function createFolderIfPossible()
+    if type(makefolder) == "function" then
+        pcall(makefolder, outputFolder)
+    else
+        outputFolder = "."
+    end
+end
+
+local function initializeStorageAt(folder)
+    local canAppend = type(appendfile) == "function"
+    local canWrite = type(writefile) == "function"
+
+    partIndex = 0
+    currentPartPath = nil
+    currentPartBytes = 0
+    outputFolder = folder
+    manifestPath = outputFolder .. "/" .. baseName .. (canWrite and "_manifest.json" or "_manifest.jsonl")
+
+    if canAppend then
+        partIndex = 1
+        currentPartPath = getPartPath(partIndex)
+        local created = false
+        if canWrite then
+            local ok = pcall(writefile, currentPartPath, "")
+            created = ok
+        end
+        if not created then
+            local ok = pcall(appendfile, currentPartPath, "")
+            created = ok
+        end
+        if created then
+            storageMode = "append"
+            table.insert(partPaths, currentPartPath)
+            partBytes[currentPartPath] = 0
+            writeManifest(false)
+            return true
+        end
+        storageError = "appendfile could not create the first JSONL part"
+    end
+
+    if canWrite then
+        -- Use the manifest itself as a writefile probe, then replace it with
+        -- the real manifest. This avoids leaving a disposable probe file.
+        local probeOk = pcall(writefile, manifestPath, "{}")
+        if probeOk then
+            storageMode = "segments"
+            writeManifest(false)
+            return true
+        end
+        storageError = "writefile could not create the manifest in " .. tostring(folder)
+    end
+
+    return false
 end
 
 local function initializeStorage()
-    local makeFolderAvailable = type(makefolder) == "function"
-    local writeAvailable = type(writefile) == "function"
-    local appendAvailable = type(appendfile) == "function"
-
-    if makeFolderAvailable then
-        pcall(makefolder, CONFIG.FOLDER)
+    local canAppend = type(appendfile) == "function"
+    local canWrite = type(writefile) == "function"
+    if not canAppend and not canWrite then
+        storageMode = "unavailable"
+        storageError = "Executor has neither appendfile nor writefile. Recording was not started."
+        return false
     end
 
-    if writeAvailable then
-        local ok = pcall(writefile, filePath, "")
-        if not ok then
-            filePath = sessionFile
-            ok = pcall(writefile, filePath, "")
-        end
-        if ok then
-            if appendAvailable then
-                storageMode = "append"
-            else
-                storageMode = "memory_then_write"
-            end
-            return
+    createFolderIfPossible()
+    if initializeStorageAt(outputFolder) then
+        return true
+    end
+
+    if outputFolder ~= "." then
+        warn("[CU Recorder] Output folder failed; trying executor workspace root.")
+        if initializeStorageAt(".") then
+            return true
         end
     end
 
-    if appendAvailable then
-        local ok = pcall(appendfile, filePath, "")
-        if ok then
-            storageMode = "append"
-            return
-        end
-    end
-
-    storageMode = "memory_only"
-    storageError = "Executor file APIs unavailable or failed. Logs will remain in memory until stop."
+    storageMode = "unavailable"
+    storageError = storageError or "Could not initialize an output file"
+    return false
 end
 
 local function updateStatus(extra)
-    local mode = storageMode == "append" and "DISK"
-        or storageMode == "memory_then_write" and "MEM->FILE"
-        or storageMode == "memory_recovery" and "MEM->RECOVERY"
-        or storageMode == "written_at_stop" and "FILE WRITTEN"
-        or storageMode == "written_recovery" and "RECOVERY WRITTEN"
-        or "MEMORY ONLY"
-    statusText = string.format(
-        "%s | %d events | %d instances | %d queued | %s",
-        paused and "PAUSED" or (running and "RECORDING" or "STOPPED"),
-        totalEvents,
-        totalInstances,
-        #queue,
-        mode
-    )
+    local mode = storageMode == "append" and "DISK / ROTATING"
+        or storageMode == "segments" and "DISK / SEGMENTS"
+        or storageMode == "unavailable" and "NO DISK - STOPPED"
+        or tostring(storageMode):upper()
+    local state = paused and "PAUSED" or (running and "RECORDING" or "STOPPED")
+    local text = string.format("%s | %d events | %d instances | %d parts | %s", state, totalEvents, totalInstances, #partPaths, mode)
     if extra then
-        statusText = statusText .. " | " .. tostring(extra)
+        text = text .. " | " .. tostring(extra)
     end
     if ui.status then
         pcall(function()
-            ui.status.Text = statusText
+            ui.status.Text = text
         end)
     end
     if ui.path then
         pcall(function()
-            ui.path.Text = recoveryFilePath and (tostring(filePath) .. " + " .. tostring(recoveryFilePath)) or (filePath or "No file path")
+            ui.path.Text = outputFolder .. "/" .. baseName .. "_part*.jsonl"
         end)
     end
 end
 
-local function flushQueue()
-    if flushing or #queue == 0 then
-        return
+local function writeNewSegment(content)
+    if content == "" then
+        return true
     end
+    if type(writefile) ~= "function" then
+        return false, "writefile unavailable"
+    end
+
+    partIndex = partIndex + 1
+    local path = getPartPath(partIndex)
+    local ok, err = pcall(writefile, path, content)
+    if not ok then
+        partIndex = partIndex - 1
+        return false, tostring(err)
+    end
+
+    table.insert(partPaths, path)
+    partBytes[path] = #content
+    totalBytes = totalBytes + #content
+    return true
+end
+
+local function rotateAppendPart()
+    partIndex = partIndex + 1
+    currentPartPath = getPartPath(partIndex)
+    local created = false
+    if type(writefile) == "function" then
+        local ok = pcall(writefile, currentPartPath, "")
+        created = ok
+    end
+    if not created and type(appendfile) == "function" then
+        local ok = pcall(appendfile, currentPartPath, "")
+        created = ok
+    end
+    if not created then
+        return false, "Could not create rotated JSONL part"
+    end
+    currentPartBytes = 0
+    table.insert(partPaths, currentPartPath)
+    partBytes[currentPartPath] = 0
+    writeManifest(false)
+    return true
+end
+
+local function flushQueue(forceSegment)
+    if flushing then
+        return false
+    end
+    if #queue == 0 and segmentBuffer == "" then
+        return true
+    end
+
     flushing = true
+    local batch = ""
+    if #queue > 0 then
+        batch = table.concat(queue, "\n") .. "\n"
+        queue = {}
+    end
 
-    local batch = table.concat(queue, "\n") .. "\n"
-    queue = {}
-
-    if storageMode == "append" and type(appendfile) == "function" then
-        local ok, err = pcall(appendfile, filePath, batch)
-        if ok then
-            totalBytes = totalBytes + #batch
-        else
-            storageMode = type(writefile) == "function" and "memory_recovery" or "memory_only"
-            recoveryFilePath = filePath:gsub("%.jsonl$", "_remainder.jsonl")
-            storageError = tostring(err)
-            table.insert(memoryBatches, batch)
-            warn("[CU Recorder] Disk append failed; switching to memory buffering: " .. tostring(err))
+    local success = true
+    if storageMode == "append" then
+        if batch ~= "" then
+            if currentPartBytes + #batch > CONFIG.APPEND_PART_BYTES and currentPartBytes > 0 then
+                local rotateOk, rotateError = rotateAppendPart()
+                if not rotateOk then
+                    storageError = tostring(rotateError)
+                    storageMode = type(writefile) == "function" and "segments" or "unavailable"
+                end
+            end
+            if storageMode == "append" then
+                local ok, err = pcall(appendfile, currentPartPath, batch)
+                if ok then
+                    currentPartBytes = currentPartBytes + #batch
+                    totalBytes = totalBytes + #batch
+                    partBytes[currentPartPath] = currentPartBytes
+                else
+                    storageError = "appendfile failed: " .. tostring(err)
+                    storageMode = type(writefile) == "function" and "segments" or "unavailable"
+                    segmentBuffer = segmentBuffer .. batch
+                    success = false
+                end
+            else
+                segmentBuffer = segmentBuffer .. batch
+            end
+        end
+    elseif storageMode == "segments" then
+        if batch ~= "" then
+            segmentBuffer = segmentBuffer .. batch
+        end
+        local shouldWrite = forceSegment
+            or #segmentBuffer >= CONFIG.WRITEFILE_SEGMENT_BYTES
+            or (segmentBuffer ~= "" and os.clock() - segmentLastWrite >= CONFIG.WRITEFILE_SEGMENT_SECONDS)
+        if shouldWrite and segmentBuffer ~= "" then
+            local content = segmentBuffer
+            local ok, err = writeNewSegment(content)
+            if ok then
+                segmentBuffer = ""
+                segmentLastWrite = os.clock()
+            else
+                storageError = "writefile segment failed: " .. tostring(err)
+                paused = true
+                warn("[CU Recorder] Disk write failed; recording paused to prevent memory growth: " .. tostring(err))
+                success = false
+            end
         end
     else
-        table.insert(memoryBatches, batch)
+        if batch ~= "" then
+            droppedEvents = droppedEvents + 1
+            storageError = storageError or "Storage unavailable; event batch could not be persisted"
+            success = false
+        end
+    end
+
+    if totalEvents > 0 and (totalEvents % 5000 == 0 or forceSegment) then
+        writeManifest(false)
     end
 
     flushing = false
     updateStatus()
+    return success
 end
 
 local function emit(eventName, data, force)
@@ -587,88 +664,241 @@ local function emit(eventName, data, force)
 
     sequence = sequence + 1
     totalEvents = totalEvents + 1
+    eventCounts[eventName] = (eventCounts[eventName] or 0) + 1
 
     local row = {
         seq = sequence,
-        time_unix = os.time(),
+        unix_ms = getTimestampMillis(),
         time_local = os.date("%Y-%m-%d %H:%M:%S"),
         time_utc = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        elapsed = math.floor((os.clock() - startedClock) * 1000) / 1000,
+        elapsed_s = math.floor((os.clock() - startedClock) * 1000) / 1000,
         event = eventName,
+        tags = data and data.path and classifyPath(data.path) or nil,
         data = normalize(data or {}),
     }
 
     local ok, encoded = pcall(function()
         return HttpService:JSONEncode(row)
     end)
-
     if not ok then
         droppedEvents = droppedEvents + 1
-        local fallback = string.format(
-            '{"seq":%d,"event":"encode_error","message":"%s"}',
-            sequence,
-            tostring(encoded):gsub('"', "'"):gsub("\n", " ")
-        )
-        table.insert(queue, fallback)
-    else
-        table.insert(queue, encoded)
+        local fallback = {
+            seq = sequence,
+            unix_ms = getTimestampMillis(),
+            elapsed_s = math.floor((os.clock() - startedClock) * 1000) / 1000,
+            event = "encode_error",
+            data = { failed_event = eventName, error = truncateString(encoded, 500) },
+        }
+        local fallbackOk, fallbackEncoded = pcall(function()
+            return HttpService:JSONEncode(fallback)
+        end)
+        if fallbackOk then
+            encoded = fallbackEncoded
+        else
+            return
+        end
     end
 
-    if #queue >= CONFIG.FLUSH_BATCH_SIZE then
-        -- The writer loop flushes asynchronously; this flag is intentionally
-        -- not a synchronous file write inside a game event callback.
-        sharedEnv.__CURecorderNeedsFlush = true
+    table.insert(queue, encoded)
+    if #queue >= CONFIG.FLUSH_BATCH_EVENTS then
+        flushRequested = true
     end
+end
+
+local function addConnection(connection)
+    if connection then
+        table.insert(connections, connection)
+    end
+    return connection
+end
+
+local function addUiConnection(connection)
+    if connection then
+        table.insert(uiConnections, connection)
+    end
+    return connection
+end
+
+local function connectSignal(instance, signalName, callback, bucket)
+    local ok, signal = pcall(function()
+        return instance[signalName]
+    end)
+    if not ok or not signal then
+        return nil
+    end
+    local connected, connection = pcall(function()
+        return signal:Connect(callback)
+    end)
+    if connected then
+        if bucket == "ui" then
+            addUiConnection(connection)
+        else
+            addConnection(connection)
+        end
+        return connection
+    end
+    return nil
 end
 
 local function shouldSkipInstance(instance)
     if not instance then
         return true
     end
-    if gui then
-        local ok, isGui = pcall(function()
-            return instance == gui or instance:IsDescendantOf(gui)
-        end)
-        if ok and isGui then
-            return true
-        end
+    if gui and safeDescendantOf(instance, gui) then
+        return true
     end
     return false
 end
 
-local function logButtonEvent(instance, eventName, extra)
-    emit(eventName, {
-        path = safePath(instance),
-        class = safeClass(instance),
-        name = safeGet(instance, "Name"),
-        extra = extra or {},
-        tags = classifyPath(safePath(instance)),
-    })
+local function isRelevantInstance(instance)
+    if not instance or shouldSkipInstance(instance) then
+        return false
+    end
+
+    if instance == LocalPlayer or safeDescendantOf(instance, LocalPlayer) then
+        return true
+    end
+
+    local character = LocalPlayer.Character
+    if character and safeDescendantOf(instance, character) then
+        return true
+    end
+
+    local className = safeClass(instance)
+    if className == "Humanoid" or className == "ProximityPrompt" or className == "ClickDetector" or className == "Tool" then
+        return true
+    end
+
+    if className == "RemoteEvent" or className == "RemoteFunction" then
+        return true
+    end
+
+    return pathContainsAny(safePath(instance), MECHANIC_WORDS)
 end
 
-local function connectSignal(instance, signalName, callback)
-    local ok, signal = pcall(function()
-        return instance[signalName]
-    end)
-    if not ok or not signal then
-        return
+local function isEffectivelyVisible(instance)
+    local current = instance
+    while current and current ~= game do
+        if safeIsA(current, "GuiObject") and safeGet(current, "Visible") == false then
+            return false
+        end
+        if safeIsA(current, "LayerCollector") and safeGet(current, "Enabled") == false then
+            return false
+        end
+        current = safeGet(current, "Parent")
     end
-    local connected, connection = pcall(function()
-        return signal:Connect(callback)
-    end)
-    if connected then
-        addConnection(connection)
-    end
+    return true
 end
 
-local function pathContainsAny(path, words)
-    local lower = string.lower(tostring(path or ""))
-    for _, word in ipairs(words) do
-        if string.find(lower, word, 1, true) then
-            return true
+local function propertiesFor(instance)
+    local props = { "Name", "ClassName" }
+    local function add(list)
+        for _, property in ipairs(list) do
+            table.insert(props, property)
         end
     end
-    return false
+
+    if safeIsA(instance, "GuiObject") then
+        add({
+            "Visible", "Active", "Selectable", "Position", "Size", "AbsolutePosition",
+            "AbsoluteSize", "AnchorPoint", "Rotation", "ZIndex", "LayoutOrder",
+            "BackgroundColor3", "BackgroundTransparency", "BorderColor3", "BorderSizePixel",
+            "ClipsDescendants",
+        })
+    end
+
+    if safeIsA(instance, "LayerCollector") then
+        add({ "Enabled", "DisplayOrder", "ZIndexBehavior" })
+    end
+
+    if safeIsA(instance, "TextLabel") or safeIsA(instance, "TextButton") or safeIsA(instance, "TextBox") then
+        add({
+            "Text", "TextColor3", "TextTransparency", "TextStrokeColor3", "TextStrokeTransparency",
+            "TextSize", "TextScaled", "TextWrapped", "RichText", "Font", "TextXAlignment",
+            "TextYAlignment", "PlaceholderText",
+        })
+    end
+
+    if safeIsA(instance, "ImageLabel") or safeIsA(instance, "ImageButton") then
+        add({ "Image", "ImageColor3", "ImageTransparency", "ImageRectOffset", "ImageRectSize", "ScaleType" })
+    end
+
+    if safeIsA(instance, "UIStroke") then
+        add({ "Color", "Thickness", "Transparency", "Enabled" })
+    end
+    if safeIsA(instance, "UIGradient") then
+        add({ "Color", "Transparency", "Rotation", "Offset", "Enabled" })
+    end
+    if safeIsA(instance, "UIScale") then
+        add({ "Scale" })
+    end
+    if safeIsA(instance, "ValueBase") then
+        add({ "Value" })
+    end
+
+    if safeIsA(instance, "BasePart") then
+        local path = safePath(instance)
+        local character = LocalPlayer.Character
+        local inCharacter = character and safeDescendantOf(instance, character)
+        if inCharacter or pathContainsAny(path, {
+            "npc", "boss", "herb", "quest", "merchant", "event", "trial", "cultivation",
+            "spawn", "resource", "drop", "zone", "training", "weight", "item", "chest",
+        }) then
+            add({ "CFrame", "Position", "Orientation", "Size", "Anchored", "CanCollide", "Transparency", "Color", "Material" })
+        end
+    end
+
+    if safeIsA(instance, "Model") then
+        add({ "PrimaryPart", "WorldPivot" })
+    end
+
+    if safeIsA(instance, "Humanoid") then
+        add({
+            "Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight", "UseJumpPower",
+            "HipHeight", "Sit", "PlatformStand", "MoveDirection", "FloorMaterial", "AutoRotate",
+            "RigType", "DisplayName",
+        })
+    end
+
+    if safeIsA(instance, "Tool") then
+        add({ "Enabled", "CanBeDropped", "RequiresHandle", "ToolTip" })
+    end
+
+    if safeIsA(instance, "ProximityPrompt") then
+        add({
+            "ActionText", "ObjectText", "Enabled", "HoldDuration", "MaxActivationDistance",
+            "RequiresLineOfSight", "KeyboardKeyCode", "GamepadKeyCode", "ClickablePrompt",
+        })
+    end
+
+    if safeIsA(instance, "ClickDetector") then
+        add({ "MaxActivationDistance", "CursorIcon" })
+    end
+
+    if safeIsA(instance, "RemoteEvent") or safeIsA(instance, "RemoteFunction") then
+        add({ "Name", "ClassName" })
+    end
+
+    local unique = {}
+    local result = {}
+    for _, property in ipairs(props) do
+        if not unique[property] then
+            unique[property] = true
+            table.insert(result, property)
+        end
+    end
+    return result
+end
+
+local function snapshotProperties(instance)
+    local result = {}
+    for _, property in ipairs(propertiesFor(instance)) do
+        local value = safeGet(instance, property)
+        if value ~= nil then
+            result[property] = normalize(value)
+        end
+    end
+    return result
 end
 
 local function shouldWatchChanged(instance)
@@ -687,16 +917,11 @@ local function shouldLogPropertyChange(instance, propertyName)
     end
 
     if safeIsA(instance, "Humanoid") then
-        return propertyName == "Health"
-            or propertyName == "MaxHealth"
-            or propertyName == "WalkSpeed"
-            or propertyName == "JumpPower"
-            or propertyName == "JumpHeight"
-            or propertyName == "Sit"
-            or propertyName == "PlatformStand"
-            or propertyName == "MoveDirection"
-            or propertyName == "FloorMaterial"
-            or propertyName == "AutoRotate"
+        return propertyName == "Health" or propertyName == "MaxHealth"
+            or propertyName == "WalkSpeed" or propertyName == "JumpPower"
+            or propertyName == "JumpHeight" or propertyName == "Sit"
+            or propertyName == "PlatformStand" or propertyName == "MoveDirection"
+            or propertyName == "FloorMaterial" or propertyName == "AutoRotate"
     end
 
     if safeIsA(instance, "LayerCollector") then
@@ -705,55 +930,26 @@ local function shouldLogPropertyChange(instance, propertyName)
 
     if safeIsA(instance, "GuiObject") then
         local path = safePath(instance)
-        local trialUi = pathContainsAny(path, { "trial", "tribulation", "breakthrough" })
-        local importantUi = trialUi or pathContainsAny(path, {
-            "cultivation", "realm", "quest", "inventory", "backpack", "shop",
-            "boss", "event", "skill", "herb", "pill", "sect", "tracker",
-            "qi", "body", "reward", "dialog", "merchant",
-        })
-
-        if trialUi then
-            return propertyName == "Visible"
-                or propertyName == "Position"
-                or propertyName == "Size"
-                or propertyName == "BackgroundColor3"
-                or propertyName == "BackgroundTransparency"
-                or propertyName == "ImageColor3"
-                or propertyName == "ImageTransparency"
-                or propertyName == "Rotation"
-                or propertyName == "Text"
-                or propertyName == "TextColor3"
-                or propertyName == "TextTransparency"
-                or propertyName == "TextSize"
-                or propertyName == "Enabled"
-                or propertyName == "Active"
-                or propertyName == "Selectable"
+        if isTrialPath(path) then
+            return propertyName == "Visible" or propertyName == "Position" or propertyName == "Size"
+                or propertyName == "AbsolutePosition" or propertyName == "AbsoluteSize"
+                or propertyName == "BackgroundColor3" or propertyName == "BackgroundTransparency"
+                or propertyName == "ImageColor3" or propertyName == "ImageTransparency"
+                or propertyName == "Rotation" or propertyName == "Text" or propertyName == "TextColor3"
+                or propertyName == "TextTransparency" or propertyName == "TextSize"
+                or propertyName == "Active" or propertyName == "Selectable"
         end
-
-        if importantUi then
-            return propertyName == "Visible"
-                or propertyName == "Enabled"
-                or propertyName == "Text"
-                or propertyName == "TextColor3"
-                or propertyName == "TextTransparency"
-                or propertyName == "BackgroundColor3"
-                or propertyName == "BackgroundTransparency"
-                or propertyName == "ImageColor3"
-                or propertyName == "ImageTransparency"
-                or propertyName == "Active"
-                or propertyName == "Selectable"
-        end
-
-        return propertyName == "Visible" or propertyName == "Enabled"
+        return propertyName == "Visible" or propertyName == "Enabled" or propertyName == "Text"
+            or propertyName == "TextColor3" or propertyName == "TextTransparency"
+            or propertyName == "BackgroundColor3" or propertyName == "BackgroundTransparency"
+            or propertyName == "ImageColor3" or propertyName == "ImageTransparency"
+            or propertyName == "Active" or propertyName == "Selectable"
     end
 
     if safeIsA(instance, "ProximityPrompt") then
-        return propertyName == "ActionText"
-            or propertyName == "ObjectText"
-            or propertyName == "Enabled"
-            or propertyName == "HoldDuration"
-            or propertyName == "MaxActivationDistance"
-            or propertyName == "RequiresLineOfSight"
+        return propertyName == "ActionText" or propertyName == "ObjectText"
+            or propertyName == "Enabled" or propertyName == "HoldDuration"
+            or propertyName == "MaxActivationDistance" or propertyName == "RequiresLineOfSight"
     end
 
     if safeIsA(instance, "ClickDetector") then
@@ -764,18 +960,63 @@ local function shouldLogPropertyChange(instance, propertyName)
         return propertyName == "Enabled" or propertyName == "ToolTip"
     end
 
-    if safeIsA(instance, "BasePart") then
-        return CONFIG.LOG_WORLD_PHYSICS_CHANGES
-            and (propertyName == "CFrame" or propertyName == "Position"
-                or propertyName == "AssemblyLinearVelocity"
-                or propertyName == "AssemblyAngularVelocity")
-    end
-
     return false
 end
 
-local function recordInstance(instance, origin)
+local function packArguments(...)
+    local count = select("#", ...)
+    local values = {}
+    local limit = math.min(count, 50)
+    for index = 1, limit do
+        values[index] = normalize(select(index, ...))
+    end
+    return { n = count, values = values, truncated = count > limit }
+end
+
+local function logButtonEvent(instance, eventName, extra)
+    emit(eventName, {
+        path = safePath(instance),
+        class = safeClass(instance),
+        name = safeGet(instance, "Name"),
+        text = safeGet(instance, "Text"),
+        visible = safeGet(instance, "Visible"),
+        extra = extra or {},
+    })
+end
+
+local function remoteShouldLog(remote)
+    if CONFIG.LOG_ALL_INBOUND_REMOTES then
+        return true
+    end
+    return CONFIG.LOG_RELEVANT_INBOUND_REMOTES and pathContainsAny(safePath(remote), REMOTE_WORDS)
+end
+
+local recordInstance
+
+local function registerEntityFromHumanoid(humanoid)
+    local model = safeGet(humanoid, "Parent")
+    if not model or not safeIsA(model, "Model") then
+        return
+    end
+
+    if not tracked[model] then
+        recordInstance(model, "entity_model", true)
+    end
+
+    local rootNames = { "HumanoidRootPart", "PrimaryPart", "Head", "Torso", "UpperTorso" }
+    for _, name in ipairs(rootNames) do
+        local part = safeGet(model, name)
+        if part and safeIsA(part, "BasePart") and not tracked[part] then
+            recordInstance(part, "entity_part", true)
+        end
+    end
+end
+
+recordInstance = function(instance, origin, force)
     if not running or shouldSkipInstance(instance) or tracked[instance] then
+        return
+    end
+    if not force and not isRelevantInstance(instance) then
         return
     end
 
@@ -784,137 +1025,111 @@ local function recordInstance(instance, origin)
 
     local path = safePath(instance)
     local className = safeClass(instance)
-    local lowerPath = string.lower(path)
+    local attributes = getAttributes(instance)
 
-    if string.find(lowerPath, "trial", 1, true) then
-        table.insert(trialInstances, instance)
+    if isTrialPath(path) and not trialSet[instance] then
+        trialSet[instance] = true
+        table.insert(trialObjects, instance)
     end
 
-    local initialAttributes = getAttributes(instance)
-    emit(origin == "initial" and "instance_snapshot" or "instance_added", {
+    local isInitialOrigin = string.find(tostring(origin or ""), "initial", 1, true) == 1
+    emit(isInitialOrigin and "instance_snapshot" or "instance_added", {
         origin = origin,
         path = path,
         class = className,
         name = safeGet(instance, "Name"),
         parent = safePath(safeGet(instance, "Parent")),
         properties = snapshotProperties(instance),
-        attributes = initialAttributes,
+        attributes = attributes,
         tags = getTags(instance),
         mechanic_tags = classifyPath(path),
     })
 
-    if CONFIG.LOG_RELEVANT_PROPERTY_CHANGES and shouldWatchChanged(instance) then
+    if shouldWatchChanged(instance) then
         connectSignal(instance, "Changed", function(changed)
             local propertyName
-            local value
             if safeIsA(instance, "ValueBase") then
                 propertyName = "Value"
-                value = changed
             elseif type(changed) == "string" then
                 propertyName = changed
-                value = safeGet(instance, propertyName)
             else
                 return
             end
-
             if not shouldLogPropertyChange(instance, propertyName) then
                 return
             end
-
             emit("property_changed", {
                 path = safePath(instance),
-                class = safeClass(instance),
+                class = className,
                 property = propertyName,
-                value = value,
-                tags = classifyPath(safePath(instance)),
+                value = safeGet(instance, propertyName),
             })
         end)
     end
 
-    -- Attribute watchers are useful on mechanic-related objects and objects that
-    -- already expose attributes. Avoid one extra connection on every static map part.
-    if next(initialAttributes) ~= nil or pathContainsAny(path, {
-        "cultivation", "realm", "trial", "breakthrough", "quest", "inventory",
-        "boss", "skill", "herb", "pill", "sect", "event", "soul", "npc",
-        "merchant", "tracker", "reward", "body", "qi",
-    }) then
+    local characterForAttributes = LocalPlayer.Character
+    local shouldWatchAttributes = next(attributes) ~= nil
+        or safeDescendantOf(instance, LocalPlayer)
+        or (characterForAttributes and safeDescendantOf(instance, characterForAttributes))
+        or pathContainsAny(path, MECHANIC_WORDS)
+        or safeIsA(instance, "Humanoid")
+    if shouldWatchAttributes then
         connectSignal(instance, "AttributeChanged", function(attributeName)
             local attributeValue = nil
-            local attributeOk, result = pcall(function()
+            local attributeOk, attributeResult = pcall(function()
                 return instance:GetAttribute(attributeName)
             end)
             if attributeOk then
-                attributeValue = result
+                attributeValue = attributeResult
             end
             emit("attribute_changed", {
                 path = safePath(instance),
                 class = className,
                 attribute = attributeName,
                 value = attributeValue,
-                tags = classifyPath(safePath(instance)),
             })
         end)
     end
 
     if safeIsA(instance, "RemoteEvent") then
-        connectSignal(instance, "OnClientEvent", function(...)
-            emit("remote_inbound", {
-                remote = safePath(instance),
-                class = className,
-                arguments = packArguments(...),
-            })
-        end)
+        emit("remote_discovered", { path = path, class = className, name = safeGet(instance, "Name") })
+        if remoteShouldLog(instance) then
+            connectSignal(instance, "OnClientEvent", function(...)
+                emit("remote_inbound", {
+                    remote = safePath(instance),
+                    arguments = packArguments(...),
+                })
+            end)
+        end
+    elseif safeIsA(instance, "RemoteFunction") then
+        emit("remote_discovered", { path = path, class = className, name = safeGet(instance, "Name"), inbound_callback = "not_hooked" })
     end
 
-    if safeIsA(instance, "BindableEvent") and pathContainsAny(path, {
-        "cultivation", "realm", "trial", "breakthrough", "quest", "inventory",
-        "boss", "skill", "herb", "pill", "sect", "event", "soul",
-    }) then
+    if safeIsA(instance, "BindableEvent") and pathContainsAny(path, MECHANIC_WORDS) then
         connectSignal(instance, "Event", function(...)
-            emit("bindable_event", {
-                bindable = safePath(instance),
-                arguments = packArguments(...),
-            })
+            emit("bindable_event", { path = safePath(instance), arguments = packArguments(...) })
         end)
     end
 
     if safeIsA(instance, "GuiButton") then
         connectSignal(instance, "Activated", function(inputObject, clickCount)
             logButtonEvent(instance, "gui_button_activated", {
-                input_type = inputObject and tostring(inputObject.UserInputType) or nil,
-                key_code = inputObject and tostring(inputObject.KeyCode) or nil,
+                input_type = inputObject and tostring(safeGet(inputObject, "UserInputType")) or nil,
+                key_code = inputObject and tostring(safeGet(inputObject, "KeyCode")) or nil,
                 click_count = clickCount,
             })
-        end)
-        connectSignal(instance, "MouseButton1Click", function()
-            logButtonEvent(instance, "gui_button_mouse1_click")
         end)
         connectSignal(instance, "MouseButton2Click", function()
             logButtonEvent(instance, "gui_button_mouse2_click")
         end)
-        connectSignal(instance, "MouseEnter", function()
-            logButtonEvent(instance, "gui_button_mouse_enter")
-        end)
-        connectSignal(instance, "MouseLeave", function()
-            logButtonEvent(instance, "gui_button_mouse_leave")
-        end)
-    end
-
-    if safeIsA(instance, "TextBox") then
-        connectSignal(instance, "Focused", function()
-            logButtonEvent(instance, "textbox_focused")
-        end)
-        connectSignal(instance, "FocusLost", function(enterPressed, inputObject)
-            logButtonEvent(instance, "textbox_focus_lost", {
-                enter_pressed = enterPressed,
-                input_type = inputObject and tostring(inputObject.UserInputType) or nil,
-                text = safeGet(instance, "Text"),
-            })
-        end)
     end
 
     if safeIsA(instance, "ProximityPrompt") then
-        for _, signalName in ipairs({ "PromptButtonHoldBegan", "PromptButtonHoldEnded", "Triggered", "TriggerEnded", "PromptShown", "PromptHidden" }) do
+        local promptSignals = {
+            "PromptButtonHoldBegan", "PromptButtonHoldEnded", "Triggered",
+            "TriggerEnded", "PromptShown", "PromptHidden",
+        }
+        for _, signalName in ipairs(promptSignals) do
             connectSignal(instance, signalName, function(...)
                 emit("proximity_prompt_" .. string.lower(signalName), {
                     path = safePath(instance),
@@ -926,31 +1141,30 @@ local function recordInstance(instance, origin)
         end
     end
 
-    if safeIsA(instance, "ClickDetector") then
-        for _, signalName in ipairs({ "MouseClick", "RightMouseClick", "MouseHoverEnter", "MouseHoverLeave" }) do
+    if safeIsA(instance, "Tool") then
+        for _, signalName in ipairs({ "Activated", "Deactivated", "Equipped", "Unequipped" }) do
             connectSignal(instance, signalName, function(...)
-                emit("click_detector_" .. string.lower(signalName), {
-                    path = safePath(instance),
-                    arguments = packArguments(...),
-                })
+                emit("tool_" .. string.lower(signalName), { path = safePath(instance), arguments = packArguments(...) })
             end)
         end
     end
 
-    if safeIsA(instance, "Tool") then
-        for _, signalName in ipairs({ "Activated", "Deactivated", "Equipped", "Unequipped" }) do
-            connectSignal(instance, signalName, function(...)
-                emit("tool_" .. string.lower(signalName), {
-                    path = safePath(instance),
-                    arguments = packArguments(...),
-                })
-            end)
+    if safeIsA(instance, "ProximityPrompt") or safeIsA(instance, "ClickDetector") then
+        local parentPart = safeGet(instance, "Parent")
+        if parentPart and safeIsA(parentPart, "BasePart") then
+            if not tracked[parentPart] then
+                recordInstance(parentPart, "interactable_parent", true)
+            end
+            local model = parentPart:FindFirstAncestorOfClass("Model")
+            if model and not tracked[model] then
+                recordInstance(model, "interactable_model", true)
+            end
         end
     end
 
     if safeIsA(instance, "Humanoid") then
         connectSignal(instance, "Died", function()
-            emit("humanoid_died", { path = safePath(instance) })
+            emit("humanoid_died", { path = safePath(instance), model = safePath(safeGet(instance, "Parent")) })
         end)
         connectSignal(instance, "StateChanged", function(oldState, newState)
             emit("humanoid_state_changed", {
@@ -967,25 +1181,17 @@ local function recordInstance(instance, origin)
                 max_health = safeGet(instance, "MaxHealth"),
             })
         end)
-    end
-
-    if safeIsA(instance, "Player") then
-        connectSignal(instance, "Chatted", function(message)
-            emit("player_chat", {
-                player = safeGet(instance, "Name"),
-                user_id = safeGet(instance, "UserId"),
-                message = message,
-            })
-        end)
+        registerEntityFromHumanoid(instance)
     end
 end
 
 local function getInputDetails(inputObject, processed)
+    local inputType = inputObject and safeGet(inputObject, "UserInputType")
+    local keyCode = inputObject and safeGet(inputObject, "KeyCode")
     local data = {
-        user_input_type = inputObject and tostring(safeGet(inputObject, "UserInputType")) or nil,
-        key_code = inputObject and tostring(safeGet(inputObject, "KeyCode")) or nil,
+        user_input_type = inputType and tostring(inputType) or nil,
+        key_code = keyCode and tostring(keyCode) or nil,
         position = inputObject and normalize(safeGet(inputObject, "Position")) or nil,
-        delta = inputObject and normalize(safeGet(inputObject, "Delta")) or nil,
         processed = processed == true,
     }
 
@@ -994,19 +1200,19 @@ local function getInputDetails(inputObject, processed)
         data.user_input_state = state and tostring(state) or nil
     end
 
-    if inputObject and (data.user_input_type == "Enum.UserInputType.MouseButton1" or data.user_input_type == "Enum.UserInputType.MouseButton2") then
-        local ok, mouse = pcall(function()
-            return LocalPlayer:GetMouse()
-        end)
-        if ok and mouse then
-            data.mouse_target = normalize(safeGet(mouse, "Target"))
-            data.mouse_hit = normalize(safeGet(mouse, "Hit"))
-        end
+    if inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.MouseButton2 then
         local locationOk, location = pcall(function()
             return UserInputService:GetMouseLocation()
         end)
         if locationOk then
             data.mouse_location = normalize(location)
+        end
+        local mouseOk, mouse = pcall(function()
+            return LocalPlayer:GetMouse()
+        end)
+        if mouseOk and mouse then
+            data.mouse_target = normalize(safeGet(mouse, "Target"))
+            data.mouse_hit = normalize(safeGet(mouse, "Hit"))
         end
     end
 
@@ -1015,45 +1221,39 @@ end
 
 local function connectGlobalSignals()
     addConnection(game.DescendantAdded:Connect(function(instance)
-        recordInstance(instance, "live")
+        if isRelevantInstance(instance) then
+            recordInstance(instance, "live")
+        end
     end))
 
     addConnection(game.DescendantRemoving:Connect(function(instance)
-        if shouldSkipInstance(instance) then return end
-        emit("instance_removing", {
-            path = safePath(instance),
-            class = safeClass(instance),
-            name = safeGet(instance, "Name"),
-            parent = safePath(safeGet(instance, "Parent")),
-            properties = snapshotProperties(instance),
-        })
+        if tracked[instance] then
+            emit("instance_removing", {
+                path = safePath(instance),
+                class = safeClass(instance),
+                name = safeGet(instance, "Name"),
+                parent = safePath(safeGet(instance, "Parent")),
+                properties = snapshotProperties(instance),
+            })
+        end
     end))
 
     addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
+        if UserInputService:GetFocusedTextBox() then
+            return
+        end
         emit("input_began", getInputDetails(inputObject, processed))
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(inputObject, processed)
+        if UserInputService:GetFocusedTextBox() then
+            return
+        end
         emit("input_ended", getInputDetails(inputObject, processed))
-    end))
-
-    if CONFIG.LOG_INPUT_CHANGED then
-        addConnection(UserInputService.InputChanged:Connect(function(inputObject, processed)
-            emit("input_changed", getInputDetails(inputObject, processed))
-        end))
-    end
-
-    addConnection(UserInputService.TextBoxFocused:Connect(function(textBox)
-        emit("input_textbox_focused", { path = safePath(textBox), text = safeGet(textBox, "Text") })
-    end))
-
-    addConnection(UserInputService.TextBoxFocusReleased:Connect(function(textBox)
-        emit("input_textbox_released", { path = safePath(textBox), text = safeGet(textBox, "Text") })
     end))
 
     addConnection(Players.PlayerAdded:Connect(function(player)
         emit("player_added", { name = player.Name, user_id = player.UserId, display_name = player.DisplayName })
-        recordInstance(player, "live_player")
     end))
 
     addConnection(Players.PlayerRemoving:Connect(function(player)
@@ -1062,107 +1262,15 @@ local function connectGlobalSignals()
 
     addConnection(LocalPlayer.CharacterAdded:Connect(function(character)
         emit("local_character_added", { path = safePath(character), name = character.Name })
-        recordInstance(character, "character_added")
+        recordInstance(character, "character_added", true)
         for _, descendant in ipairs(character:GetDescendants()) do
-            recordInstance(descendant, "character_added")
+            recordInstance(descendant, "character_added", true)
         end
     end))
 
     addConnection(LocalPlayer.CharacterRemoving:Connect(function(character)
         emit("local_character_removing", { path = safePath(character), name = character.Name })
     end))
-
-    pcall(function()
-        addConnection(TextChatService.MessageReceived:Connect(function(message)
-            emit("text_chat_message", {
-                text = safeGet(message, "Text"),
-                prefix_text = safeGet(message, "PrefixText"),
-                message_id = safeGet(message, "MessageId"),
-                text_source = normalize(safeGet(message, "TextSource")),
-            })
-        end))
-    end)
-end
-
-local function installRemoteHook()
-    if not CONFIG.LOG_REMOTE_TRAFFIC then
-        emit("capability", { name = "outbound_remote_capture", available = false, reason = "disabled_in_config" })
-        return
-    end
-
-    sharedEnv.__CURecorderRemoteLog = function(remote, method, packedArgs)
-        if not running or paused then return end
-        emit("remote_outbound", {
-            remote = safePath(remote),
-            class = safeClass(remote),
-            method = method,
-            arguments = normalize(packedArgs),
-        })
-    end
-
-    if sharedEnv.__CURecorderRemoteHookInstalled then
-        emit("capability", { name = "outbound_remote_capture", available = true, note = "existing pass-through hook reused" })
-        return
-    end
-
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then
-        emit("capability", { name = "outbound_remote_capture", available = false, reason = "executor_namecall_hook_unavailable" })
-        return
-    end
-
-    local oldNamecall
-    local wrapper = function(self, ...)
-        local method = nil
-        pcall(function()
-            method = getnamecallmethod()
-        end)
-
-        if method == "FireServer" or method == "InvokeServer" then
-            local logger = sharedEnv.__CURecorderRemoteLog
-            if type(logger) == "function" then
-                local ok, isRemote = pcall(function()
-                    return self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
-                end)
-                if ok and isRemote then
-                    local count = select("#", ...)
-                    local args = { n = count }
-                    for index = 1, count do
-                        args[index] = select(index, ...)
-                    end
-                    pcall(logger, self, method, args)
-                end
-            end
-        end
-
-        if oldNamecall then
-            return oldNamecall(self, ...)
-        end
-        return nil
-    end
-
-    if type(newcclosure) == "function" then
-        wrapper = newcclosure(wrapper)
-    end
-
-    local ok, original = pcall(function()
-        return hookmetamethod(game, "__namecall", wrapper)
-    end)
-
-    if ok and original then
-        oldNamecall = original
-        sharedEnv.__CURecorderRemoteHookInstalled = true
-        emit("capability", {
-            name = "outbound_remote_capture",
-            available = true,
-            note = "pass-through namecall observer installed; remote calls are not modified",
-        })
-    else
-        emit("capability", {
-            name = "outbound_remote_capture",
-            available = false,
-            reason = tostring(original),
-        })
-    end
 end
 
 local function getGuiParent()
@@ -1202,14 +1310,14 @@ local function makeUiButton(parent, text, x, width, color)
     local button = makeUiObject("TextButton", {
         Position = UDim2.fromOffset(x, 0),
         Size = UDim2.fromOffset(width, 28),
-        BackgroundColor3 = color or Color3.fromRGB(39, 47, 62),
+        BackgroundColor3 = color,
         BorderSizePixel = 0,
         Active = true,
         Selectable = false,
         AutoButtonColor = true,
         Font = Enum.Font.GothamBold,
         Text = text,
-        TextColor3 = Color3.fromRGB(235, 240, 248),
+        TextColor3 = Color3.fromRGB(238, 242, 249),
         TextSize = 10,
     }, parent)
     roundUi(button, 6)
@@ -1217,80 +1325,76 @@ local function makeUiButton(parent, text, x, width, color)
 end
 
 local function createUi()
-    local parent = getGuiParent()
     gui = makeUiObject("ScreenGui", {
-        Name = "CU_FullSessionRecorder",
+        Name = "CU_FullSessionRecorder_v13",
         ResetOnSpawn = false,
         IgnoreGuiInset = true,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-        DisplayOrder = 10,
-    }, parent)
+        DisplayOrder = 20,
+    }, getGuiParent())
     sharedEnv.__CURecorderGui = gui
 
     local main = makeUiObject("Frame", {
         Name = "Main",
-        Position = UDim2.new(1, -473, 0, 12),
-        Size = UDim2.fromOffset(455, 150),
+        Position = UDim2.new(1, -400, 0, 12),
+        Size = UDim2.fromOffset(388, 126),
         BackgroundColor3 = Color3.fromRGB(17, 21, 29),
+        BackgroundTransparency = 0.08,
         BorderSizePixel = 0,
         Active = false,
-        Draggable = false,
+        Selectable = false,
     }, gui)
-    roundUi(main, 10)
+    roundUi(main, 9)
 
-    local header = makeUiObject("Frame", {
-        Position = UDim2.fromOffset(0, 0),
-        Size = UDim2.new(1, 0, 0, 34),
-        BackgroundColor3 = Color3.fromRGB(31, 39, 53),
-        BorderSizePixel = 0,
+    local header = makeUiObject("TextLabel", {
+        Position = UDim2.fromOffset(10, 6),
+        Size = UDim2.new(1, -20, 0, 20),
+        BackgroundTransparency = 1,
         Active = false,
-    }, main)
-    roundUi(header, 10)
-
-    makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(11, 0),
-        Size = UDim2.new(1, -20, 1, 0),
-        BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND | FULL SESSION RECORDER v1.2",
-        TextColor3 = Color3.fromRGB(236, 241, 249),
-        TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, header)
-
-    ui.status = makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(11, 42),
-        Size = UDim2.new(1, -22, 0, 20),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        Text = "RECORDING | Initializing...",
-        TextColor3 = Color3.fromRGB(117, 214, 153),
+        Text = "CULTIVATION UNBOUND | SESSION RECORDER v1.3",
+        TextColor3 = Color3.fromRGB(238, 242, 249),
         TextSize = 10,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, main)
 
-    ui.path = makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(11, 64),
-        Size = UDim2.new(1, -22, 0, 24),
+    ui.status = makeUiObject("TextLabel", {
+        Position = UDim2.fromOffset(10, 30),
+        Size = UDim2.new(1, -20, 0, 20),
         BackgroundTransparency = 1,
-        Font = Enum.Font.Code,
-        Text = filePath,
-        TextColor3 = Color3.fromRGB(164, 176, 195),
+        Active = false,
+        Font = Enum.Font.GothamBold,
+        Text = "CHECKING STORAGE...",
+        TextColor3 = Color3.fromRGB(117, 214, 153),
         TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, main)
 
-    local buttonRow = makeUiObject("Frame", {
-        Position = UDim2.fromOffset(11, 101),
-        Size = UDim2.new(1, -22, 0, 28),
+    ui.path = makeUiObject("TextLabel", {
+        Position = UDim2.fromOffset(10, 51),
+        Size = UDim2.new(1, -20, 0, 17),
         BackgroundTransparency = 1,
+        Active = false,
+        Font = Enum.Font.Code,
+        Text = outputFolder .. "/" .. baseName,
+        TextColor3 = Color3.fromRGB(164, 176, 195),
+        TextSize = 8,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
     }, main)
 
-    ui.pause = makeUiButton(buttonRow, "PAUSE", 0, 75, Color3.fromRGB(65, 77, 99))
-    ui.flush = makeUiButton(buttonRow, "FLUSH", 82, 75, Color3.fromRGB(65, 77, 99))
-    ui.export = makeUiButton(buttonRow, "EXPORT & STOP", 164, 126, Color3.fromRGB(54, 125, 91))
-    ui.close = makeUiButton(buttonRow, "CLOSE", 299, 67, Color3.fromRGB(45, 53, 68))
+    local row = makeUiObject("Frame", {
+        Position = UDim2.fromOffset(10, 82),
+        Size = UDim2.new(1, -20, 0, 28),
+        BackgroundTransparency = 1,
+        Active = false,
+    }, main)
+
+    ui.pause = makeUiButton(row, "PAUSE", 0, 66, Color3.fromRGB(65, 77, 99))
+    ui.flush = makeUiButton(row, "FLUSH", 72, 66, Color3.fromRGB(65, 77, 99))
+    ui.export = makeUiButton(row, "EXPORT & STOP", 144, 112, Color3.fromRGB(54, 125, 91))
+    ui.hide = makeUiButton(row, "HIDE", 262, 66, Color3.fromRGB(45, 53, 68))
 
     addUiConnection(ui.pause.MouseButton1Click:Connect(function()
         if not running then return end
@@ -1298,58 +1402,41 @@ local function createUi()
             paused = false
             emit("recording_resumed", { reason = "ui_button" }, true)
             ui.pause.Text = "PAUSE"
-            updateStatus()
         else
             emit("recording_paused", { reason = "ui_button" }, true)
             paused = true
             ui.pause.Text = "RESUME"
-            updateStatus()
         end
+        updateStatus()
     end))
 
     addUiConnection(ui.flush.MouseButton1Click:Connect(function()
         emit("manual_flush_requested", { queued = #queue }, true)
-        flushQueue()
+        flushQueue(true)
         updateStatus("manual flush")
     end))
 
     addUiConnection(ui.export.MouseButton1Click:Connect(function()
         if running then
-            emit("export_requested", {
-                file_path = filePath,
-                queued_events = #queue,
-                storage_mode = storageMode,
-            }, true)
-            sharedEnv.__CURecorderStop("export_button")
+            stopRecorder("export_button")
         end
     end))
 
-    addUiConnection(ui.close.MouseButton1Click:Connect(function()
-        pcall(function() gui:Destroy() end)
-        gui = nil
-        sharedEnv.__CURecorderGui = nil
+    addUiConnection(ui.hide.MouseButton1Click:Connect(function()
+        if gui then
+            gui.Enabled = false
+        end
     end))
-end
-
-local function isEffectivelyVisible(instance)
-    local current = instance
-    while current and current ~= game do
-        if safeIsA(current, "GuiObject") and safeGet(current, "Visible") == false then
-            return false
-        end
-        if safeIsA(current, "LayerCollector") and safeGet(current, "Enabled") == false then
-            return false
-        end
-        current = safeGet(current, "Parent")
-    end
-    return true
 end
 
 local function trialIsActive()
-    for _, instance in ipairs(trialInstances) do
+    for _, instance in ipairs(trialObjects) do
         if instance and safeGet(instance, "Parent") then
             if safeIsA(instance, "GuiObject") and safeGet(instance, "Visible") == true and isEffectivelyVisible(instance) then
                 return true
+            end
+            if safeIsA(instance, "LayerCollector") and safeGet(instance, "Enabled") == true then
+                -- A visible child will confirm activity; this only keeps the root tracked.
             end
         end
     end
@@ -1357,145 +1444,350 @@ local function trialIsActive()
 end
 
 local TRIAL_SAMPLE_PROPERTIES = {
-    "Visible", "Enabled", "Position", "Size", "AbsolutePosition", "AbsoluteSize",
-    "BackgroundColor3", "BackgroundTransparency", "ImageColor3", "ImageTransparency",
+    "Visible", "Active", "Selectable", "Position", "Size", "AbsolutePosition", "AbsoluteSize",
+    "BackgroundColor3", "BackgroundTransparency", "ImageColor3", "ImageTransparency", "Image",
     "Rotation", "Text", "TextColor3", "TextTransparency", "TextSize", "ZIndex",
-    "Color", "Thickness", "Transparency", "Offset", "Scale",
+    "Color", "Thickness", "Transparency", "Offset", "Scale", "Enabled",
 }
 
 local function sampleTrialFrame()
     if not running or paused then
         return
     end
+    local now = os.clock()
+    if now - lastTrialSample < (1 / CONFIG.TRIAL_SAMPLE_HZ) then
+        return
+    end
+    lastTrialSample = now
 
     local active = trialIsActive()
+    if now - lastTrialPrune >= 1 then
+        lastTrialPrune = now
+        for index = #trialObjects, 1, -1 do
+            local instance = trialObjects[index]
+            if not instance or not safeGet(instance, "Parent") then
+                if instance then
+                    trialSet[instance] = nil
+                    trialSampleCache[instance] = nil
+                end
+                table.remove(trialObjects, index)
+            end
+        end
+    end
+
     if active and not trialWasActive then
         trialWasActive = true
-        emit("trial_sampling_started", { tracked_trial_instances = #trialInstances })
+        trialFrame = 0
+        emit("trial_ui_became_active", { tracked_objects = #trialObjects })
     elseif not active and trialWasActive then
         trialWasActive = false
-        emit("trial_sampling_stopped", { tracked_trial_instances = #trialInstances })
+        emit("trial_ui_became_inactive", { tracked_objects = #trialObjects })
     end
 
     if not active then
         return
     end
 
-    for _, instance in ipairs(trialInstances) do
+    trialFrame = trialFrame + 1
+    for _, instance in ipairs(trialObjects) do
         if instance and safeGet(instance, "Parent") then
-            local properties = {}
-            for _, property in ipairs(TRIAL_SAMPLE_PROPERTIES) do
-                local value = safeGet(instance, property)
-                if value ~= nil then
-                    properties[property] = normalize(value)
+            local className = safeClass(instance)
+            local isSampleClass = safeIsA(instance, "GuiObject")
+                or className == "UIStroke" or className == "UIGradient" or className == "UIScale"
+            if isSampleClass then
+                local properties = {}
+                for _, property in ipairs(TRIAL_SAMPLE_PROPERTIES) do
+                    local value = safeGet(instance, property)
+                    if value ~= nil then
+                        properties[property] = normalize(value)
+                    end
                 end
-            end
-
-            if next(properties) ~= nil then
-                local signature = ""
-                local ok, encoded = pcall(function()
-                    return HttpService:JSONEncode(properties)
-                end)
-                if ok then
-                    signature = encoded
-                else
-                    signature = tostring(properties)
-                end
-
-                if trialSampleCache[instance] ~= signature then
-                    trialSampleCache[instance] = signature
-                    emit("trial_frame_sample", {
-                        path = safePath(instance),
-                        class = safeClass(instance),
-                        properties = properties,
-                    })
+                if next(properties) ~= nil then
+                    local ok, signature = pcall(function()
+                        return HttpService:JSONEncode(properties)
+                    end)
+                    if ok and trialSampleCache[instance] ~= signature then
+                        trialSampleCache[instance] = signature
+                        emit("trial_visual_sample", {
+                            frame = trialFrame,
+                            path = safePath(instance),
+                            class = className,
+                            properties = properties,
+                        })
+                    end
                 end
             end
         end
     end
+end
+
+local function collectCheckpoint()
+    local snapshot = {
+        player = {
+            name = LocalPlayer.Name,
+            display_name = LocalPlayer.DisplayName,
+            user_id = LocalPlayer.UserId,
+            account_age_days = LocalPlayer.AccountAge,
+            attributes = getAttributes(LocalPlayer),
+        },
+        values = {},
+        gui_text = {},
+        tools = {},
+    }
+
+    local descendants = {}
+    local ok, result = pcall(function()
+        return LocalPlayer:GetDescendants()
+    end)
+    if ok then
+        descendants = result
+    end
+
+    for _, instance in ipairs(descendants) do
+        if safeIsA(instance, "ValueBase") and #snapshot.values < 350 then
+            table.insert(snapshot.values, {
+                path = safePath(instance),
+                class = safeClass(instance),
+                value = safeGet(instance, "Value"),
+            })
+        elseif safeIsA(instance, "Tool") and #snapshot.tools < 100 then
+            table.insert(snapshot.tools, {
+                path = safePath(instance),
+                name = safeGet(instance, "Name"),
+                enabled = safeGet(instance, "Enabled"),
+                tooltip = safeGet(instance, "ToolTip"),
+            })
+        elseif (safeIsA(instance, "TextLabel") or safeIsA(instance, "TextButton")) and #snapshot.gui_text < 450 then
+            local text = safeGet(instance, "Text")
+            local path = safePath(instance)
+            if type(text) == "string" and text ~= "" and (pathContainsAny(path, MECHANIC_WORDS) or pathContainsAny(text, MECHANIC_WORDS)) then
+                table.insert(snapshot.gui_text, {
+                    path = path,
+                    text = truncateString(text, 500),
+                    visible = safeGet(instance, "Visible"),
+                })
+            end
+        end
+    end
+
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local root = character:FindFirstChild("HumanoidRootPart")
+        snapshot.character = {
+            name = character.Name,
+            humanoid = humanoid and {
+                health = humanoid.Health,
+                max_health = humanoid.MaxHealth,
+                walk_speed = humanoid.WalkSpeed,
+                jump_power = humanoid.JumpPower,
+                state = tostring(humanoid:GetState()),
+            } or nil,
+            root_position = root and normalize(root.Position) or nil,
+            root_cframe = root and normalize(root.CFrame) or nil,
+        }
+    end
+
+    return snapshot
 end
 
 local function checkpoint()
     if not running or paused then
         return
     end
-
-    emit("checkpoint_start", {
-        player = LocalPlayer.Name,
-        user_id = LocalPlayer.UserId,
-        place_id = game.PlaceId,
-        job_id = game.JobId,
-    })
-
-    local roots = {}
-    local ok, descendants = pcall(function()
-        return LocalPlayer:GetDescendants()
+    local snapshot = collectCheckpoint()
+    local ok, signature = pcall(function()
+        return HttpService:JSONEncode(snapshot)
     end)
     if ok then
-        for _, instance in ipairs(descendants) do
-            table.insert(roots, instance)
+        if checkpointSignatures.last ~= signature then
+            checkpointSignatures.last = signature
+            emit("player_checkpoint", snapshot)
+        else
+            emit("checkpoint_heartbeat", { unchanged = true })
+        end
+    else
+        emit("checkpoint_error", { error = tostring(signature) })
+    end
+end
+
+local function sampleCharacterPosition()
+    if not running or paused then
+        return
+    end
+    local now = os.clock()
+    if now - lastPositionSample < CONFIG.CHARACTER_POSITION_INTERVAL then
+        return
+    end
+    lastPositionSample = now
+
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return
+    end
+
+    local position = root.Position
+    if not lastCharacterPosition or (position - lastCharacterPosition).Magnitude >= CONFIG.CHARACTER_POSITION_MIN_DELTA then
+        lastCharacterPosition = position
+        emit("character_position", {
+            position = position,
+            cframe = root.CFrame,
+            velocity = root.AssemblyLinearVelocity,
+        })
+    end
+end
+
+local function scanInitial()
+    local playerDescendants = {}
+    local okPlayer, playerResult = pcall(function()
+        return LocalPlayer:GetDescendants()
+    end)
+    if okPlayer then
+        playerDescendants = playerResult
+    end
+
+    emit("initial_scan_started", {
+        local_player_descendants = #playerDescendants,
+        workspace_scan = "selective",
+        replicated_storage_scan = "remote_metadata_and_relevant_paths",
+    })
+
+    for index, instance in ipairs(playerDescendants) do
+        recordInstance(instance, "initial")
+        if index % 400 == 0 then
+            updateStatus("player snapshot " .. index .. "/" .. #playerDescendants)
+            task.wait()
         end
     end
+    recordInstance(LocalPlayer, "initial_root", true)
 
     local character = LocalPlayer.Character
     if character then
-        table.insert(roots, character)
-        local charOk, charDescendants = pcall(function()
-            return character:GetDescendants()
-        end)
-        if charOk then
-            for _, instance in ipairs(charDescendants) do
-                table.insert(roots, instance)
+        recordInstance(character, "initial_character", true)
+        local charDescendants = character:GetDescendants()
+        for index, instance in ipairs(charDescendants) do
+            recordInstance(instance, "initial_character")
+            if index % 300 == 0 then
+                task.wait()
             end
         end
     end
 
-    local seen = setmetatable({}, { __mode = "k" })
-    for index, instance in ipairs(roots) do
-        if instance and not seen[instance] and not shouldSkipInstance(instance) then
-            seen[instance] = true
-            emit("checkpoint_instance", {
-                path = safePath(instance),
-                class = safeClass(instance),
-                properties = snapshotProperties(instance),
-                attributes = getAttributes(instance),
-            })
+    local workspaceDescendants = {}
+    local okWorkspace, workspaceResult = pcall(function()
+        return workspace:GetDescendants()
+    end)
+    if okWorkspace then
+        workspaceDescendants = workspaceResult
+    end
+
+    for index, instance in ipairs(workspaceDescendants) do
+        if isRelevantInstance(instance) then
+            recordInstance(instance, "initial_workspace")
         end
-        if index % 100 == 0 then
+        if index % 1200 == 0 then
+            updateStatus("world scan " .. index .. "/" .. #workspaceDescendants)
             task.wait()
         end
     end
 
-    emit("checkpoint_end", { instances = #roots })
+    local replicatedDescendants = {}
+    local okReplicated, replicatedResult = pcall(function()
+        return ReplicatedStorage:GetDescendants()
+    end)
+    if okReplicated then
+        replicatedDescendants = replicatedResult
+    end
+    for index, instance in ipairs(replicatedDescendants) do
+        local className = safeClass(instance)
+        if className == "RemoteEvent" or className == "RemoteFunction" or pathContainsAny(safePath(instance), MECHANIC_WORDS) then
+            recordInstance(instance, "initial_replicated_storage", true)
+        end
+        if index % 600 == 0 then
+            task.wait()
+        end
+    end
+
+    local firstDescendants = {}
+    local okFirst, firstResult = pcall(function()
+        return ReplicatedFirst:GetDescendants()
+    end)
+    if okFirst then
+        firstDescendants = firstResult
+    end
+    for index, instance in ipairs(firstDescendants) do
+        local className = safeClass(instance)
+        if className == "RemoteEvent" or className == "RemoteFunction" or pathContainsAny(safePath(instance), MECHANIC_WORDS) then
+            recordInstance(instance, "initial_replicated_first", true)
+        end
+        if index % 600 == 0 then
+            task.wait()
+        end
+    end
+
+    emit("initial_scan_finished", {
+        player_descendants = #playerDescendants,
+        workspace_descendants_examined = #workspaceDescendants,
+        replicated_storage_descendants_examined = #replicatedDescendants,
+        replicated_first_descendants_examined = #firstDescendants,
+        tracked_instances = totalInstances,
+        trial_objects = #trialObjects,
+    })
+    initialScanComplete = true
 end
 
 local function stopRecorder(reason)
-    if not running then
+    if stopping or not running then
         return
     end
+    stopping = true
 
     emit("session_stop", {
         reason = reason or "manual",
-        total_events = totalEvents,
+        total_events_before_stop = totalEvents,
         total_instances = totalInstances,
         elapsed_seconds = math.floor((os.clock() - startedClock) * 1000) / 1000,
         dropped_events = droppedEvents,
     }, true)
 
     running = false
-    sharedEnv.__CURecorderRemoteLog = nil
     sharedEnv.__CURecorderStop = nil
     sharedEnv.__CURecorderNeedsFlush = nil
 
     for _, connection in ipairs(connections) do
-        pcall(function()
-            connection:Disconnect()
-        end)
+        pcall(function() connection:Disconnect() end)
     end
     connections = {}
+    for _, connection in ipairs(uiConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    uiConnections = {}
+
+    while flushing do
+        task.wait(0.05)
+    end
+
+    flushQueue(true)
+    if storageMode == "segments" and segmentBuffer ~= "" then
+        local content = segmentBuffer
+        local ok, err = writeNewSegment(content)
+        if ok then
+            segmentBuffer = ""
+        else
+            storageError = "Final segment write failed: " .. tostring(err)
+        end
+    end
+
+    writeManifest(true)
+
+    local saved = storageMode == "append" or (storageMode == "segments" and #partPaths > 0)
+    local message = saved and "EXPORTED - upload every part + manifest" or "EXPORT FAILED - check executor file APIs"
+    updateStatus(message)
+
     if ui.export then
         pcall(function()
-            ui.export.Text = "SAVING..."
+            ui.export.Text = saved and "EXPORTED" or "NO FILE"
             ui.export.Active = false
         end)
     end
@@ -1506,54 +1798,12 @@ local function stopRecorder(reason)
         end)
     end
 
-    while flushing do
-        task.wait(0.05)
-    end
-    flushQueue()
-
-    if storageMode == "memory_then_write" or storageMode == "memory_only" or storageMode == "memory_recovery" then
-        if type(writefile) == "function" then
-            local content = table.concat(memoryBatches)
-            local targetPath = storageMode == "memory_recovery" and (recoveryFilePath or (filePath .. ".remainder.jsonl")) or filePath
-            local ok, err = pcall(writefile, targetPath, content)
-            if ok then
-                totalBytes = totalBytes + #content
-                storageMode = storageMode == "memory_recovery" and "written_recovery" or "written_at_stop"
-                if storageMode == "written_recovery" then
-                    recoveryFilePath = targetPath
-                end
-            else
-                storageError = tostring(err)
-                warn("[CU Recorder] Could not write memory log: " .. tostring(err))
-            end
-        else
-            warn("[CU Recorder] No writefile API; remaining buffered data is only in memory.")
-        end
-    end
-
-    local exportSucceeded = storageMode == "append"
-        or storageMode == "written_at_stop"
-        or storageMode == "written_recovery"
-
-    if ui.export then
-        pcall(function()
-            ui.export.Text = not exportSucceeded and "NO FILE"
-                or (storageMode == "written_recovery" and "2 FILES SAVED" or "EXPORTED")
-        end)
-    end
-
-    local exportStatus = "EXPORT FAILED - check executor file API"
-    if storageMode == "written_recovery" then
-        exportStatus = "LOG EXPORTED IN 2 FILES | " .. tostring(totalBytes) .. " bytes"
-    elseif exportSucceeded then
-        exportStatus = "FULL LOG EXPORTED | " .. tostring(totalBytes) .. " bytes"
-    end
-    updateStatus(exportStatus)
-    if recoveryFilePath then
-        warn("[CU Recorder] Earlier log: " .. tostring(filePath))
-        warn("[CU Recorder] Remainder log: " .. tostring(recoveryFilePath))
-    end
-    warn("[CU Recorder] Stopped. Events=" .. totalEvents .. " Instances=" .. totalInstances .. " File=" .. tostring(filePath))
+    warn("[CU Recorder] Stopped. Events=" .. tostring(totalEvents)
+        .. " Instances=" .. tostring(totalInstances)
+        .. " Parts=" .. tostring(#partPaths)
+        .. " Bytes=" .. tostring(totalBytes))
+    warn("[CU Recorder] Output folder: " .. tostring(outputFolder))
+    warn("[CU Recorder] Manifest: " .. tostring(manifestPath))
     if storageError then
         warn("[CU Recorder] Storage note: " .. tostring(storageError))
     end
@@ -1561,107 +1811,137 @@ end
 
 sharedEnv.__CURecorderStop = stopRecorder
 
--- Emergency controls work even if the floating panel is hidden or hard to reach:
--- RightCtrl+End stops and exports; RightCtrl+Home toggles the panel.
-addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
-    if processed then return end
-    local key = safeGet(inputObject, "KeyCode")
-    local rightCtrl = UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
-    local leftCtrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-    if not (rightCtrl or leftCtrl) then return end
-
-    if key == Enum.KeyCode.End then
-        stopRecorder("emergency_hotkey")
-    elseif key == Enum.KeyCode.Home and gui then
-        gui.Enabled = not gui.Enabled
+local function togglePause(reason)
+    if not running then
+        return
     end
-end))
-
--- Set up UI before scanning so the user can see that the recorder is active.
-local uiOk, uiError = pcall(createUi)
-if not uiOk then
-    warn("[CU Recorder] GUI creation failed: " .. tostring(uiError))
+    if paused then
+        paused = false
+        emit("recording_resumed", { reason = reason or "hotkey" }, true)
+        if ui.pause then ui.pause.Text = "PAUSE" end
+    else
+        emit("recording_paused", { reason = reason or "hotkey" }, true)
+        paused = true
+        if ui.pause then ui.pause.Text = "RESUME" end
+    end
+    updateStatus()
 end
 
-initializeStorage()
-
-emit("session_start", {
-    recorder = "Cultivation Unbound Full Session Recorder",
-    version = "1.2",
-    place_id = game.PlaceId,
-    game_id = game.GameId,
-    job_id = game.JobId,
-    creator_id = game.CreatorId,
-    player_name = LocalPlayer.Name,
-    display_name = LocalPlayer.DisplayName,
-    user_id = LocalPlayer.UserId,
-    account_age_days = LocalPlayer.AccountAge,
-    started_unix = startedUnix,
-    file_path = filePath,
-    storage_mode = storageMode,
-    config = CONFIG,
-})
-
-installRemoteHook()
-connectGlobalSignals()
-
--- Start flushing before the initial snapshot; the initial scan can be large.
-task.spawn(function()
-    while running do
-        task.wait(CONFIG.FLUSH_INTERVAL)
-        if #queue > 0 or sharedEnv.__CURecorderNeedsFlush then
-            sharedEnv.__CURecorderNeedsFlush = nil
-            flushQueue()
+local function connectHotkeys()
+    addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
+        if processed or UserInputService:GetFocusedTextBox() then
+            return
         end
-        updateStatus()
-    end
-    flushQueue()
-end)
-
--- Record the DataModel root and every currently replicated descendant.
-recordInstance(game, "initial_root")
-local scanOk, initialDescendants = pcall(function()
-    return game:GetDescendants()
-end)
-
-if scanOk and type(initialDescendants) == "table" then
-    local count = #initialDescendants
-    emit("initial_scan_started", { descendants = count })
-    for index, instance in ipairs(initialDescendants) do
-        recordInstance(instance, "initial")
-        if index % 50 == 0 then
-            updateStatus("initial scan " .. index .. "/" .. count)
-            task.wait()
+        local key = safeGet(inputObject, "KeyCode")
+        local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+            or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+        if not ctrl then
+            return
         end
-    end
-    emit("initial_scan_finished", { scanned = count, tracked = totalInstances })
-else
-    emit("initial_scan_failed", { error = tostring(initialDescendants) })
+        if key == Enum.KeyCode.Home then
+            if gui then gui.Enabled = not gui.Enabled end
+        elseif key == Enum.KeyCode.End then
+            stopRecorder("emergency_hotkey")
+        elseif key == Enum.KeyCode.P then
+            togglePause("hotkey")
+        elseif key == Enum.KeyCode.F then
+            emit("manual_flush_requested", { queued = #queue }, true)
+            flushQueue(true)
+        end
+    end))
 end
 
--- Record an immediate player/character checkpoint after the initial snapshot.
-checkpoint()
-
--- Trial sampler: event-driven property changes are recorded continuously;
--- this extra RenderStepped sampler catches fast visual state/color transitions.
-addConnection(RunService.RenderStepped:Connect(sampleTrialFrame))
-
--- Periodic player/character/PlayerGui checkpoints catch state that might not
--- raise a normal property-change event in a particular client build.
-task.spawn(function()
-    while running do
-        task.wait(CONFIG.CHECKPOINT_INTERVAL)
-        if running then
-            checkpoint()
-        end
+local function main()
+    local uiOk, uiError = pcall(createUi)
+    if not uiOk then
+        warn("[CU Recorder] GUI creation failed: " .. tostring(uiError))
     end
-end)
 
-updateStatus("initial recording active")
-print("[CU Recorder] FULL SESSION RECORDING ACTIVE")
-print("[CU Recorder] File: " .. tostring(filePath))
-print("[CU Recorder] Storage: " .. tostring(storageMode))
-print("[CU Recorder] Press EXPORT & STOP to finalize the complete JSONL file.")
-print("[CU Recorder] Find it in the executor workspace: " .. tostring(filePath))
-print("[CU Recorder] SAFE MODE: no input hooks, no outbound remote hook, no per-frame world physics logging.")
-print("[CU Recorder] Only the visible buttons intercept clicks; panel background is click-through.")
+    local storageOk = initializeStorage()
+    if not storageOk then
+        if ui.status then
+            ui.status.Text = "STORAGE UNAVAILABLE - RECORDING NOT STARTED"
+            ui.status.TextColor3 = Color3.fromRGB(235, 110, 110)
+        end
+        warn("[CU Recorder] " .. tostring(storageError))
+        running = false
+        sharedEnv.__CURecorderStop = nil
+        return
+    end
+
+    emit("session_start", {
+        recorder = "Cultivation Unbound Full Session Recorder",
+        version = "1.3",
+        place_id = game.PlaceId,
+        game_id = game.GameId,
+        job_id = game.JobId,
+        creator_id = game.CreatorId,
+        player_name = LocalPlayer.Name,
+        display_name = LocalPlayer.DisplayName,
+        user_id = LocalPlayer.UserId,
+        account_age_days = LocalPlayer.AccountAge,
+        started_unix = startedUnix,
+        output_folder = outputFolder,
+        manifest_path = manifestPath,
+        storage_mode = storageMode,
+        config = CONFIG,
+        capability = {
+            inbound_remote_events = CONFIG.LOG_RELEVANT_INBOUND_REMOTES or CONFIG.LOG_ALL_INBOUND_REMOTES,
+            outbound_remote_events = false,
+            outbound_remote_reason = "No namecall/metamethod hook installed; avoided to protect input and game stability",
+            mouse_move_logging = false,
+            chat_content_logging = false,
+        },
+    })
+
+    connectGlobalSignals()
+    connectHotkeys()
+
+    task.spawn(function()
+        while running do
+            task.wait(CONFIG.FLUSH_INTERVAL)
+            if #queue > 0 or flushRequested then
+                flushRequested = false
+                flushQueue(false)
+            elseif storageMode == "segments" and segmentBuffer ~= "" and os.clock() - segmentLastWrite >= CONFIG.WRITEFILE_SEGMENT_SECONDS then
+                flushQueue(false)
+            end
+            updateStatus()
+        end
+    end)
+
+    task.spawn(function()
+        while running do
+            task.wait(CONFIG.CHECKPOINT_INTERVAL)
+            if running and not paused then
+                checkpoint()
+                writeManifest(false)
+            end
+        end
+    end)
+
+    addConnection(RunService.RenderStepped:Connect(function()
+        if running and not paused then
+            sampleTrialFrame()
+        end
+    end))
+
+    addConnection(RunService.Heartbeat:Connect(function()
+        if running and not paused then
+            sampleCharacterPosition()
+        end
+    end))
+
+    scanInitial()
+    checkpoint()
+    updateStatus("initial scan complete")
+
+    print("[CU Recorder] v1.3 recording active")
+    print("[CU Recorder] Folder: " .. tostring(outputFolder))
+    print("[CU Recorder] Manifest: " .. tostring(manifestPath))
+    print("[CU Recorder] Storage: " .. tostring(storageMode))
+    print("[CU Recorder] Ctrl+Home show/hide | Ctrl+P pause | Ctrl+F flush | Ctrl+End export/stop")
+    print("[CU Recorder] Read-only: no clicks, remote firing, stat edits or movement")
+end
+
+main()
