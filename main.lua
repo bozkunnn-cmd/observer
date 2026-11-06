@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + HERB COLLECTION + AUTO BREW
-    Version: 0.6
+    Version: 0.7
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -12,7 +12,8 @@
       - Tribulation processing does not require a readable hit counter.
       - Anti-AFK toggle using LocalPlayer.Idled / VirtualUser.
       - Auto Herb Collection: scans enabled CollectHerbPrompt objects in both
-        normal HerbSpots and SpiritWorld.Herbs folders.
+        normal HerbSpots and SpiritWorld.Herbs folders; reads HerbYear and
+        prioritizes oldest age first, with optional species filters.
       - Holds the real 2.5-second collection prompt and verifies the result.
       - Temporarily pauses cultivation during a herb sweep, then resumes.
       - Auto Brew: exact recipe validation, oldest available herbs first,
@@ -52,7 +53,7 @@ if type(Env.__CUAutoCultivationStop) == "function" then
     pcall(Env.__CUAutoCultivationStop, "replaced")
 end
 if type(Env.__CUAutoBreakthroughStop) == "function" then
-    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.6")
+    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.7")
 end
 
 local running = true
@@ -94,6 +95,19 @@ local herbCounts = nil
 local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
+local herbFilterButton = nil
+local herbFilterPicker = nil
+local herbFilterToggleButtons = {}
+local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
+local HERB_TYPE_NAMES = {[1] = "Ginseng", [2] = "Azure Lotus", [3] = "Verdant Moss", [4] = "Golden Fern", [5] = "Violet Sage"}
+local herbSpeciesSelection = {
+    ["Ginseng"] = true,
+    ["Azure Lotus"] = true,
+    ["Verdant Moss"] = true,
+    ["Golden Fern"] = true,
+    ["Violet Sage"] = true,
+}
+local autoStartedTrainingMode = nil
 local selectedAutoMode = nil -- nil, "Qi", or "Body"
 local connections = {}
 
@@ -307,6 +321,14 @@ Env.__CUAutoCultivationState = {
             herbCollectorBusy = herbCollectorBusy,
             herbsCollected = herbCollectedCount,
             herbsFailed = herbFailedCount,
+            herbSpeciesSelection = {
+                Ginseng = herbSpeciesSelection["Ginseng"],
+                AzureLotus = herbSpeciesSelection["Azure Lotus"],
+                VerdantMoss = herbSpeciesSelection["Verdant Moss"],
+                GoldenFern = herbSpeciesSelection["Golden Fern"],
+                VioletSage = herbSpeciesSelection["Violet Sage"],
+            },
+            autoStartedTrainingMode = autoStartedTrainingMode,
             mode = lastMode,
             percent = lastPercent,
             action = lastAction,
@@ -1043,6 +1065,13 @@ local function teleportToZone(mode, zone)
     setStatus("Travelling to " .. zone.name .. "...", COLORS.warning)
 
     task.spawn(function()
+        -- Cancel a pending travel if the user switches Auto Cultivation OFF
+        -- or changes to the other mode before the teleport task runs.
+        if not running or paused or selectedAutoMode ~= mode then
+            teleporting = false
+            return
+        end
+
         local currentRoot = getCharacterParts()
         if not currentRoot then
             teleporting = false
@@ -1066,10 +1095,12 @@ local function teleportToZone(mode, zone)
         task.wait(2.5)
         local verifyRoot = getCharacterParts()
         local arrived = verifyRoot and isInsideZone(verifyRoot, target, size)
-        if arrived then
-            setStatus("Arrived at " .. zone.name .. "; checking the server zone bonus.", COLORS.success)
-        else
-            setStatus("Teleport was not retained by the game. Server may be correcting CFrame movement.", COLORS.danger)
+        if selectedAutoMode == mode and running then
+            if arrived then
+                setStatus("Arrived at " .. zone.name .. "; checking the server zone bonus.", COLORS.success)
+            else
+                setStatus("Teleport was not retained by the game. Server may be correcting CFrame movement.", COLORS.danger)
+            end
         end
         teleporting = false
     end)
@@ -1086,14 +1117,14 @@ end
 
 local function isTrainingActive(mode)
     if mode == "Qi" then
-        if type(qiState) == "table" and type(qiState.isMeditating) == "boolean" then
-            return qiState.isMeditating
+        if type(qiState) == "table" and qiState.isMeditating == true then
+            return true
         end
         return readCharacterBool("IsMeditating") == true
     end
 
-    if type(bodyState) == "table" and type(bodyState.isPushingUp) == "boolean" then
-        return bodyState.isPushingUp
+    if type(bodyState) == "table" and bodyState.isPushingUp == true then
+        return true
     end
     return readCharacterBool("IsPushingUp") == true
 end
@@ -1148,10 +1179,31 @@ local function activateTraining(mode)
     trainingToggleAt = now
     trainingToggleAttempts = trainingToggleAttempts + 1
     if sent then
+        autoStartedTrainingMode = mode
         setStatus("Starting " .. (mode == "Qi" and "Qi meditation" or "Body push-ups") .. " via " .. tostring(backend) .. ".", COLORS.success)
     else
         setStatus("Could not send the " .. (mode == "Qi" and "M" or "P") .. " training input: " .. tostring(backend), COLORS.danger)
     end
+end
+
+local function stopAutomationOwnedTraining(mode)
+    if autoStartedTrainingMode ~= mode then
+        return true, false, nil
+    end
+
+    if not isTrainingActive(mode) then
+        autoStartedTrainingMode = nil
+        return true, false, nil
+    end
+
+    local key = mode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
+    local sent, backend = sendKey(key)
+    if not sent then
+        return false, false, backend
+    end
+
+    autoStartedTrainingMode = nil
+    return true, true, backend
 end
 
 local function processAutoCultivation()
@@ -1261,6 +1313,62 @@ local function getHerbPromptName(prompt)
     return prompt.Parent and prompt.Parent.Name or "Unknown herb"
 end
 
+local function getHerbMetadata(prompt)
+    local node = prompt and prompt.Parent
+    local age, herbType, species
+    local depth = 0
+
+    while node and depth < 6 do
+        if age == nil then
+            local ok, value = pcall(function()
+                return node:GetAttribute("HerbYear")
+            end)
+            if ok then age = tonumber(value) end
+        end
+        if herbType == nil then
+            local ok, value = pcall(function()
+                return node:GetAttribute("HerbType")
+            end)
+            if ok then herbType = tonumber(value) end
+        end
+        if age ~= nil and herbType ~= nil then
+            break
+        end
+        if node.Name == "HerbSpots" or node.Name == "Herbs" then
+            break
+        end
+        node = node.Parent
+        depth = depth + 1
+    end
+
+    species = (herbType and HERB_TYPE_NAMES[herbType]) or getHerbPromptName(prompt)
+    for _, known in ipairs(HERB_SPECIES) do
+        if string.find(string.lower(species), string.lower(known), 1, true) then
+            species = known
+            break
+        end
+    end
+
+    return species, age, herbType
+end
+
+local function isHerbSpeciesAllowed(species)
+    for _, known in ipairs(HERB_SPECIES) do
+        if species == known then
+            return herbSpeciesSelection[known] == true
+        end
+    end
+
+    -- Unknown/spirit herb species are allowed only when all normal-herb
+    -- filters are enabled; selecting specific species excludes unknown types.
+    for _, known in ipairs(HERB_SPECIES) do
+        if not herbSpeciesSelection[known] then
+            return false
+        end
+    end
+    return true
+end
+
 local function getHerbFolders()
     local folders = {}
     local normal = Workspace:FindFirstChild("HerbSpots")
@@ -1278,11 +1386,12 @@ end
 local function findNearestHerbPrompt()
     local root = getCharacterParts()
     if not root then
-        return nil, nil, nil, nil
+        return nil, nil, nil, nil, nil
     end
 
-    local bestPrompt, bestPosition, bestName = nil, nil, nil
+    local bestPrompt, bestPosition, bestName, bestAge = nil, nil, nil, nil
     local bestDistance = math.huge
+    local bestAgeRank = -1
     local now = os.clock()
 
     for _, folder in ipairs(getHerbFolders()) do
@@ -1304,14 +1413,23 @@ local function findNearestHerbPrompt()
                 local lastAttempt = herbAttemptTimes[descendant]
                 local coolingDown = lastAttempt and (now - lastAttempt < 12)
                 if descendant.Enabled and not alreadyCollected and not picked and not coolingDown then
-                    local position = getHerbPromptPosition(descendant)
-                    if position then
-                        local distance = (root.Position - position).Magnitude
-                        if distance < bestDistance then
-                            bestPrompt = descendant
-                            bestPosition = position
-                            bestName = getHerbPromptName(descendant)
-                            bestDistance = distance
+                    local species, age = getHerbMetadata(descendant)
+                    if isHerbSpeciesAllowed(species) then
+                        local position = getHerbPromptPosition(descendant)
+                        if position then
+                            local distance = (root.Position - position).Magnitude
+                            -- Highest HerbYear always wins; distance breaks ties.
+                            -- Missing age is ranked below known 1-year herbs.
+                            local ageRank = age or -1
+                            if ageRank > bestAgeRank
+                                or (ageRank == bestAgeRank and distance < bestDistance) then
+                                bestPrompt = descendant
+                                bestPosition = position
+                                bestName = species
+                                bestAge = age
+                                bestDistance = distance
+                                bestAgeRank = ageRank
+                            end
                         end
                     end
                 end
@@ -1319,7 +1437,7 @@ local function findNearestHerbPrompt()
         end
     end
 
-    return bestPrompt, bestPosition, bestName, bestDistance
+    return bestPrompt, bestPosition, bestName, bestDistance, bestAge
 end
 
 local function herbWait(seconds)
@@ -1442,7 +1560,7 @@ local function finishHerbSweep(reason)
     setHerbStatus(reason or "waiting for herbs")
 end
 
-local function collectHerbPrompt(prompt, position, herbName)
+local function collectHerbPrompt(prompt, position, herbName, herbAge)
     if not prompt or not prompt.Parent or not prompt.Enabled then
         return false, "herb is no longer available"
     end
@@ -1502,8 +1620,9 @@ local function collectHerbPrompt(prompt, position, herbName)
         if prompt.Parent and prompt.Enabled then
             herbCollectedPrompts[prompt] = true
         end
-        setHerbStatus("collected " .. herbName)
-        print("[CU AutoCultivation] Collected " .. herbName .. " via " .. tostring(backend))
+        local ageText = herbAge and (tostring(herbAge) .. "-year") or "age unknown"
+        setHerbStatus("collected " .. herbName .. " (" .. ageText .. ")")
+        print("[CU AutoCultivation] Collected " .. herbName .. " (" .. ageText .. ") via " .. tostring(backend))
         return true, "collected"
     end
 
@@ -1543,14 +1662,15 @@ local function runHerbCollector()
                     setHerbStatus("waiting for character")
                     task.wait(0.5)
                 else
-                    local prompt, position, herbName = findNearestHerbPrompt()
+                    local prompt, position, herbName, herbDistance, herbAge = findNearestHerbPrompt()
                     if prompt then
                         if not herbCollectorBusy then
                             beginHerbSweep()
                         end
                         herbAttemptTimes[prompt] = os.clock()
-                        setHerbStatus("collecting " .. tostring(herbName))
-                        local ok, result = collectHerbPrompt(prompt, position, herbName)
+                        local ageText = herbAge and (tostring(herbAge) .. "-year") or "age unknown"
+                        setHerbStatus("collecting " .. tostring(herbName) .. " (" .. ageText .. ")")
+                        local ok, result = collectHerbPrompt(prompt, position, herbName, herbAge)
                         if ok then
                             -- Keep a successful prompt marked until the game disables
                             -- it for collection; this prevents repeat farming of one node.
@@ -2161,6 +2281,39 @@ local function updateBrewRecipePicker()
     end
 end
 
+local function getHerbFilterSummary()
+    local count = 0
+    for _, species in ipairs(HERB_SPECIES) do
+        if herbSpeciesSelection[species] then
+            count = count + 1
+        end
+    end
+    if count == #HERB_SPECIES then
+        return "HERB FILTER: ALL"
+    elseif count == 0 then
+        return "HERB FILTER: NONE"
+    end
+    return "HERB FILTER: " .. tostring(count) .. "/" .. tostring(#HERB_SPECIES)
+end
+
+local function updateHerbFilterPicker()
+    for species, button in pairs(herbFilterToggleButtons) do
+        if button then
+            local selected = herbSpeciesSelection[species] == true
+            button.Text = (selected and "[ON] " or "[  ] ") .. species
+            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
+        end
+    end
+    if herbFilterButton then
+        herbFilterButton.Text = getHerbFilterSummary()
+        local count = 0
+        for _, species in ipairs(HERB_SPECIES) do
+            if herbSpeciesSelection[species] then count = count + 1 end
+        end
+        herbFilterButton.BackgroundColor3 = count == #HERB_SPECIES and COLORS.panel2 or (count == 0 and COLORS.danger or COLORS.accent)
+    end
+end
+
 updateModeButtons = function()
     if qiButton then
         qiButton.Text = selectedAutoMode == "Qi" and "QI AUTO: ON" or "QI AUTO: OFF"
@@ -2197,6 +2350,7 @@ updateModeButtons = function()
         brewRecipeButton.BackgroundColor3 = selectedCount > 0 and COLORS.panel2 or COLORS.danger
     end
     updateBrewRecipePicker()
+    updateHerbFilterPicker()
     if herbInfoLabel then
         herbInfoLabel.Text = string.format("Herbs: %d collected | %s", herbCollectedCount, herbActiveName)
     end
@@ -2204,7 +2358,7 @@ end
 
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoCultivation_v06")
+    local old = parent:FindFirstChild("CUAutoCultivation_v07")
     if old then
         pcall(function()
             old:Destroy()
@@ -2212,7 +2366,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v06",
+        Name = "CUAutoCultivation_v07",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -2222,7 +2376,7 @@ local function createGui()
     panel = make("Frame", {
         Name = "Panel",
         Position = UDim2.new(0, 14, 0, 82),
-        Size = UDim2.fromOffset(330, 244),
+        Size = UDim2.fromOffset(330, 272),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.06,
         BorderSizePixel = 0,
@@ -2237,7 +2391,7 @@ local function createGui()
         Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CU AUTO CULTIVATION  v0.6",
+        Text = "CU AUTO CULTIVATION  v0.7",
         TextColor3 = COLORS.text,
         TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -2338,8 +2492,99 @@ local function createGui()
         TextTruncate = Enum.TextTruncate.AtEnd,
     }, panel)
 
-    brewButton = makeButton("BREW: OFF", 10, 207, 94, COLORS.panel2)
-    brewRecipeButton = makeButton("PILLS: QI+BODY", 110, 207, 112, COLORS.panel2)
+    herbFilterButton = makeButton("HERB FILTER: ALL", 10, 207, 132, COLORS.panel2)
+    brewButton = makeButton("BREW: OFF", 10, 234, 94, COLORS.panel2)
+    brewRecipeButton = makeButton("PILLS: QI+BODY", 110, 234, 112, COLORS.panel2)
+
+    herbFilterPicker = make("Frame", {
+        Name = "HerbFilterPicker",
+        Position = UDim2.fromOffset(338, 126),
+        Size = UDim2.fromOffset(190, 218),
+        BackgroundColor3 = COLORS.bg,
+        BackgroundTransparency = 0.02,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 22,
+    }, panel)
+    round(herbFilterPicker, 8)
+    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, herbFilterPicker)
+    make("TextLabel", {
+        Position = UDim2.fromOffset(9, 5),
+        Size = UDim2.new(1, -18, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT HERB SPECIES",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 23,
+    }, herbFilterPicker)
+
+    local allHerbsButton = make("TextButton", {
+        Position = UDim2.fromOffset(8, 27),
+        Size = UDim2.new(1, -16, 0, 22),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "SELECT ALL",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 23,
+    }, herbFilterPicker)
+    round(allHerbsButton, 5)
+    addConnection(allHerbsButton.MouseButton1Click, function()
+        for _, species in ipairs(HERB_SPECIES) do
+            herbSpeciesSelection[species] = true
+        end
+        updateModeButtons()
+        setStatus("All five normal herb species enabled. Oldest available herbs are prioritized.", COLORS.success)
+    end)
+
+    for index, species in ipairs(HERB_SPECIES) do
+        local toggle = make("TextButton", {
+            Position = UDim2.fromOffset(8, 53 + (index - 1) * 27),
+            Size = UDim2.new(1, -16, 0, 23),
+            BackgroundColor3 = COLORS.success,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = species,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+            ZIndex = 23,
+        }, herbFilterPicker)
+        round(toggle, 5)
+        herbFilterToggleButtons[species] = toggle
+        addConnection(toggle.MouseButton1Click, function()
+            herbSpeciesSelection[species] = not herbSpeciesSelection[species]
+            updateModeButtons()
+            setStatus(species .. (herbSpeciesSelection[species] and " enabled for collection." or " excluded from collection."), COLORS.success)
+        end)
+    end
+
+    local herbFilterDone = make("TextButton", {
+        Position = UDim2.fromOffset(8, 190),
+        Size = UDim2.new(1, -16, 0, 22),
+        BackgroundColor3 = COLORS.accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Font = Enum.Font.GothamBold,
+        Text = "DONE",
+        TextColor3 = COLORS.text,
+        TextSize = 9,
+        Active = true,
+        Selectable = true,
+        ZIndex = 23,
+    }, herbFilterPicker)
+    round(herbFilterDone, 5)
+    addConnection(herbFilterDone.MouseButton1Click, function()
+        herbFilterPicker.Visible = false
+    end)
 
     brewRecipePicker = make("Frame", {
         Name = "BrewRecipePicker",
@@ -2426,28 +2671,82 @@ local function createGui()
         end
     end)
 
+    addConnection(herbFilterButton.MouseButton1Click, function()
+        if herbFilterPicker then
+            herbFilterPicker.Visible = not herbFilterPicker.Visible
+        end
+        if brewRecipePicker then
+            brewRecipePicker.Visible = false
+        end
+        updateModeButtons()
+        setStatus("Choose which herb species Auto Herbs may collect. Within the selected species, older HerbYear values are collected first.", COLORS.success)
+    end)
+
     addConnection(brewRecipeButton.MouseButton1Click, function()
         if brewRecipePicker then
             brewRecipePicker.Visible = not brewRecipePicker.Visible
+        end
+        if herbFilterPicker then
+            herbFilterPicker.Visible = false
         end
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes when ingredients are available.", COLORS.success)
     end)
 
     addConnection(qiButton.MouseButton1Click, function()
-        selectedAutoMode = selectedAutoMode == "Qi" and nil or "Qi"
+        if selectedAutoMode == "Qi" then
+            selectedAutoMode = nil
+            local ok, stopped, backend = stopAutomationOwnedTraining("Qi")
+            if not ok then
+                setStatus("Qi Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
+            elseif stopped then
+                setStatus("Qi Auto OFF; script-started meditation stopped.", COLORS.warning)
+            else
+                setStatus("Qi Auto OFF. Manually started meditation is left alone.", COLORS.warning)
+            end
+        else
+            if selectedAutoMode == "Body" then
+                local ok, _, backend = stopAutomationOwnedTraining("Body")
+                if not ok then
+                    setStatus("Could not stop script-started Body training; Qi was not enabled: " .. tostring(backend), COLORS.danger)
+                    return
+                end
+            end
+            selectedAutoMode = "Qi"
+            setStatus("Qi Auto Cultivation ON. Selecting the best unlocked Qi zone.", COLORS.success)
+        end
         trainingToggleAttempts = 0
+        trainingToggleAt = 0
         lastTeleportTarget = nil
         updateModeButtons()
-        setStatus(selectedAutoMode == "Qi" and "Qi Auto Cultivation enabled." or "Auto Cultivation disabled.", selectedAutoMode and COLORS.success or COLORS.warning)
     end)
 
     addConnection(bodyButton.MouseButton1Click, function()
-        selectedAutoMode = selectedAutoMode == "Body" and nil or "Body"
+        if selectedAutoMode == "Body" then
+            selectedAutoMode = nil
+            local ok, stopped, backend = stopAutomationOwnedTraining("Body")
+            if not ok then
+                setStatus("Body Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
+            elseif stopped then
+                setStatus("Body Auto OFF; script-started push-ups stopped.", COLORS.warning)
+            else
+                setStatus("Body Auto OFF. Manually started push-ups are left alone.", COLORS.warning)
+            end
+        else
+            if selectedAutoMode == "Qi" then
+                local ok, _, backend = stopAutomationOwnedTraining("Qi")
+                if not ok then
+                    setStatus("Could not stop script-started Qi meditation; Body was not enabled: " .. tostring(backend), COLORS.danger)
+                    return
+                end
+            end
+            selectedAutoMode = "Body"
+            setStatus("Body Auto Cultivation ON. Selecting the best unlocked Body zone.", COLORS.success)
+        end
         trainingToggleAttempts = 0
+        trainingToggleAt = 0
         lastTeleportTarget = nil
         updateModeButtons()
-        setStatus(selectedAutoMode == "Body" and "Body Auto Cultivation enabled." or "Auto Cultivation disabled.", selectedAutoMode and COLORS.success or COLORS.warning)
     end)
 
     addConnection(herbButton.MouseButton1Click, function()
@@ -2693,6 +2992,6 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v0.6 loaded. Auto Breakthrough and Anti-AFK are ON; Auto Herbs and Auto Brew are OFF.")
+print("[CU AutoCultivation] v0.7 loaded. Qi/Body toggles are reversible; Auto Breakthrough and Anti-AFK are ON; Auto Herbs and Auto Brew are OFF.")
 print("[CU AutoCultivation] Auto Brew supports multiple selected pill recipes, confirmed Claim handling, oldest herbs first, and Perfect-band timing.")
-setStatus("Loaded. Select Qi Auto, Body Auto, HERBS, or BREW to begin.", COLORS.success)
+setStatus("Loaded. Qi/Body can be toggled OFF; Auto Herbs prioritizes oldest HerbYear with species filters.", COLORS.success)
