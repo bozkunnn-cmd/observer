@@ -1,6 +1,6 @@
 --[[
-    CULTIVATION UNBOUND - AUTO CULTIVATION
-    Version: 0.3
+    CULTIVATION UNBOUND - AUTO CULTIVATION + HERB COLLECTION
+    Version: 0.4
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -11,6 +11,10 @@
       - Preserve the working BreakthroughBanner and tribulation Tap logic.
       - Tribulation processing does not require a readable hit counter.
       - Anti-AFK toggle using LocalPlayer.Idled / VirtualUser.
+      - Auto Herb Collection: scans enabled CollectHerbPrompt objects in both
+        normal HerbSpots and SpiritWorld.Herbs folders.
+      - Holds the real 2.5-second collection prompt and verifies the result.
+      - Temporarily pauses cultivation during a herb sweep, then resumes.
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
@@ -46,13 +50,24 @@ if type(Env.__CUAutoCultivationStop) == "function" then
     pcall(Env.__CUAutoCultivationStop, "replaced")
 end
 if type(Env.__CUAutoBreakthroughStop) == "function" then
-    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.3")
+    pcall(Env.__CUAutoBreakthroughStop, "replaced by v0.4")
 end
 
 local running = true
 local paused = false
 local breakthroughEnabled = true
 local antiAfkEnabled = true
+local autoHerbsEnabled = false
+local herbCollectorBusy = false
+local herbCollectorTaskRunning = false
+local herbAttemptTimes = setmetatable({}, {__mode = "k"})
+local herbCollectedPrompts = setmetatable({}, {__mode = "k"})
+local herbCollectedCount = 0
+local herbFailedCount = 0
+local herbInventoryRevision = 0
+local herbReturnCFrame = nil
+local herbResumeMode = nil
+local herbActiveName = "idle"
 local selectedAutoMode = nil -- nil, "Qi", or "Body"
 local connections = {}
 
@@ -96,6 +111,8 @@ local qiButton = nil
 local bodyButton = nil
 local breakthroughButton = nil
 local antiAfkButton = nil
+local herbButton = nil
+local herbInfoLabel = nil
 local pauseButton = nil
 
 local COLORS = {
@@ -163,11 +180,23 @@ local function setStatus(message, color)
     end
 end
 
+local function setHerbStatus(message)
+    herbActiveName = tostring(message or "idle")
+    if herbInfoLabel then
+        herbInfoLabel.Text = string.format(
+            "Herbs: %d collected | %s",
+            herbCollectedCount,
+            herbActiveName
+        )
+    end
+end
+
 local function stop(reason)
     if not running then
         return
     end
     running = false
+    autoHerbsEnabled = false
     disconnectAll()
     if gui then
         pcall(function()
@@ -192,6 +221,10 @@ Env.__CUAutoCultivationState = {
             autoMode = selectedAutoMode,
             breakthroughEnabled = breakthroughEnabled,
             antiAfkEnabled = antiAfkEnabled,
+            autoHerbsEnabled = autoHerbsEnabled,
+            herbCollectorBusy = herbCollectorBusy,
+            herbsCollected = herbCollectedCount,
+            herbsFailed = herbFailedCount,
             mode = lastMode,
             percent = lastPercent,
             action = lastAction,
@@ -1030,7 +1063,7 @@ local function activateTraining(mode)
 end
 
 local function processAutoCultivation()
-    if not selectedAutoMode or paused or not running then
+    if herbCollectorBusy or not selectedAutoMode or paused or not running then
         return
     end
     -- Never relocate or restart training while a breakthrough/tribulation is
@@ -1100,6 +1133,360 @@ local function processAutoCultivation()
     activateTraining(mode)
 end
 
+-- Herb collection -----------------------------------------------------------
+-- The user's recording showed CollectHerbPrompt with ActionText="Collect",
+-- KeyboardKeyCode=E, HoldDuration=2.5, MaxActivationDistance=10. The game also
+-- exposes HerbInventoryUpdate. We use the prompt rather than directly invoking the collection remote.
+
+local function getHerbPromptPosition(prompt)
+    local parent = prompt and prompt.Parent
+    if not parent then
+        return nil
+    end
+    if parent:IsA("BasePart") then
+        return parent.Position
+    end
+    if parent:IsA("Model") then
+        local ok, pivot = pcall(function()
+            return parent:GetPivot()
+        end)
+        if ok and pivot then
+            return pivot.Position
+        end
+    end
+    local part = parent:FindFirstChildWhichIsA("BasePart", true)
+    return part and part.Position or nil
+end
+
+local function getHerbPromptName(prompt)
+    if not prompt then
+        return "Unknown herb"
+    end
+    local objectText = tostring(prompt.ObjectText or "")
+    if objectText ~= "" then
+        return objectText
+    end
+    return prompt.Parent and prompt.Parent.Name or "Unknown herb"
+end
+
+local function getHerbFolders()
+    local folders = {}
+    local normal = Workspace:FindFirstChild("HerbSpots")
+    if normal then
+        table.insert(folders, normal)
+    end
+    local spiritWorld = Workspace:FindFirstChild("SpiritWorld")
+    local spiritHerbs = spiritWorld and spiritWorld:FindFirstChild("Herbs")
+    if spiritHerbs then
+        table.insert(folders, spiritHerbs)
+    end
+    return folders
+end
+
+local function findNearestHerbPrompt()
+    local root = getCharacterParts()
+    if not root then
+        return nil, nil, nil, nil
+    end
+
+    local bestPrompt, bestPosition, bestName = nil, nil, nil
+    local bestDistance = math.huge
+    local now = os.clock()
+
+    for _, folder in ipairs(getHerbFolders()) do
+        for _, descendant in ipairs(folder:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt")
+                and descendant.Name == "CollectHerbPrompt"
+                and descendant.Parent then
+
+                if herbCollectedPrompts[descendant] and not descendant.Enabled then
+                    herbCollectedPrompts[descendant] = nil
+                end
+
+                local alreadyCollected = herbCollectedPrompts[descendant] == true
+                local picked = false
+                pcall(function()
+                    picked = descendant.Parent:GetAttribute("Picked") == true
+                end)
+
+                local lastAttempt = herbAttemptTimes[descendant]
+                local coolingDown = lastAttempt and (now - lastAttempt < 12)
+                if descendant.Enabled and not alreadyCollected and not picked and not coolingDown then
+                    local position = getHerbPromptPosition(descendant)
+                    if position then
+                        local distance = (root.Position - position).Magnitude
+                        if distance < bestDistance then
+                            bestPrompt = descendant
+                            bestPosition = position
+                            bestName = getHerbPromptName(descendant)
+                            bestDistance = distance
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPrompt, bestPosition, bestName, bestDistance
+end
+
+local function herbWait(seconds)
+    local finishAt = os.clock() + seconds
+    while os.clock() < finishAt do
+        if not running or not autoHerbsEnabled or paused then
+            return false
+        end
+        task.wait(0.05)
+    end
+    return true
+end
+
+local function holdHerbPrompt(prompt)
+    local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 2.5, 0.1, 5)
+
+    -- Prefer the real ProximityPrompt hold lifecycle. It respects the game's
+    -- HoldDuration and lets the server validate the normal interaction.
+    local began = pcall(function()
+        prompt:InputHoldBegin()
+    end)
+    if began then
+        local completed = herbWait(holdDuration + 0.12)
+        pcall(function()
+            prompt:InputHoldEnd()
+        end)
+        return completed, completed and "ProximityPrompt hold" or "cancelled"
+    end
+
+    -- Executor compatibility fallback. This still targets the actual prompt.
+    if type(fireproximityprompt) == "function" then
+        local ok, err = pcall(fireproximityprompt, prompt, holdDuration)
+        return ok, ok and "fireproximityprompt" or tostring(err)
+    end
+
+    -- Last fallback: hold E through VirtualInputManager for the prompt's
+    -- configured duration. Always release the key, including cancellation.
+    local virtualInput
+    local okService, service = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    if okService then
+        virtualInput = service
+    end
+    if not virtualInput then
+        return false, "no supported ProximityPrompt input method"
+    end
+
+    local keyDown = pcall(function()
+        virtualInput:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    end)
+    if not keyDown then
+        return false, "could not press E"
+    end
+    local completed = herbWait(holdDuration + 0.12)
+    pcall(function()
+        virtualInput:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    return completed, completed and "VirtualInputManager E hold" or "cancelled"
+end
+
+local function getHerbResumeMode()
+    if selectedAutoMode then
+        return selectedAutoMode
+    end
+    if type(qiState) == "table" and qiState.isMeditating == true then
+        return "Qi"
+    end
+    if type(bodyState) == "table" and bodyState.isPushingUp == true then
+        return "Body"
+    end
+    return nil
+end
+
+local function beginHerbSweep()
+    if herbCollectorBusy then
+        return
+    end
+
+    local root = getCharacterParts()
+    herbReturnCFrame = root and root.CFrame or nil
+
+    herbResumeMode = getHerbResumeMode()
+    herbCollectorBusy = true
+
+    if herbResumeMode and isTrainingActive(herbResumeMode) then
+        local key = herbResumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
+        sendKey(key)
+        task.wait(0.35)
+    end
+end
+
+local function finishHerbSweep(reason)
+    herbCollectorBusy = false
+
+    -- With Auto Cultivation enabled, its normal controller will return to the
+    -- best unlocked zone. Otherwise restore the user's previous position.
+    if not selectedAutoMode and herbReturnCFrame then
+        local root = getCharacterParts()
+        if root then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                root.CFrame = herbReturnCFrame
+            end)
+            task.wait(0.65)
+        end
+    end
+
+    local resumeMode = herbResumeMode
+    herbReturnCFrame = nil
+    herbResumeMode = nil
+
+    if not selectedAutoMode and resumeMode and running and not paused then
+        if not isTrainingActive(resumeMode) then
+            activateTraining(resumeMode)
+        end
+    end
+
+    setHerbStatus(reason or "waiting for herbs")
+end
+
+local function collectHerbPrompt(prompt, position, herbName)
+    if not prompt or not prompt.Parent or not prompt.Enabled then
+        return false, "herb is no longer available"
+    end
+
+    local root = getCharacterParts()
+    if not root then
+        return false, "waiting for character"
+    end
+
+    local maxDistance = tonumber(prompt.MaxActivationDistance) or 10
+    local distance = (root.Position - position).Magnitude
+    if distance > math.max(2, maxDistance - 1.0) then
+        local destination = position + Vector3.new(0, 3.0, 0)
+        local look = root.CFrame.LookVector
+        local moved, moveError = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.new(destination, destination + look)
+        end)
+        if not moved then
+            return false, "teleport failed: " .. tostring(moveError)
+        end
+        if not herbWait(1.0) then
+            return false, "cancelled"
+        end
+        root = getCharacterParts()
+        if not root then
+            return false, "character unavailable after moving"
+        end
+        position = getHerbPromptPosition(prompt) or position
+        distance = (root.Position - position).Magnitude
+    end
+
+    if not prompt.Parent or not prompt.Enabled then
+        return false, "herb became unavailable before interaction"
+    end
+    if distance > maxDistance then
+        return false, string.format("outside prompt range (%.1f/%.1f)", distance, maxDistance)
+    end
+
+    local inventoryBefore = herbInventoryRevision
+    local sent, backend = holdHerbPrompt(prompt)
+    if not sent then
+        if backend == "cancelled" then
+            return false, "cancelled"
+        end
+        return false, "input failed: " .. tostring(backend)
+    end
+    if not herbWait(0.55) then
+        return false, "cancelled"
+    end
+
+    local inventoryChanged = herbInventoryRevision > inventoryBefore
+    local promptConsumed = not prompt.Parent or not prompt.Enabled
+    if inventoryChanged or promptConsumed then
+        herbCollectedCount = herbCollectedCount + 1
+        if prompt.Parent and prompt.Enabled then
+            herbCollectedPrompts[prompt] = true
+        end
+        setHerbStatus("collected " .. herbName)
+        print("[CU AutoCultivation] Collected " .. herbName .. " via " .. tostring(backend))
+        return true, "collected"
+    end
+
+    herbFailedCount = herbFailedCount + 1
+    return false, "no inventory/prompt confirmation; will retry later"
+end
+
+local function isBreakthroughPending()
+    if not breakthroughEnabled then
+        return false
+    end
+    local mode, frame = getActiveMode()
+    if not mode or not frame then
+        return false
+    end
+    local percent = getModeProgress(mode, frame)
+    return percent ~= nil and percent >= 99.95
+end
+
+local function runHerbCollector()
+    if herbCollectorTaskRunning then
+        return
+    end
+
+    herbCollectorTaskRunning = true
+    task.spawn(function()
+        while running and autoHerbsEnabled do
+            if paused then
+                setHerbStatus("paused")
+                task.wait(0.25)
+            elseif activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+                setHerbStatus("waiting for breakthrough")
+                task.wait(0.25)
+            else
+                local root = getCharacterParts()
+                if not root then
+                    setHerbStatus("waiting for character")
+                    task.wait(0.5)
+                else
+                    local prompt, position, herbName = findNearestHerbPrompt()
+                    if prompt then
+                        if not herbCollectorBusy then
+                            beginHerbSweep()
+                        end
+                        herbAttemptTimes[prompt] = os.clock()
+                        setHerbStatus("collecting " .. tostring(herbName))
+                        local ok, result = collectHerbPrompt(prompt, position, herbName)
+                        if ok then
+                            -- Keep a successful prompt marked until the game disables
+                            -- it for collection; this prevents repeat farming of one node.
+                        elseif result == "cancelled" then
+                            herbAttemptTimes[prompt] = nil
+                        else
+                            setHerbStatus(tostring(herbName) .. ": " .. tostring(result))
+                        end
+                        task.wait(0.15)
+                    else
+                        if herbCollectorBusy then
+                            finishHerbSweep("sweep complete; checking respawns")
+                        else
+                            setHerbStatus("scanning enabled prompts")
+                        end
+                        task.wait(3.0)
+                    end
+                end
+            end
+        end
+
+        if herbCollectorBusy then
+            finishHerbSweep("auto herb collection stopped")
+        end
+        herbCollectorTaskRunning = false
+    end)
+end
+
 local function updateModeButtons()
     if qiButton then
         qiButton.Text = selectedAutoMode == "Qi" and "QI AUTO: ON" or "QI AUTO: OFF"
@@ -1117,11 +1504,18 @@ local function updateModeButtons()
         antiAfkButton.Text = antiAfkEnabled and "ANTI-AFK: ON" or "ANTI-AFK: OFF"
         antiAfkButton.BackgroundColor3 = antiAfkEnabled and COLORS.success or COLORS.panel2
     end
+    if herbButton then
+        herbButton.Text = autoHerbsEnabled and "HERBS: ON" or "HERBS: OFF"
+        herbButton.BackgroundColor3 = autoHerbsEnabled and COLORS.success or COLORS.panel2
+    end
+    if herbInfoLabel then
+        herbInfoLabel.Text = string.format("Herbs: %d collected | %s", herbCollectedCount, herbActiveName)
+    end
 end
 
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoCultivation_v03")
+    local old = parent:FindFirstChild("CUAutoCultivation_v04")
     if old then
         pcall(function()
             old:Destroy()
@@ -1129,7 +1523,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v03",
+        Name = "CUAutoCultivation_v04",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -1139,7 +1533,7 @@ local function createGui()
     panel = make("Frame", {
         Name = "Panel",
         Position = UDim2.new(0, 14, 0, 82),
-        Size = UDim2.fromOffset(330, 190),
+        Size = UDim2.fromOffset(330, 216),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.06,
         BorderSizePixel = 0,
@@ -1154,7 +1548,7 @@ local function createGui()
         Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CU AUTO CULTIVATION  v0.3",
+        Text = "CU AUTO CULTIVATION  v0.4",
         TextColor3 = COLORS.text,
         TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -1242,6 +1636,18 @@ local function createGui()
     pauseButton = makeButton("PAUSE", 110, 153, 65, COLORS.panel2)
     local hideButton = makeButton("HIDE", 181, 153, 55, COLORS.panel2)
     local stopButton = makeButton("STOP", 242, 153, 78, COLORS.danger)
+    herbButton = makeButton("HERBS: OFF", 10, 180, 96, COLORS.panel2)
+    herbInfoLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(114, 182),
+        Size = UDim2.fromOffset(206, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Herbs: 0 collected | idle",
+        TextColor3 = COLORS.muted,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, panel)
 
     addConnection(qiButton.MouseButton1Click, function()
         selectedAutoMode = selectedAutoMode == "Qi" and nil or "Qi"
@@ -1257,6 +1663,19 @@ local function createGui()
         lastTeleportTarget = nil
         updateModeButtons()
         setStatus(selectedAutoMode == "Body" and "Body Auto Cultivation enabled." or "Auto Cultivation disabled.", selectedAutoMode and COLORS.success or COLORS.warning)
+    end)
+
+    addConnection(herbButton.MouseButton1Click, function()
+        autoHerbsEnabled = not autoHerbsEnabled
+        updateModeButtons()
+        if autoHerbsEnabled then
+            setHerbStatus("scanning enabled prompts")
+            setStatus("Auto Herb Collection enabled; cultivation will resume after each sweep.", COLORS.success)
+            runHerbCollector()
+        else
+            setHerbStatus("turning off")
+            setStatus("Auto Herb Collection disabled; finishing the current hold safely.", COLORS.warning)
+        end
     end)
 
     addConnection(breakthroughButton.MouseButton1Click, function()
@@ -1316,6 +1735,17 @@ do
                 if type(data) == "table" then
                     bodyState = data
                 end
+            end)
+        end
+
+        local herbInventoryRemote = eventsFolder:FindFirstChild("HerbInventoryUpdate")
+        if herbInventoryRemote and herbInventoryRemote:IsA("RemoteEvent") then
+            addConnection(herbInventoryRemote.OnClientEvent, function(data)
+                herbInventoryRevision = herbInventoryRevision + 1
+                if type(data) == "table" then
+                    lastAction = "Herb inventory update received."
+                end
+                setHerbStatus("inventory updated")
             end)
         end
 
@@ -1397,7 +1827,7 @@ addConnection(RunService.RenderStepped, function()
         return
     end
 
-    if not trialActiveOrError and frameCounter % 6 == 0 then
+    if not trialActiveOrError and not herbCollectorBusy and frameCounter % 6 == 0 then
         local okBreak, breakError = pcall(processBreakthrough)
         if not okBreak then
             lastError = tostring(breakError)
@@ -1422,7 +1852,7 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v0.3 loaded.")
+print("[CU AutoCultivation] v0.4 loaded.")
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] Auto Breakthrough and Anti-AFK are ON.")
-setStatus("Loaded. Select Qi Auto or Body Auto to begin.", COLORS.success)
+print("[CU AutoCultivation] Auto Breakthrough and Anti-AFK are ON; Auto Herbs is OFF.")
+setStatus("Loaded. Select Qi Auto, Body Auto, or HERBS to begin.", COLORS.success)
