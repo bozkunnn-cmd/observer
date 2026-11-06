@@ -1,20 +1,19 @@
 --[[
     CULTIVATION UNBOUND - FULL SESSION RECORDER
-    Version: 1.1
+    Version: 1.2
 
     Purpose:
       Record the client-visible state of a fresh Cultivation Unbound session.
 
     Captures:
       - Initial snapshot of DataModel descendants
-      - Instance creation/removal and ancestry changes
-      - Instance property changes and attribute changes
-      - GUI text, colors, visibility, sizes, positions and button activations
-      - Player input (keyboard, mouse, touch, gamepad)
+      - Instance creation/removal and selected attribute/property changes
+      - GUI text, colors, visibility and trial timing visuals
+      - Keyboard/mouse/touch/gamepad press and release (no mouse-move flood)
       - Local character and player state
       - Proximity prompts, click detectors, tools and bindable events
-      - Incoming RemoteEvent traffic
-      - Outgoing RemoteEvent/RemoteFunction calls when executor namecall hooks exist
+      - Incoming RemoteEvent traffic; outbound remote hooks are disabled by default
+        because executor namecall hooks can interfere with client input/game behavior
       - High-frequency sampling of visible Trial GUI elements during tribulations
       - Periodic checkpoints of local player, character and PlayerGui
 
@@ -65,14 +64,14 @@ end
 
 local CONFIG = {
     FOLDER = "CultivationUnbound_Logs",
-    FLUSH_INTERVAL = 0.5,
-    FLUSH_BATCH_SIZE = 400,
-    CHECKPOINT_INTERVAL = 30,
+    FLUSH_INTERVAL = 1.0,
+    FLUSH_BATCH_SIZE = 300,
+    CHECKPOINT_INTERVAL = 45,
     TRIAL_SAMPLE_RATE = "RenderStepped",
-    LOG_INPUT_CHANGED = true,
-    LOG_REMOTE_TRAFFIC = true,
-    LOG_ALL_INSTANCE_PROPERTY_CHANGES = true,
-    LOG_WORLD_PHYSICS_CHANGES = true,
+    LOG_INPUT_CHANGED = false,
+    LOG_REMOTE_TRAFFIC = false,
+    LOG_RELEVANT_PROPERTY_CHANGES = true,
+    LOG_WORLD_PHYSICS_CHANGES = false,
 }
 
 local running = true
@@ -134,6 +133,8 @@ local function safeIsA(instance, className)
     end)
     return ok and result == true
 end
+
+local safeGet
 
 local function normalize(value, depth, seen)
     depth = depth or 0
@@ -293,7 +294,7 @@ local function addUiConnection(connection)
     return connection
 end
 
-local function safeGet(instance, property)
+safeGet = function(instance, property)
     local ok, value = pcall(function()
         return instance[property]
     end)
@@ -376,12 +377,35 @@ local function propertiesFor(instance)
     end
 
     if safeIsA(instance, "BasePart") then
-        add({
-            "CFrame", "Position", "Orientation", "Size", "Anchored", "CanCollide",
-            "CanTouch", "CanQuery", "Transparency", "LocalTransparencyModifier",
-            "Color", "Material", "Reflectance", "AssemblyLinearVelocity",
-            "AssemblyAngularVelocity", "CollisionGroup", "Mass", "CastShadow",
-        })
+        -- Keep spatial details for likely gameplay objects and the local character.
+        -- Static map geometry still gets its name/class/path/attributes, but does not
+        -- generate thousands of unnecessary transform reads in the initial snapshot.
+        local lowerPath = string.lower(safePath(instance))
+        local spatialRelevant = string.find(lowerPath, "npc", 1, true)
+            or string.find(lowerPath, "herb", 1, true)
+            or string.find(lowerPath, "boss", 1, true)
+            or string.find(lowerPath, "quest", 1, true)
+            or string.find(lowerPath, "merchant", 1, true)
+            or string.find(lowerPath, "event", 1, true)
+            or string.find(lowerPath, "trial", 1, true)
+            or string.find(lowerPath, "cultivation", 1, true)
+            or string.find(lowerPath, "spawn", 1, true)
+            or string.find(lowerPath, "resource", 1, true)
+            or string.find(lowerPath, "drop", 1, true)
+            or string.find(lowerPath, "zone", 1, true)
+        local character = LocalPlayer.Character
+        if character then
+            local ok, insideCharacter = pcall(function()
+                return instance:IsDescendantOf(character)
+            end)
+            spatialRelevant = spatialRelevant or (ok and insideCharacter)
+        end
+        if spatialRelevant then
+            add({
+                "CFrame", "Position", "Orientation", "Size", "Anchored", "CanCollide",
+                "CanTouch", "CanQuery", "Transparency", "Color", "Material",
+            })
+        end
     end
 
     if safeIsA(instance, "Model") then
@@ -637,6 +661,119 @@ local function connectSignal(instance, signalName, callback)
     end
 end
 
+local function pathContainsAny(path, words)
+    local lower = string.lower(tostring(path or ""))
+    for _, word in ipairs(words) do
+        if string.find(lower, word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function shouldWatchChanged(instance)
+    return safeIsA(instance, "ValueBase")
+        or safeIsA(instance, "GuiObject")
+        or safeIsA(instance, "LayerCollector")
+        or safeIsA(instance, "Humanoid")
+        or safeIsA(instance, "ProximityPrompt")
+        or safeIsA(instance, "ClickDetector")
+        or safeIsA(instance, "Tool")
+end
+
+local function shouldLogPropertyChange(instance, propertyName)
+    if safeIsA(instance, "ValueBase") then
+        return propertyName == "Value"
+    end
+
+    if safeIsA(instance, "Humanoid") then
+        return propertyName == "Health"
+            or propertyName == "MaxHealth"
+            or propertyName == "WalkSpeed"
+            or propertyName == "JumpPower"
+            or propertyName == "JumpHeight"
+            or propertyName == "Sit"
+            or propertyName == "PlatformStand"
+            or propertyName == "MoveDirection"
+            or propertyName == "FloorMaterial"
+            or propertyName == "AutoRotate"
+    end
+
+    if safeIsA(instance, "LayerCollector") then
+        return propertyName == "Enabled" or propertyName == "DisplayOrder"
+    end
+
+    if safeIsA(instance, "GuiObject") then
+        local path = safePath(instance)
+        local trialUi = pathContainsAny(path, { "trial", "tribulation", "breakthrough" })
+        local importantUi = trialUi or pathContainsAny(path, {
+            "cultivation", "realm", "quest", "inventory", "backpack", "shop",
+            "boss", "event", "skill", "herb", "pill", "sect", "tracker",
+            "qi", "body", "reward", "dialog", "merchant",
+        })
+
+        if trialUi then
+            return propertyName == "Visible"
+                or propertyName == "Position"
+                or propertyName == "Size"
+                or propertyName == "BackgroundColor3"
+                or propertyName == "BackgroundTransparency"
+                or propertyName == "ImageColor3"
+                or propertyName == "ImageTransparency"
+                or propertyName == "Rotation"
+                or propertyName == "Text"
+                or propertyName == "TextColor3"
+                or propertyName == "TextTransparency"
+                or propertyName == "TextSize"
+                or propertyName == "Enabled"
+                or propertyName == "Active"
+                or propertyName == "Selectable"
+        end
+
+        if importantUi then
+            return propertyName == "Visible"
+                or propertyName == "Enabled"
+                or propertyName == "Text"
+                or propertyName == "TextColor3"
+                or propertyName == "TextTransparency"
+                or propertyName == "BackgroundColor3"
+                or propertyName == "BackgroundTransparency"
+                or propertyName == "ImageColor3"
+                or propertyName == "ImageTransparency"
+                or propertyName == "Active"
+                or propertyName == "Selectable"
+        end
+
+        return propertyName == "Visible" or propertyName == "Enabled"
+    end
+
+    if safeIsA(instance, "ProximityPrompt") then
+        return propertyName == "ActionText"
+            or propertyName == "ObjectText"
+            or propertyName == "Enabled"
+            or propertyName == "HoldDuration"
+            or propertyName == "MaxActivationDistance"
+            or propertyName == "RequiresLineOfSight"
+    end
+
+    if safeIsA(instance, "ClickDetector") then
+        return propertyName == "MaxActivationDistance" or propertyName == "CursorIcon"
+    end
+
+    if safeIsA(instance, "Tool") then
+        return propertyName == "Enabled" or propertyName == "ToolTip"
+    end
+
+    if safeIsA(instance, "BasePart") then
+        return CONFIG.LOG_WORLD_PHYSICS_CHANGES
+            and (propertyName == "CFrame" or propertyName == "Position"
+                or propertyName == "AssemblyLinearVelocity"
+                or propertyName == "AssemblyAngularVelocity")
+    end
+
+    return false
+end
+
 local function recordInstance(instance, origin)
     if not running or shouldSkipInstance(instance) or tracked[instance] then
         return
@@ -653,6 +790,7 @@ local function recordInstance(instance, origin)
         table.insert(trialInstances, instance)
     end
 
+    local initialAttributes = getAttributes(instance)
     emit(origin == "initial" and "instance_snapshot" or "instance_added", {
         origin = origin,
         path = path,
@@ -660,12 +798,12 @@ local function recordInstance(instance, origin)
         name = safeGet(instance, "Name"),
         parent = safePath(safeGet(instance, "Parent")),
         properties = snapshotProperties(instance),
-        attributes = getAttributes(instance),
+        attributes = initialAttributes,
         tags = getTags(instance),
         mechanic_tags = classifyPath(path),
     })
 
-    if CONFIG.LOG_ALL_INSTANCE_PROPERTY_CHANGES then
+    if CONFIG.LOG_RELEVANT_PROPERTY_CHANGES and shouldWatchChanged(instance) then
         connectSignal(instance, "Changed", function(changed)
             local propertyName
             local value
@@ -676,18 +814,11 @@ local function recordInstance(instance, origin)
                 propertyName = changed
                 value = safeGet(instance, propertyName)
             else
-                propertyName = "ChangedValue"
-                value = changed
+                return
             end
 
-            -- Physics transforms are included by default. Disable this only
-            -- if the file becomes too noisy or the client becomes overloaded.
-            if not CONFIG.LOG_WORLD_PHYSICS_CHANGES and safeIsA(instance, "BasePart") then
-                if propertyName == "CFrame" or propertyName == "Position"
-                    or propertyName == "AssemblyLinearVelocity"
-                    or propertyName == "AssemblyAngularVelocity" then
-                    return
-                end
+            if not shouldLogPropertyChange(instance, propertyName) then
+                return
             end
 
             emit("property_changed", {
@@ -700,37 +831,30 @@ local function recordInstance(instance, origin)
         end)
     end
 
-    connectSignal(instance, "AttributeChanged", function(attributeName)
-        local attributeValue = nil
-        local attributeOk, result = pcall(function()
-            return instance:GetAttribute(attributeName)
+    -- Attribute watchers are useful on mechanic-related objects and objects that
+    -- already expose attributes. Avoid one extra connection on every static map part.
+    if next(initialAttributes) ~= nil or pathContainsAny(path, {
+        "cultivation", "realm", "trial", "breakthrough", "quest", "inventory",
+        "boss", "skill", "herb", "pill", "sect", "event", "soul", "npc",
+        "merchant", "tracker", "reward", "body", "qi",
+    }) then
+        connectSignal(instance, "AttributeChanged", function(attributeName)
+            local attributeValue = nil
+            local attributeOk, result = pcall(function()
+                return instance:GetAttribute(attributeName)
+            end)
+            if attributeOk then
+                attributeValue = result
+            end
+            emit("attribute_changed", {
+                path = safePath(instance),
+                class = className,
+                attribute = attributeName,
+                value = attributeValue,
+                tags = classifyPath(safePath(instance)),
+            })
         end)
-        if attributeOk then
-            attributeValue = result
-        end
-        emit("attribute_changed", {
-            path = safePath(instance),
-            class = className,
-            attribute = attributeName,
-            value = attributeValue,
-            tags = classifyPath(safePath(instance)),
-        })
-    end)
-
-    connectSignal(instance, "AncestryChanged", function(_, newParent)
-        emit("ancestry_changed", {
-            path = safePath(instance),
-            class = className,
-            new_parent = safePath(newParent),
-        })
-    end)
-
-    connectSignal(instance, "Destroying", function()
-        emit("instance_destroying", {
-            path = safePath(instance),
-            class = className,
-        })
-    end)
+    end
 
     if safeIsA(instance, "RemoteEvent") then
         connectSignal(instance, "OnClientEvent", function(...)
@@ -742,7 +866,10 @@ local function recordInstance(instance, origin)
         end)
     end
 
-    if safeIsA(instance, "BindableEvent") then
+    if safeIsA(instance, "BindableEvent") and pathContainsAny(path, {
+        "cultivation", "realm", "trial", "breakthrough", "quest", "inventory",
+        "boss", "skill", "herb", "pill", "sect", "event", "soul",
+    }) then
         connectSignal(instance, "Event", function(...)
             emit("bindable_event", {
                 bindable = safePath(instance),
@@ -1077,6 +1204,8 @@ local function makeUiButton(parent, text, x, width, color)
         Size = UDim2.fromOffset(width, 28),
         BackgroundColor3 = color or Color3.fromRGB(39, 47, 62),
         BorderSizePixel = 0,
+        Active = true,
+        Selectable = false,
         AutoButtonColor = true,
         Font = Enum.Font.GothamBold,
         Text = text,
@@ -1094,17 +1223,18 @@ local function createUi()
         ResetOnSpawn = false,
         IgnoreGuiInset = true,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 10,
     }, parent)
     sharedEnv.__CURecorderGui = gui
 
     local main = makeUiObject("Frame", {
         Name = "Main",
-        Position = UDim2.fromOffset(18, 110),
+        Position = UDim2.new(1, -473, 0, 12),
         Size = UDim2.fromOffset(455, 150),
         BackgroundColor3 = Color3.fromRGB(17, 21, 29),
         BorderSizePixel = 0,
-        Active = true,
-        Draggable = true,
+        Active = false,
+        Draggable = false,
     }, gui)
     roundUi(main, 10)
 
@@ -1113,7 +1243,7 @@ local function createUi()
         Size = UDim2.new(1, 0, 0, 34),
         BackgroundColor3 = Color3.fromRGB(31, 39, 53),
         BorderSizePixel = 0,
-        Active = true,
+        Active = false,
     }, main)
     roundUi(header, 10)
 
@@ -1122,7 +1252,7 @@ local function createUi()
         Size = UDim2.new(1, -20, 1, 0),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND | FULL SESSION RECORDER v1.1",
+        Text = "CULTIVATION UNBOUND | FULL SESSION RECORDER v1.2",
         TextColor3 = Color3.fromRGB(236, 241, 249),
         TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -1331,7 +1461,7 @@ local function checkpoint()
                 attributes = getAttributes(instance),
             })
         end
-        if index % 250 == 0 then
+        if index % 100 == 0 then
             task.wait()
         end
     end
@@ -1431,6 +1561,22 @@ end
 
 sharedEnv.__CURecorderStop = stopRecorder
 
+-- Emergency controls work even if the floating panel is hidden or hard to reach:
+-- RightCtrl+End stops and exports; RightCtrl+Home toggles the panel.
+addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
+    if processed then return end
+    local key = safeGet(inputObject, "KeyCode")
+    local rightCtrl = UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+    local leftCtrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+    if not (rightCtrl or leftCtrl) then return end
+
+    if key == Enum.KeyCode.End then
+        stopRecorder("emergency_hotkey")
+    elseif key == Enum.KeyCode.Home and gui then
+        gui.Enabled = not gui.Enabled
+    end
+end))
+
 -- Set up UI before scanning so the user can see that the recorder is active.
 local uiOk, uiError = pcall(createUi)
 if not uiOk then
@@ -1441,7 +1587,7 @@ initializeStorage()
 
 emit("session_start", {
     recorder = "Cultivation Unbound Full Session Recorder",
-    version = "1.1",
+    version = "1.2",
     place_id = game.PlaceId,
     game_id = game.GameId,
     job_id = game.JobId,
@@ -1483,7 +1629,7 @@ if scanOk and type(initialDescendants) == "table" then
     emit("initial_scan_started", { descendants = count })
     for index, instance in ipairs(initialDescendants) do
         recordInstance(instance, "initial")
-        if index % 200 == 0 then
+        if index % 50 == 0 then
             updateStatus("initial scan " .. index .. "/" .. count)
             task.wait()
         end
@@ -1517,4 +1663,5 @@ print("[CU Recorder] File: " .. tostring(filePath))
 print("[CU Recorder] Storage: " .. tostring(storageMode))
 print("[CU Recorder] Press EXPORT & STOP to finalize the complete JSONL file.")
 print("[CU Recorder] Find it in the executor workspace: " .. tostring(filePath))
-print("[CU Recorder] Read-only: it does not click, fire remotes, or modify gameplay.")
+print("[CU Recorder] SAFE MODE: no input hooks, no outbound remote hook, no per-frame world physics logging.")
+print("[CU Recorder] Only the visible buttons intercept clicks; panel background is click-through.")
