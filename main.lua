@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO BREAKTHROUGH
-    Version: 0.1
+    Version: 0.2
 
     Shared Qi + Body breakthrough automation.
 
@@ -181,7 +181,7 @@ end
 
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoBreakthrough_v01")
+    local old = parent:FindFirstChild("CUAutoBreakthrough_v02")
     if old then
         pcall(function()
             old:Destroy()
@@ -189,7 +189,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoBreakthrough_v01",
+        Name = "CUAutoBreakthrough_v02",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -214,7 +214,7 @@ local function createGui()
         Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CU AUTO BREAKTHROUGH  v0.1",
+        Text = "CU AUTO BREAKTHROUGH  v0.2",
         TextColor3 = COLORS.text,
         TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -366,72 +366,49 @@ local function getActiveMode()
 end
 
 local function getModeProgress(mode, frame)
+    -- The mastery label is the authoritative progress source. Do not divide
+    -- qi/maxQi here: that is the player's Qi pool, not layer mastery.
     local label
+    local realmLabel
+    local layerLabel
+    local block = frame:FindFirstChild("Block")
+    local bar
     local fill
-    local state
+    local percentLabel
 
     if mode == "Qi" then
         label = frame:FindFirstChild("ProgressLabel")
-        local block = frame:FindFirstChild("Block")
-        local bar = block and block:FindFirstChild("QiBarFrame")
+        realmLabel = frame:FindFirstChild("RealmLabel")
+        layerLabel = frame:FindFirstChild("LayerLabel")
+        bar = block and block:FindFirstChild("QiBarFrame")
         fill = bar and bar:FindFirstChild("QiBarFill")
-        state = qiState
     else
         label = frame:FindFirstChild("BodyProgressLabel")
-        local block = frame:FindFirstChild("Block")
-        local bar = block and block:FindFirstChild("BodyBarFrame")
+        realmLabel = frame:FindFirstChild("BodyRealmLabel")
+        layerLabel = frame:FindFirstChild("BodyLayerLabel")
+        bar = block and block:FindFirstChild("BodyBarFrame")
         fill = bar and bar:FindFirstChild("BodyBarFill")
-        state = bodyState
     end
 
-    -- Use the most conservative live reading if multiple sources exist.
-    -- This avoids a stale 100% label causing a second click after a reset.
-    local percent = nil
-    local function includePercent(value)
-        if type(value) == "number" then
-            value = math.clamp(value, 0, 100)
-            if percent == nil or value < percent then
-                percent = value
-            end
-        end
-    end
+    percentLabel = bar and bar:FindFirstChild("Percent")
 
-    if label then
-        includePercent(parsePercent(label.Text))
+    local percent = label and parsePercent(label.Text) or nil
+    if percent == nil and percentLabel then
+        percent = parsePercent(percentLabel.Text)
     end
-
-    if fill then
+    if percent == nil and fill then
         local ok, scale = pcall(function()
             return fill.Size.X.Scale
         end)
         if ok and type(scale) == "number" then
-            includePercent(scale * 100)
+            percent = math.clamp(scale * 100, 0, 100)
         end
     end
 
-    if state then
-        if mode == "Qi" then
-            includePercent(ratioPercent(state.qi, state.maxQi))
-        else
-            includePercent(ratioPercent(state.bodyExp, state.maxBodyExp))
-        end
-    end
-
-    local realmName
-    local layer
-    if mode == "Qi" then
-        realmName = state and (state.realmName or tostring(state.realm or "Qi")) or "Qi"
-        layer = state and state.layer or nil
-    else
-        realmName = state and (state.bodyRealmName or tostring(state.bodyRealm or "Body")) or "Body"
-        layer = state and state.bodyLayer or nil
-    end
-
-    if not layer then
-        local layerLabel = frame:FindFirstChild("LayerLabel") or frame:FindFirstChild("BodyLayerLabel")
-        if layerLabel and type(layerLabel.Text) == "string" then
-            layer = string.match(layerLabel.Text, "Layer%s+(%d+)")
-        end
+    local realmName = realmLabel and realmLabel.Text or mode
+    local layer = nil
+    if layerLabel and type(layerLabel.Text) == "string" then
+        layer = string.match(layerLabel.Text, "Layer%s+(%d+)")
     end
 
     local signature = mode .. ":" .. tostring(realmName) .. ":" .. tostring(layer or "?")
@@ -563,63 +540,95 @@ local function getLatestPrompt(trialGui)
     return nil, nil
 end
 
+local function isVisibleInTree(object)
+    local node = object
+    while node and node ~= PlayerGui do
+        if node:IsA("GuiObject") and not node.Visible then
+            return false
+        end
+        if node:IsA("ScreenGui") and not node.Enabled then
+            return false
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+local function hasEnabledConnections(signal)
+    if type(getconnections) ~= "function" then
+        return false
+    end
+    local ok, list = pcall(getconnections, signal)
+    if not ok or type(list) ~= "table" then
+        return false
+    end
+    for _, connection in ipairs(list) do
+        if connection.Enabled ~= false then
+            return true
+        end
+    end
+    return false
+end
+
 local function clickGuiButton(button)
     if not button or not button:IsA("GuiButton") then
         return false, "not a GuiButton"
     end
-    if not button.Visible or not button.Active then
-        return false, "button not visible/active"
+    if not button.Active or not isVisibleInTree(button) then
+        return false, "button or parent is not visible/active"
+    end
+    if not button:IsDescendantOf(PlayerGui) then
+        return false, "button is outside PlayerGui"
     end
 
-    local position = button.AbsolutePosition
-    local size = button.AbsoluteSize
-    local x = math.floor(position.X + size.X / 2 + 0.5)
-    local y = math.floor(position.Y + size.Y / 2 + 0.5)
-
-    -- Preferred: actual simulated left mouse click at the button center.
-    local okVim, vimError = pcall(function()
-        local virtualInput = game:GetService("VirtualInputManager")
-        virtualInput:SendMouseButtonEvent(x, y, 0, true, game, 0)
-        task.delay(0.025, function()
-            pcall(function()
-                virtualInput:SendMouseButtonEvent(x, y, 0, false, game, 0)
-            end)
-        end)
-    end)
-    if okVim then
-        return true, "VirtualInputManager"
+    -- Safety guard: never send a coordinate click that could land on a
+    -- RealmList entry or another overlay. Activate the exact instance.
+    if button.Name == "BreakthroughBanner" then
+        local parent = button.Parent
+        if not parent or parent.Name ~= "BreakthroughRow" or button.Text ~= "Breakthrough" then
+            return false, "BreakthroughBanner identity check failed"
+        end
     end
-
-    -- Executor mouse API fallback.
-    if type(mousemoveabs) == "function" and type(mouse1click) == "function" then
-        local okMouse = pcall(function()
-            mousemoveabs(x, y)
-            mouse1click()
-        end)
-        if okMouse then
-            return true, "executor mouse1click"
+    if button.Name == "Tap" then
+        local seal = button.Parent
+        local prompt = seal and seal.Parent
+        if not seal or seal.Name ~= "Seal" or not prompt or not string.match(prompt.Name, "^Prompt%d+$") then
+            return false, "Tribulation Tap identity check failed"
         end
     end
 
-    -- Roblox GuiButton activation fallback.
-    local okActivate = pcall(function()
+    -- If the executor exposes connection inspection, fire the exact event
+    -- the game wired. This avoids screen-coordinate clicks being intercepted
+    -- by an open Realm List window.
+    if type(firesignal) == "function" and type(getconnections) == "function" then
+        local mouseSignal = button.MouseButton1Click
+        if hasEnabledConnections(mouseSignal) then
+            local ok = pcall(firesignal, mouseSignal)
+            if ok then
+                return true, "direct MouseButton1Click signal"
+            end
+        end
+        local activatedSignal = button.Activated
+        if hasEnabledConnections(activatedSignal) then
+            local ok = pcall(firesignal, activatedSignal)
+            if ok then
+                return true, "direct Activated signal"
+            end
+        end
+    end
+
+    -- Standard Roblox GuiButton activation. This targets the instance itself,
+    -- not whatever happens to be visually on top of its screen coordinates.
+    local okActivate, activateError = pcall(function()
         button:Activate()
     end)
     if okActivate then
-        return true, "GuiButton:Activate"
+        return true, "GuiButton:Activate (direct)"
     end
 
-    -- Signal fallback for executors that expose firesignal.
-    if type(firesignal) == "function" then
-        local okSignal = pcall(function()
-            firesignal(button.Activated)
-        end)
-        if okSignal then
-            return true, "firesignal(Activated)"
-        end
-    end
-
-    return false, tostring(vimError or "no supported click backend")
+    -- No coordinate-based fallback: failing safely is better than selecting
+    -- a realm or another unrelated control by mistake.
+    return false, tostring(activateError or "direct GuiButton activation unavailable")
 end
 
 local function processTrial()
@@ -783,14 +792,17 @@ local function processBreakthrough()
         return
     end
 
+    -- The recorder confirmed this is the actual shared per-layer button
+    -- for both cultivation paths. Do not target RealmListGui realm entries
+    -- or the hidden MainFrame placeholder buttons.
     local row = statusPanel:FindFirstChild("BreakthroughRow")
     local button = row and row:FindFirstChild("BreakthroughBanner")
-    if not button or not button:IsA("GuiButton") then
-        setStatus("100% reached; Breakthrough button not found.", COLORS.warning)
+    if not button or not button:IsA("TextButton") or button.Text ~= "Breakthrough" then
+        setStatus("100% reached; exact BreakthroughBanner not found.", COLORS.warning)
         return
     end
-    if not row.Visible or not button.Visible or not button.Active then
-        setStatus("100% reached; waiting for Breakthrough button to activate.", COLORS.warning)
+    if not row.Visible or not isVisibleInTree(button) or not button.Active then
+        setStatus("100% reached; waiting for the actual Breakthrough button to activate.", COLORS.warning)
         return
     end
 
@@ -807,7 +819,7 @@ local function processBreakthrough()
         lastBreakthroughAt = now
         if sent then
             setStatus(
-                mode .. " at 100%; clicked Breakthrough (attempt " .. tostring(breakthroughAttempts) .. ").",
+                mode .. " layer at 100%; activated BreakthroughBanner (attempt " .. tostring(breakthroughAttempts) .. ").",
                 COLORS.success
             )
             print("[CU AutoBreakthrough] " .. mode .. " 100% -> Breakthrough click, " .. signature .. " via " .. backend)
