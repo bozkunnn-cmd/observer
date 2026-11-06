@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.0
+    Version: 1.0.1
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -26,7 +26,7 @@
         session deltas, and Destiny reroll probability/cost estimates.
       - Auto Silver: targets eligible non-boss cultivators in Workspace.CultivatorCamps
         using normal client-side weapon input; no fabricated reward remotes.
-      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics.
+      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics, Experiments.
       - Integrated bounded diagnostics for module actions, server confirmations, errors, and fast-progress rate sampling.
       - Manual Destiny reroll audit: records displayed odds, click category/batch, balances, and server result updates.
       - Optional Quick Interact probe for real herb/chest prompts; requires server/prompt-state confirmation and falls back to configured hold duration.
@@ -44,6 +44,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
@@ -96,7 +97,18 @@ local CHEST = {
     tierOrder = {Celestial = 4, Jade = 3, Bronze = 2, Wooden = 1},
 }
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0}
-local QUICK_INTERACT = {enabled = false, attempts = 0, successes = 0, fallbacks = 0}
+local QUICK_INTERACT = {enabled = false, chestEnabled = true, attempts = 0, successes = 0, fallbacks = 0}
+local EXPERIMENT = {
+    remoteAuditEnabled = false,
+    remoteAuditInstalled = false,
+    remoteAuditStatus = "Not installed",
+    remoteAuditCount = 0,
+    progressProbeEnabled = true,
+    rerollClickCount = 0,
+    rerollResultCount = 0,
+    chestManualHold = nil,
+    remoteAuditShared = nil,
+}
 
 -- Currency tracking is passive: values come from player attributes and the
 -- game's inbound UpdateMoney / UpdatePrimordialStones events.
@@ -126,6 +138,8 @@ local SILVER = {
     failed = 0,
     lastReward = 0,
     lastTargetAt = 0,
+    autoDrawEnabled = true,
+    jAttemptedCharacter = nil,
     blacklist = setmetatable({}, {__mode = "k"}),
 }
 -- Multiple pill recipes can be queued. Qi + Body are enabled by default.
@@ -410,6 +424,8 @@ end
 DIAG.log = function(level, moduleName, eventName, data)
     if not DIAG.enabled then return end
     DIAG.sequence = DIAG.sequence + 1
+    if moduleName == "RNG" and eventName == "manual_reroll_click" then EXPERIMENT.rerollClickCount = EXPERIMENT.rerollClickCount + 1 end
+    if moduleName == "RNG" and eventName == "server_reroll_result" then EXPERIMENT.rerollResultCount = EXPERIMENT.rerollResultCount + 1 end
     local row = {
         seq = DIAG.sequence,
         unix_ms = DateTime.now().UnixTimestampMillis,
@@ -447,10 +463,17 @@ DIAG.refreshUI = function(force)
     UI.diagEventLabel.Text = table.concat(lines, "\n")
     if UI.diagSummaryLabel then
         UI.diagSummaryLabel.Text = string.format(
-            "Observer ON | Events %d/%d | Warnings %d | Errors %d | Quick interact %s (%d/%d verified)",
+            "Observer ON | Events %d/%d | Warnings %d | Errors %d | Quick %s (%d/%d) | Remote audit %s",
             #DIAG.events, DIAG.maxEvents, DIAG.warningCount, DIAG.errorCount,
-            QUICK_INTERACT.enabled and "ON" or "OFF", QUICK_INTERACT.successes, QUICK_INTERACT.attempts
+            (QUICK_INTERACT.enabled or QUICK_INTERACT.chestEnabled) and "ON" or "OFF", QUICK_INTERACT.successes, QUICK_INTERACT.attempts,
+            EXPERIMENT.remoteAuditEnabled and "ON" or "OFF"
         )
+    end
+    if UI.remoteAuditStatusLabel then
+        UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount)
+    end
+    if UI.rngSampleLabel then
+        UI.rngSampleLabel.Text = "Manual reroll clicks: " .. tostring(EXPERIMENT.rerollClickCount) .. "\nServer results: " .. tostring(EXPERIMENT.rerollResultCount)
     end
     if UI.diagProgressLabel then
         local q = DIAG.progressRates.Qi
@@ -501,6 +524,82 @@ DIAG.flush = function()
     end
     return pcall(writefile, DIAG.fileName, table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
 end
+
+-- Optional passive outbound request audit. It observes normal game-originated
+-- FireServer/InvokeServer calls and passes them through unchanged. It never
+-- replays, edits, blocks, or fabricates a request. Enable only during a test.
+EXPERIMENT.installRemoteAudit = function()
+    local shared = Env.__CUOutboundRemoteAudit
+    if type(shared) == "table" and shared.installed == true then
+        shared.callback = function(method, remote, packed)
+            local args = {}
+            for i = 1, math.min(packed.n, 8) do args[i] = diagClean(packed[i], 0, {}) end
+            EXPERIMENT.remoteAuditCount = EXPERIMENT.remoteAuditCount + 1
+            DIAG.log("INFO", "EXPERIMENT", "outbound_remote_observed", {method = method, remote = remote.Name, path = remote:GetFullName(), args = args, argCount = packed.n})
+        end
+        EXPERIMENT.remoteAuditShared = shared
+        EXPERIMENT.remoteAuditInstalled = true
+        EXPERIMENT.remoteAuditStatus = "Existing passive hook reused"
+        return true, EXPERIMENT.remoteAuditStatus
+    end
+    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" or type(newcclosure) ~= "function" then
+        EXPERIMENT.remoteAuditStatus = "Unsupported: executor hook APIs unavailable"
+        return false, EXPERIMENT.remoteAuditStatus
+    end
+    shared = {installed = false, enabled = false, callback = nil}
+    local function relevant(remote)
+        local name = string.lower(tostring(remote.Name or ""))
+        local full = ""
+        pcall(function() full = string.lower(remote:GetFullName()) end)
+        local hay = name .. " " .. full
+        if string.find(full, "cultivationevents", 1, true) then return true end
+        for _, word in ipairs({"herb", "chest", "reroll", "roll", "cultivation", "breakthrough", "meditate", "pushup", "silver", "primordial", "cauldron", "stoke", "claim", "weapon", "attack", "coin", "reward"}) do
+            if string.find(hay, word, 1, true) then return true end
+        end
+        return false
+    end
+    local oldNamecall
+    local wrapper = newcclosure(function(self, ...)
+        local method = ""
+        pcall(function() method = getnamecallmethod() end)
+        if shared.enabled and type(shared.callback) == "function"
+            and (method == "FireServer" or method == "InvokeServer")
+            and typeof(self) == "Instance"
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+            and relevant(self) then
+            local executorCaller = false
+            if type(checkcaller) == "function" then
+                local okCaller, value = pcall(checkcaller)
+                executorCaller = okCaller and value == true
+            end
+            if not executorCaller then
+                local packed = table.pack(...)
+                pcall(shared.callback, method, self, packed)
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    local ok, previous = pcall(hookmetamethod, game, "__namecall", wrapper)
+    if not ok or type(previous) ~= "function" then
+        EXPERIMENT.remoteAuditStatus = "Install failed: " .. tostring(previous)
+        return false, EXPERIMENT.remoteAuditStatus
+    end
+    oldNamecall = previous
+    shared.installed = true
+    shared.callback = function(method, remote, packed)
+        local args = {}
+        for i = 1, math.min(packed.n, 8) do args[i] = diagClean(packed[i], 0, {}) end
+        EXPERIMENT.remoteAuditCount = EXPERIMENT.remoteAuditCount + 1
+        DIAG.log("INFO", "EXPERIMENT", "outbound_remote_observed", {method = method, remote = remote.Name, path = remote:GetFullName(), args = args, argCount = packed.n})
+    end
+    Env.__CUOutboundRemoteAudit = shared
+    EXPERIMENT.remoteAuditShared = shared
+    EXPERIMENT.remoteAuditInstalled = true
+    EXPERIMENT.remoteAuditStatus = "Installed; passive logging only"
+    DIAG.log("INFO", "EXPERIMENT", "remote_audit_installed", {note = "Calls are passed through unchanged; no requests are forged."})
+    return true, EXPERIMENT.remoteAuditStatus
+end
+
 
 ECONOMY.formatNumber = function(value)
     value = tonumber(value)
@@ -583,6 +682,11 @@ local function stop(reason)
     CHEST.autoEnabled = false
     SILVER.autoEnabled = false
     SILVER.busy = false
+    EXPERIMENT.remoteAuditEnabled = false
+    if EXPERIMENT.remoteAuditShared then
+        EXPERIMENT.remoteAuditShared.enabled = false
+        EXPERIMENT.remoteAuditShared.callback = nil
+    end
     disconnectAll()
     if gui then
         pcall(function()
@@ -608,6 +712,10 @@ Env.__CUAutoCultivationState = {
             breakthroughEnabled = breakthroughEnabled,
             antiAfkEnabled = antiAfkEnabled,
             quickInteractEnabled = QUICK_INTERACT.enabled,
+            quickChestProbeEnabled = QUICK_INTERACT.chestEnabled,
+            remoteAuditEnabled = EXPERIMENT.remoteAuditEnabled,
+            remoteAuditStatus = EXPERIMENT.remoteAuditStatus,
+            remoteAuditCount = EXPERIMENT.remoteAuditCount,
             diagnosticsEnabled = DIAG.enabled,
             diagnosticEvents = #DIAG.events,
             diagnosticErrors = DIAG.errorCount,
@@ -617,6 +725,7 @@ Env.__CUAutoCultivationState = {
             autoBrewBusy = autoBrewBusy,
             autoChestEnabled = CHEST.autoEnabled,
             autoSilverEnabled = SILVER.autoEnabled,
+            autoDrawSwordEnabled = SILVER.autoDrawEnabled,
             silverBusy = SILVER.busy,
             silverKills = SILVER.kills,
             silverEarned = SILVER.earned,
@@ -984,16 +1093,18 @@ DIAG.sampleProgress = function()
         rawPerSecond = rawRate,
         zoneMultiplier = zoneMultiplier,
     }
-    DIAG.log("INFO", "PROGRESS", "rate_sample", {
-        mode = mode, signature = signature, uiPercent = percent,
-        uiPercentPerSecond = uiRate, rawValue = rawValue, rawMax = rawMax,
-        rawPerSecond = rawRate, active = active,
-        isMeditating = state.isMeditating, isPushingUp = state.isPushingUp,
-        zone = state.currentZone or state.bodyCurrentZone, zoneMultiplier = zoneMultiplier,
-        speedText = speedText, serverSpeedMultiplier = state.speedMultiplier or state.qiSpeedMultiplier or state.bodySpeedMultiplier,
-        stoneMultiplier = state.stoneMultiplier, groupBonus = state.groupBonus,
-        premiumBonus = state.premiumBonus, weightMultiplier = state.weightMultiplier,
-    })
+    if EXPERIMENT.progressProbeEnabled then
+        DIAG.log("INFO", "PROGRESS", "rate_sample", {
+            mode = mode, signature = signature, uiPercent = percent,
+            uiPercentPerSecond = uiRate, rawValue = rawValue, rawMax = rawMax,
+            rawPerSecond = rawRate, active = active,
+            isMeditating = state.isMeditating, isPushingUp = state.isPushingUp,
+            zone = state.currentZone or state.bodyCurrentZone, zoneMultiplier = zoneMultiplier,
+            speedText = speedText, serverSpeedMultiplier = state.speedMultiplier or state.qiSpeedMultiplier or state.bodySpeedMultiplier,
+            stoneMultiplier = state.stoneMultiplier, groupBonus = state.groupBonus,
+            premiumBonus = state.premiumBonus, weightMultiplier = state.weightMultiplier,
+        })
+    end
     -- Flag only unusually large observed jumps for later review. This is a
     -- diagnostic hint, not proof of an exploit or a server validation flaw.
     if previous and previous.signature == signature and uiRate > 15 then
@@ -2132,15 +2243,66 @@ SILVER.wait = function(seconds)
     return true
 end
 
+SILVER.detectWeaponState = function()
+    local character = LocalPlayer.Character
+    if not character then return false, "no character", nil end
+    local tool = character:FindFirstChildOfClass("Tool")
+    if tool then return true, "equipped Tool", tool.Name end
+    local drawn = character:FindFirstChild("DrawnSword", true)
+    if drawn then return true, "DrawnSword instance", drawn.Name end
+    local weaponValue = character:FindFirstChild("EquippedWeapon", true)
+    if weaponValue then
+        local value = nil
+        pcall(function() value = weaponValue.Value end)
+        if value ~= nil and tostring(value) ~= "" and tostring(value) ~= "false" then
+            return true, "EquippedWeapon value", tostring(value)
+        end
+    end
+    for _, node in ipairs(character:GetDescendants()) do
+        local lower = string.lower(node.Name)
+        if (node:IsA("Model") or node:IsA("BasePart"))
+            and (string.find(lower, "sword", 1, true) or string.find(lower, "blade", 1, true))
+            and not string.find(lower, "sheathe", 1, true) then
+            return true, "named weapon descendant", node.Name
+        end
+    end
+    return false, "weapon state not exposed", nil
+end
+
+SILVER.ensureWeaponDrawn = function()
+    local character = LocalPlayer.Character
+    if not character then return false, "character unavailable" end
+    local isDrawn, source, name = SILVER.detectWeaponState()
+    if isDrawn then
+        DIAG.log("INFO", "SILVER", "weapon_already_drawn", {source = source, weapon = name})
+        return true, "weapon already drawn"
+    end
+    if not SILVER.autoDrawEnabled then
+        DIAG.log("WARN", "SILVER", "weapon_state_unknown", {autoDraw = false, source = source})
+        return true, "weapon state unknown; attempting normal M1 without J toggle"
+    end
+    if SILVER.jAttemptedCharacter == character then
+        return true, "J was already attempted for this character; no repeated toggle"
+    end
+    SILVER.jAttemptedCharacter = character
+    DIAG.log("INFO", "SILVER", "sword_draw_key_attempt", {key = "J", priorState = source})
+    local sent, backend = sendKey(Enum.KeyCode.J)
+    if not sent then
+        DIAG.log("ERROR", "SILVER", "sword_draw_key_failed", {backend = backend})
+        return false, "could not send J to draw sword: " .. tostring(backend)
+    end
+    task.wait(0.35)
+    local after, afterSource, afterName = SILVER.detectWeaponState()
+    DIAG.log(after and "INFO" or "WARN", "SILVER", "sword_draw_state_after_j", {detected = after, source = afterSource, weapon = afterName, backend = backend})
+    if after then return true, "sword drawn with J" end
+    -- Some games render the sword locally without exposing a Tool/Value. Do not
+    -- press J again (it would sheath it); allow one normal M1 damage probe.
+    return true, "J sent once; weapon state hidden, testing M1"
+end
+
 SILVER.basicAttack = function(targetRoot)
     local character = LocalPlayer.Character
     if not character or not targetRoot then return false, "character or target unavailable" end
-    local drawnSword = character:FindFirstChild("DrawnSword")
-    local weaponValue = character:FindFirstChild("EquippedWeapon")
-    if not drawnSword and not (weaponValue and tostring(weaponValue.Value or "") ~= "") then
-        DIAG.log("WARN", "SILVER", "attack_preflight_failed", {reason = "weapon_not_drawn", equippedWeapon = weaponValue and tostring(weaponValue.Value) or nil})
-        return false, "draw your weapon before enabling Auto Silver"
-    end
 
     local camera = Workspace.CurrentCamera
     local vinput = nil
@@ -2259,6 +2421,15 @@ SILVER.run = function()
                                 SILVER.setStatus("could not reach " .. target.Name .. "; skipping for 12s")
                                 SILVER.busy = false
                                 task.wait(0.25)
+                            end
+                        end
+
+                        if SILVER.busy and running and SILVER.autoEnabled and target.Parent and targetHumanoid.Health > 0 then
+                            local weaponReady, weaponMessage = SILVER.ensureWeaponDrawn()
+                            DIAG.log(weaponReady and "INFO" or "WARN", "SILVER", "weapon_preparation", {result = weaponReady, detail = weaponMessage, autoDraw = SILVER.autoDrawEnabled})
+                            if not weaponReady then
+                                SILVER.setStatus("weapon preparation failed: " .. tostring(weaponMessage))
+                                SILVER.busy = false
                             end
                         end
 
@@ -2547,6 +2718,30 @@ CHEST.getPosition = function(spot, prompt)
     return nil
 end
 
+CHEST.getPromptWorldPosition = function(prompt, fallback)
+    local parent = prompt and prompt.Parent
+    if parent and parent:IsA("Attachment") then
+        return parent.WorldPosition
+    end
+    if parent and parent:IsA("BasePart") then
+        return parent.Position
+    end
+    return fallback
+end
+
+CHEST.getPromptApproach = function(prompt, fallbackPosition)
+    local parent = prompt and prompt.Parent
+    if parent and parent:IsA("Attachment") then
+        local cf = parent.WorldCFrame
+        return cf.Position + cf.LookVector * 3.5 + Vector3.new(0, 1.0, 0), cf.Position
+    end
+    if parent and parent:IsA("BasePart") then
+        local cf = parent.CFrame
+        return cf.Position + cf.LookVector * 3.5 + Vector3.new(0, 1.0, 0), cf.Position
+    end
+    return fallbackPosition + Vector3.new(0, 3.0, 0), fallbackPosition
+end
+
 CHEST.getPromptEntries = function()
     local entries = {}
     local folder = Workspace:FindFirstChild("ChestSpots")
@@ -2654,6 +2849,8 @@ end
 
 CHEST.holdPrompt = function(prompt, spot, tier, revisionBefore)
     local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 1.0, 0.1, 8)
+    local promptKey = prompt.KeyboardKeyCode
+    if promptKey == Enum.KeyCode.Unknown then promptKey = Enum.KeyCode.E end
 
     local function stateChanged()
         if not prompt or not prompt.Parent then return true end
@@ -2672,18 +2869,18 @@ CHEST.holdPrompt = function(prompt, spot, tier, revisionBefore)
             if not CHEST.wait(0.05) then return false, "cancelled" end
             if stateChanged() then return true, "prompt state changed" end
         end
-        return stateChanged(), stateChanged() and "prompt state changed" or "no trigger/state change"
+        local changed = stateChanged()
+        return changed, changed and "prompt state changed" or "no trigger/state change"
     end
 
-    -- Optional instant/quick interaction probe. It targets the real prompt and
-    -- is accepted only if the opened state or server ChestWorldOpened event changes.
-    -- If the server enforces its hold duration, normal prompt methods are tried next.
-    if QUICK_INTERACT.enabled and type(fireproximityprompt) == "function" then
+    -- Optional instant probe. A successful API call is not considered success
+    -- unless the server's opened event or the actual prompt state changes.
+    if (QUICK_INTERACT.enabled or QUICK_INTERACT.chestEnabled) and type(fireproximityprompt) == "function" then
         QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
-        DIAG.log("INFO", "CHEST", "quick_interact_attempt", {chest = spot and spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance})
+        DIAG.log("INFO", "CHEST", "quick_interact_attempt", {chest = spot and spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance, key = tostring(promptKey)})
         local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
         if quickOk then
-            local confirmed, reason = waitForState(0.75)
+            local confirmed, reason = waitForState(0.65)
             if confirmed then
                 QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
                 DIAG.log("INFO", "CHEST", "quick_interact_verified", {chest = spot and spot.Name, tier = tier, reason = reason})
@@ -2694,61 +2891,115 @@ CHEST.holdPrompt = function(prompt, spot, tier, revisionBefore)
         end
         QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
         DIAG.log("WARN", "CHEST", "quick_interact_not_confirmed_fallback", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration})
-    elseif QUICK_INTERACT.enabled then
-        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
-        DIAG.log("WARN", "CHEST", "quick_interact_api_unavailable", {chest = spot and spot.Name, tier = tier, fallback = "normal hold"})
     end
 
-    -- First try Roblox's real prompt hold lifecycle. A successful pcall only
-    -- means the method did not throw; it is NOT treated as proof of opening.
-    local began = pcall(function()
-        prompt:InputHoldBegin()
-    end)
-    if began then
-        local completed = CHEST.wait(holdDuration + 0.15)
-        pcall(function() prompt:InputHoldEnd() end)
-        if not completed then return false, "cancelled during ProximityPrompt hold" end
-        local confirmed, reason = waitForState(0.35)
-        if confirmed then return true, "ProximityPrompt hold" end
-    end
-
-    -- Executor prompt helper fallback. Wait for an actual chest/prompt state
-    -- change before considering this attempt successful.
-    if type(fireproximityprompt) == "function" then
-        local ok, err = pcall(fireproximityprompt, prompt, holdDuration)
-        if ok then
-            local confirmed = waitForState(0.65)
-            if confirmed then return true, "fireproximityprompt (verified)" end
+    -- Primary fallback mirrors the confirmed manual method: hold the prompt's
+    -- keyboard key (E in the user's manual test) for its live HoldDuration.
+    local virtualInput
+    local okService, service = pcall(function() return game:GetService("VirtualInputManager") end)
+    if okService then virtualInput = service end
+    if virtualInput then
+        local keyDown = pcall(function() virtualInput:SendKeyEvent(true, promptKey, false, game) end)
+        if keyDown then
+            local startedAt = os.clock()
+            DIAG.log("INFO", "CHEST", "automated_key_hold_begin", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance, requiresLineOfSight = prompt.RequiresLineOfSight})
+            local completed = CHEST.wait(holdDuration + 0.12)
+            pcall(function() virtualInput:SendKeyEvent(false, promptKey, false, game) end)
+            DIAG.log(completed and "INFO" or "WARN", "CHEST", "automated_key_hold_end", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey), elapsed = os.clock() - startedAt, completed = completed})
+            if not completed then return false, "cancelled during keyboard hold" end
+            local confirmed, reason = waitForState(1.0)
+            if confirmed then return true, "VirtualInputManager keyboard hold (verified)" end
         else
-            lastError = tostring(err)
+            DIAG.log("WARN", "CHEST", "automated_key_hold_failed", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey)})
         end
     end
 
-    -- Final fallback: simulate the prompt's configured keyboard key for its
-    -- configured hold duration, then verify the prompt actually changed.
-    local virtualInput
-    local okService, service = pcall(function()
-        return game:GetService("VirtualInputManager")
-    end)
-    if okService then virtualInput = service end
-    if not virtualInput then
-        return false, "no supported chest prompt input method"
+    -- Roblox ProximityPrompt lifecycle fallback. A non-throwing call is not
+    -- treated as an opened chest; wait for server/prompt confirmation.
+    local began = pcall(function() prompt:InputHoldBegin() end)
+    if began then
+        DIAG.log("INFO", "CHEST", "input_hold_begin_backend", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration})
+        local completed = CHEST.wait(holdDuration + 0.15)
+        pcall(function() prompt:InputHoldEnd() end)
+        if not completed then return false, "cancelled during ProximityPrompt hold" end
+        local confirmed, reason = waitForState(0.8)
+        if confirmed then return true, "ProximityPrompt hold (verified)" end
     end
 
-    local key = prompt.KeyboardKeyCode
-    local keyDown = pcall(function()
-        virtualInput:SendKeyEvent(true, key, false, game)
-    end)
-    if not keyDown then return false, "could not press chest prompt key" end
-
-    local completed = CHEST.wait(holdDuration + 0.15)
-    pcall(function() virtualInput:SendKeyEvent(false, key, false, game) end)
-    if not completed then return false, "cancelled during VirtualInputManager hold" end
-
-    local confirmed = waitForState(0.65)
-    if confirmed then return true, "VirtualInputManager hold (verified)" end
-    return false, "input methods ran but chest prompt never triggered; check prompt range/ownership"
+    -- Last executor helper fallback uses the real configured duration.
+    if type(fireproximityprompt) == "function" then
+        local ok, err = pcall(fireproximityprompt, prompt, holdDuration)
+        DIAG.log(ok and "INFO" or "WARN", "CHEST", "duration_prompt_helper_attempt", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration, result = ok, error = ok and nil or tostring(err)})
+        if ok then
+            local confirmed, reason = waitForState(1.0)
+            if confirmed then return true, "fireproximityprompt with configured duration (verified)" end
+        end
+    end
+    return false, "E hold and prompt fallbacks ran but no ChestWorldOpened/prompt-state confirmation"
 end
+
+
+-- Manual chest interaction trace. This records the player's real E key-down/up
+-- and Roblox prompt lifecycle so future automation can mirror the successful hold.
+local function findNearbyChestPromptForTrace()
+    local root = getCharacterParts()
+    if not root then return nil end
+    local best, bestDistance = nil, math.huge
+    for _, entry in ipairs(CHEST.getPromptEntries()) do
+        local prompt = entry.prompt
+        if prompt and prompt.Parent and prompt.Enabled then
+            local distance = (root.Position - entry.position).Magnitude
+            local range = tonumber(prompt.MaxActivationDistance) or 12
+            if distance <= range + 1.5 and distance < bestDistance then
+                best = {spot = entry.spot, prompt = prompt, tier = entry.tier, distance = distance}
+                bestDistance = distance
+            end
+        end
+    end
+    return best
+end
+
+addConnection(UserInputService.InputBegan, function(input, gameProcessed)
+    if input.KeyCode ~= Enum.KeyCode.E or EXPERIMENT.chestManualHold then return end
+    local entry = findNearbyChestPromptForTrace()
+    if not entry then return end
+    EXPERIMENT.chestManualHold = {entry = entry, startedAt = os.clock()}
+    DIAG.log("INFO", "CHEST", "manual_e_hold_begin", {
+        chest = entry.spot and entry.spot.Name, tier = entry.tier, prompt = entry.prompt:GetFullName(),
+        key = "E", holdDurationRequired = entry.prompt.HoldDuration, maxDistance = entry.prompt.MaxActivationDistance,
+        distance = entry.distance, gameProcessed = gameProcessed, requiresLineOfSight = entry.prompt.RequiresLineOfSight,
+    })
+end)
+
+addConnection(UserInputService.InputEnded, function(input, gameProcessed)
+    if input.KeyCode ~= Enum.KeyCode.E or not EXPERIMENT.chestManualHold then return end
+    local hold = EXPERIMENT.chestManualHold
+    EXPERIMENT.chestManualHold = nil
+    local entry = hold.entry
+    DIAG.log("INFO", "CHEST", "manual_e_hold_end", {
+        chest = entry and entry.spot and entry.spot.Name, tier = entry and entry.tier,
+        prompt = entry and entry.prompt and entry.prompt.Parent and entry.prompt:GetFullName() or nil,
+        key = "E", heldSeconds = os.clock() - hold.startedAt, gameProcessed = gameProcessed,
+        opened = entry and entry.spot and CHEST.isOpened(entry.spot) or false,
+        promptEnabled = entry and entry.prompt and entry.prompt.Parent and entry.prompt.Enabled or false,
+    })
+end)
+
+addConnection(ProximityPromptService.PromptButtonHoldBegan, function(prompt, inputType)
+    if prompt and prompt.Name == "OpenChestPrompt" then
+        DIAG.log("INFO", "CHEST", "prompt_hold_began", {prompt = prompt:GetFullName(), inputType = tostring(inputType), key = tostring(prompt.KeyboardKeyCode), holdDuration = prompt.HoldDuration, maxDistance = prompt.MaxActivationDistance})
+    end
+end)
+addConnection(ProximityPromptService.PromptButtonHoldEnded, function(prompt)
+    if prompt and prompt.Name == "OpenChestPrompt" then
+        DIAG.log("INFO", "CHEST", "prompt_hold_ended", {prompt = prompt:GetFullName(), enabled = prompt.Enabled})
+    end
+end)
+addConnection(ProximityPromptService.PromptTriggered, function(prompt, playerWhoTriggered)
+    if prompt and prompt.Name == "OpenChestPrompt" then
+        DIAG.log(playerWhoTriggered == LocalPlayer and "INFO" or "DEBUG", "CHEST", "prompt_triggered", {prompt = prompt:GetFullName(), player = playerWhoTriggered and playerWhoTriggered.Name, localPlayer = playerWhoTriggered == LocalPlayer})
+    end
+end)
 
 CHEST.getLocalOpenEvent = function(spot, tier, revisionBefore)
     if CHEST.worldOpenedRevision <= revisionBefore or type(CHEST.lastWorldOpened) ~= "table" then
@@ -2853,14 +3104,16 @@ CHEST.collect = function(spot, prompt, position, tier)
         return false, "waiting for character"
     end
     local maxDistance = tonumber(prompt.MaxActivationDistance) or 12
-    local distance = (root.Position - position).Magnitude
-    if distance > math.max(2, maxDistance - 1.0) then
-        local destination = position + Vector3.new(0, 3.0, 0)
-        local look = root.CFrame.LookVector
+    local promptPosition = CHEST.getPromptWorldPosition(prompt, position)
+    local distance = (root.Position - promptPosition).Magnitude
+    -- If the prompt requires line-of-sight, approach the prompt's actual parent
+    -- from its front instead of teleporting to the center/roof of the chest.
+    if distance > math.max(2, maxDistance - 1.0) or prompt.RequiresLineOfSight then
+        local destination, lookAt = CHEST.getPromptApproach(prompt, position)
         local moved, moveError = pcall(function()
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = CFrame.new(destination, destination + look)
+            root.CFrame = CFrame.lookAt(destination, lookAt)
         end)
         if not moved then
             return false, "teleport failed: " .. tostring(moveError)
@@ -2872,7 +3125,8 @@ CHEST.collect = function(spot, prompt, position, tier)
         if not root then
             return false, "character unavailable after travel"
         end
-        distance = (root.Position - (CHEST.getPosition(spot, prompt) or position)).Magnitude
+        promptPosition = CHEST.getPromptWorldPosition(prompt, CHEST.getPosition(spot, prompt) or position)
+        distance = (root.Position - promptPosition).Magnitude
     end
     if not prompt.Parent or not prompt.Enabled or CHEST.isOpened(spot) then
         return false, "chest became unavailable before opening"
@@ -2882,7 +3136,7 @@ CHEST.collect = function(spot, prompt, position, tier)
     end
 
     local revisionBefore = CHEST.worldOpenedRevision
-    DIAG.log("INFO", "CHEST", "open_attempt", {chest = spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, maxDistance = maxDistance, distance = distance, quickInteract = QUICK_INTERACT.enabled})
+    DIAG.log("INFO", "CHEST", "open_attempt", {chest = spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, maxDistance = maxDistance, distance = distance, quickInteract = QUICK_INTERACT.enabled or QUICK_INTERACT.chestEnabled, key = tostring(prompt.KeyboardKeyCode), requiresLineOfSight = prompt.RequiresLineOfSight, style = tostring(prompt.Style)})
     local sent, backend = CHEST.holdPrompt(prompt, spot, tier, revisionBefore)
     DIAG.log(sent and "INFO" or "WARN", "CHEST", "prompt_input_result", {chest = spot.Name, tier = tier, sent = sent, backend = backend})
     if not sent then
@@ -3662,8 +3916,30 @@ updateModeButtons = function()
         UI.silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
     end
     if UI.quickInteractButton then
-        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "QUICK INTERACT: ON (VERIFY + FALLBACK)" or "QUICK INTERACT: OFF (HERBS + CHESTS)"
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
+    end
+    if UI.silverDrawButton then
+        UI.silverDrawButton.Text = SILVER.autoDrawEnabled and "AUTO DRAW (J): ON" or "AUTO DRAW (J): OFF"
+        UI.silverDrawButton.BackgroundColor3 = SILVER.autoDrawEnabled and COLORS.success or COLORS.panel2
+    end
+    if UI.remoteAuditButton then
+        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REMOTE AUDIT: ON" or "REMOTE AUDIT: OFF"
+        UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
+    end
+    if UI.remoteAuditStatusLabel then
+        UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount)
+    end
+    if UI.progressProbeButton then
+        UI.progressProbeButton.Text = EXPERIMENT.progressProbeEnabled and "PROGRESS PROBE: ON" or "PROGRESS PROBE: OFF"
+        UI.progressProbeButton.BackgroundColor3 = EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.panel2
+    end
+    if UI.chestProbeButton then
+        UI.chestProbeButton.Text = QUICK_INTERACT.chestEnabled and "INSTANT CHEST PROBE: ON" or "INSTANT CHEST PROBE: OFF"
+        UI.chestProbeButton.BackgroundColor3 = QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.panel2
+    end
+    if UI.rngSampleLabel then
+        UI.rngSampleLabel.Text = "Manual reroll clicks: " .. tostring(EXPERIMENT.rerollClickCount) .. "\nServer results: " .. tostring(EXPERIMENT.rerollResultCount)
     end
     if brewRecipeButton then
         local selectedCount = 0
@@ -3695,10 +3971,11 @@ local function createGui()
         or parent:FindFirstChild("CUAutoCultivation_v09")
         or parent:FindFirstChild("CUAutoCultivation_v091")
         or parent:FindFirstChild("CUAutoCultivation_v10")
+        or parent:FindFirstChild("CUAutoCultivation_v101")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v10",
+        Name = "CUAutoCultivation_v101",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -3758,7 +4035,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.0",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.1",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -3793,7 +4070,7 @@ local function createGui()
         UI.setPanelVisible(false)
     end)
 
-    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings", "Diagnostics"}
+    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings", "Diagnostics", "Experiments"}
     local pageFrames = {}
     for _, name in ipairs(pageNames) do
         local page = make("Frame", {
@@ -3812,11 +4089,11 @@ local function createGui()
         UI.pages[name] = page
     end
 
-    local tabWidth = 86
+    local tabWidth = 76
     for index, name in ipairs(pageNames) do
         local tab = make("TextButton", {
             Name = name .. "Tab",
-            Position = UDim2.fromOffset(12 + (index - 1) * 90, 46),
+            Position = UDim2.fromOffset(12 + (index - 1) * 78, 46),
             Size = UDim2.fromOffset(tabWidth, 28),
             BackgroundColor3 = name == "Overview" and COLORS.accent or COLORS.panel2,
             BorderSizePixel = 0,
@@ -3944,15 +4221,16 @@ local function createGui()
     local silverCardFarm = makeCard(farmingPage, 16, 204, 598, 160, "AUTO SILVER - CULTIVATOR CAMPS", COLORS.warning)
     UI.silverButton = makeButton(silverCardFarm, "AUTO SILVER: OFF", 12, 29, 180, COLORS.panel2, 30)
     UI.silverInfoLabel = makeLabel(silverCardFarm, "Auto Silver: idle", 204, 29, 370, 28, 10, COLORS.muted)
-    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 12, 70, 570, 20, 10, COLORS.text)
-    makeLabel(silverCardFarm, "Targets non-boss CultivatorCamps NPCs at or below your Qi realm. Requires your sword drawn; uses normal M1 input.", 12, 99, 570, 44, 9, COLORS.muted)
-    UI.quickInteractButton = makeButton(farmingPage, "QUICK INTERACT: OFF (HERBS + CHESTS)", 16, 374, 598, COLORS.panel2, 27)
+    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO DRAW (J): ON", 12, 65, 180, COLORS.success, 25)
+    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 204, 65, 370, 25, 10, COLORS.text)
+    makeLabel(silverCardFarm, "Auto-taps J once if no equipped weapon is detectable, then uses normal M1. It never repeatedly toggles J; damage confirms whether the sword is actually drawn.", 12, 99, 570, 44, 9, COLORS.muted)
+    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 374, 598, COLORS.panel2, 27)
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
-        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "QUICK INTERACT: ON (VERIFY + FALLBACK)" or "QUICK INTERACT: OFF (HERBS + CHESTS)"
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
         DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
-        setStatus(QUICK_INTERACT.enabled and "Quick interaction enabled: prompt bypass is attempted, then server confirmation is required; normal hold is fallback." or "Quick interaction disabled; configured prompt hold durations will be used.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
+        setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use configured hold duration. Chest probe has its own toggle.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
     end)
 
     -- ALCHEMY PAGE
@@ -4025,6 +4303,65 @@ local function createGui()
         DIAG.sequence = 0
         DIAG.log("INFO", "DIAGNOSTICS", "buffer_cleared", {})
         DIAG.refreshUI(true)
+    end)
+
+    -- EXPERIMENTS PAGE: controlled, evidence-first probes. No forged reward calls.
+    local experimentsPage = pageFrames.Experiments
+    makeLabel(experimentsPage, "EXPERIMENTAL LAB | HYPOTHESIS TESTS, NOT FAKE REWARD REQUESTS", 16, 10, 600, 20, 10, COLORS.warning, Enum.Font.GothamBold)
+    local remoteCard = makeCard(experimentsPage, 16, 38, 598, 104, "PASSIVE OUTBOUND REMOTE AUDIT", COLORS.accent)
+    UI.remoteAuditButton = makeButton(remoteCard, "REMOTE AUDIT: OFF", 12, 29, 190, COLORS.panel2, 28)
+    UI.remoteAuditStatusLabel = makeLabel(remoteCard, "Not installed. Enable only while testing rerolls, chests, herbs, combat or cultivation.", 214, 28, 360, 38, 9, COLORS.muted)
+    makeLabel(remoteCard, "Logs normal game-originated FireServer/InvokeServer names and arguments, then passes each call through unchanged.", 12, 67, 570, 25, 9, COLORS.text)
+
+    local progressCard = makeCard(experimentsPage, 16, 152, 292, 104, "FAST PROGRESS EXPERIMENT", COLORS.qi)
+    UI.progressProbeButton = makeButton(progressCard, "PROGRESS PROBE: ON", 12, 29, 268, COLORS.success, 27)
+    UI.progressProbeStatusLabel = makeLabel(progressCard, "Compares UI progress with replicated Qi/Body values and multiplier changes.", 12, 62, 268, 30, 9, COLORS.muted)
+
+    local rngCard = makeCard(experimentsPage, 322, 152, 292, 104, "DESTINY RNG SAMPLE AUDIT", COLORS.body)
+    UI.rngSampleLabel = makeLabel(rngCard, "Manual reroll clicks: 0\nServer results: 0", 12, 29, 268, 42, 11, COLORS.text, Enum.Font.Code)
+    makeLabel(rngCard, "Records category, x1/x10/x100 selection, displayed odds, currency changes and server result. No forced rolls.", 12, 70, 268, 25, 8, COLORS.muted)
+
+    local interactionCard = makeCard(experimentsPage, 16, 266, 598, 94, "INTERACTION EXPERIMENTS", COLORS.success)
+    UI.chestProbeButton = makeButton(interactionCard, "INSTANT CHEST PROBE: ON", 12, 29, 190, COLORS.success, 27)
+    makeLabel(interactionCard, "Tries the quick prompt once, then mirrors the confirmed manual E hold for the live duration. Every attempt requires a real opened-state/reward confirmation.", 214, 27, 360, 48, 9, COLORS.text)
+
+    addConnection(UI.remoteAuditButton.MouseButton1Click, function()
+        if not EXPERIMENT.remoteAuditEnabled then
+            local ok, message = EXPERIMENT.installRemoteAudit()
+            if not ok then
+                EXPERIMENT.remoteAuditEnabled = false
+                setStatus("Remote audit unavailable: " .. tostring(message), COLORS.warning)
+            else
+                EXPERIMENT.remoteAuditEnabled = true
+                if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = true end
+                setStatus("Passive remote audit ON. Requests are observed and passed through unchanged.", COLORS.success)
+            end
+        else
+            EXPERIMENT.remoteAuditEnabled = false
+            if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = false end
+            EXPERIMENT.remoteAuditStatus = "Installed but logging OFF"
+            setStatus("Remote audit logging OFF. The passive wrapper remains installed until rejoin/cleanup.", COLORS.warning)
+        end
+        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REMOTE AUDIT: ON" or "REMOTE AUDIT: OFF"
+        UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
+        if UI.remoteAuditStatusLabel then UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount) end
+        DIAG.log("INFO", "EXPERIMENT", "remote_audit_toggled", {enabled = EXPERIMENT.remoteAuditEnabled, status = EXPERIMENT.remoteAuditStatus})
+    end)
+
+    addConnection(UI.progressProbeButton.MouseButton1Click, function()
+        EXPERIMENT.progressProbeEnabled = not EXPERIMENT.progressProbeEnabled
+        UI.progressProbeButton.Text = EXPERIMENT.progressProbeEnabled and "PROGRESS PROBE: ON" or "PROGRESS PROBE: OFF"
+        UI.progressProbeButton.BackgroundColor3 = EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.panel2
+        DIAG.log("INFO", "EXPERIMENT", "progress_probe_toggled", {enabled = EXPERIMENT.progressProbeEnabled})
+        setStatus(EXPERIMENT.progressProbeEnabled and "Fast progress evidence sampling enabled." or "Fast progress evidence sampling paused.", EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.warning)
+    end)
+
+    addConnection(UI.chestProbeButton.MouseButton1Click, function()
+        QUICK_INTERACT.chestEnabled = not QUICK_INTERACT.chestEnabled
+        UI.chestProbeButton.Text = QUICK_INTERACT.chestEnabled and "INSTANT CHEST PROBE: ON" or "INSTANT CHEST PROBE: OFF"
+        UI.chestProbeButton.BackgroundColor3 = QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.panel2
+        DIAG.log("INFO", "EXPERIMENT", "instant_chest_probe_toggled", {enabled = QUICK_INTERACT.chestEnabled})
+        setStatus(QUICK_INTERACT.chestEnabled and "Instant chest probe enabled; normal E hold remains fallback." or "Instant chest probe disabled; chest uses normal configured E hold.", QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.warning)
     end)
 
     -- FILTER PICKERS: placed inside their relevant tabs so they never spill
@@ -4237,6 +4574,13 @@ local function createGui()
         UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
+    end)
+
+    addConnection(UI.silverDrawButton.MouseButton1Click, function()
+        SILVER.autoDrawEnabled = not SILVER.autoDrawEnabled
+        DIAG.log("INFO", "SILVER", "auto_draw_toggled", {enabled = SILVER.autoDrawEnabled})
+        updateModeButtons()
+        setStatus(SILVER.autoDrawEnabled and "Auto Draw enabled: will tap J at most once per character if no equipped weapon is detectable." or "Auto Draw disabled: Auto Silver will not press J automatically.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
     end)
 
     addConnection(UI.silverButton.MouseButton1Click, function()
@@ -4593,6 +4937,18 @@ if eventsFolderForAudit then
     end
 end
 
+-- Manual sword/attack input trace for diagnosing Auto Silver.
+addConnection(UserInputService.InputBegan, function(input, gameProcessed)
+    if input.KeyCode == Enum.KeyCode.J then
+        SILVER.jAttemptedCharacter = LocalPlayer.Character
+        DIAG.log("INFO", "SILVER", "manual_sword_toggle_key", {key = "J", gameProcessed = gameProcessed})
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if SILVER.autoEnabled and SILVER.busy then
+            DIAG.log("INFO", "SILVER", "manual_m1_input", {gameProcessed = gameProcessed, target = SILVER.currentTarget and SILVER.currentTarget.Name or nil})
+        end
+    end
+end)
+
 -- Standard Roblox idle notification. This only addresses the normal Idled event;
 -- game-specific server AFK systems may still disconnect the player.
 addConnection(LocalPlayer.Idled, function()
@@ -4641,7 +4997,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.0", placeId = game.PlaceId, player = LocalPlayer.Name, quickInteract = QUICK_INTERACT.enabled})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.1", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
 DIAG.refreshUI(true)
 
 task.spawn(function()
@@ -4750,11 +5106,11 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v1.0.0 loaded. Integrated diagnostics + fast-progress sampling + optional quick interaction are enabled.")
-print("[CU AutoCultivation] Auto Chest prioritizes Celestial > Jade > Bronze > Wooden and verifies ChestWorldOpened for the local player.")
+print("[CU AutoCultivation] v1.0.1 loaded. Integrated diagnostics + Experimental Lab are enabled.")
+print("[CU AutoCultivation] v1.0.1: Chest uses verified E-hold fallback; manual E timing is recorded. Experimental Lab provides passive remote audit only.")
 print("[CU AutoCultivation] Auto Silver still uses normal M1 input; diagnostics now record input, target HP, and server reward confirmations.")
-print("[CU AutoCultivation] Quick Interact is OFF by default; if enabled it tries the actual prompt instantly, verifies server state, then falls back to normal hold.")
-print("[CU AutoCultivation] Diagnostics never fires fake reward, reroll, chest, herb, combat, or progression remotes.")
+print("[CU AutoCultivation] Herb quick interaction is user-toggleable; chest instant probe is independently enabled with a normal E-hold fallback.")
+print("[CU AutoCultivation] Diagnostics/Experiments never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.0"})
-setStatus("Loaded v1.0.0. Integrated diagnostics are ON; Quick Interact is OFF until enabled in Farming.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.1"})
+setStatus("Loaded v1.0.1. Diagnostics are ON; Experimental Lab is available. Auto Chest uses E-hold fallback.", COLORS.success)
