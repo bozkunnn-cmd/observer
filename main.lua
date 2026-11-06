@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - FULL SESSION RECORDER
-    Version: 1.0
+    Version: 1.1
 
     Purpose:
       Record the client-visible state of a fresh Cultivation Unbound session.
@@ -24,6 +24,7 @@
     Output:
       CultivationUnbound_Logs/CU_Recorder_<timestamp>_<userid>.jsonl
       JSONL = one JSON object per line.
+      Press EXPORT & STOP to finalize the complete session file.
 
     Notes:
       - No intentional event-count limit when file append is available.
@@ -86,7 +87,6 @@ local startedUnix = os.time()
 local sequence = 0
 local queue = {}
 local memoryBatches = {}
-local recentLines = {}
 local connections = {}
 local uiConnections = {}
 local tracked = setmetatable({}, { __mode = "k" })
@@ -586,14 +586,8 @@ local function emit(eventName, data, force)
             tostring(encoded):gsub('"', "'"):gsub("\n", " ")
         )
         table.insert(queue, fallback)
-        table.insert(recentLines, fallback)
     else
         table.insert(queue, encoded)
-        table.insert(recentLines, encoded)
-    end
-
-    while #recentLines > 250 do
-        table.remove(recentLines, 1)
     end
 
     if #queue >= CONFIG.FLUSH_BATCH_SIZE then
@@ -1128,7 +1122,7 @@ local function createUi()
         Size = UDim2.new(1, -20, 1, 0),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND | FULL SESSION RECORDER v1.0",
+        Text = "CULTIVATION UNBOUND | FULL SESSION RECORDER v1.1",
         TextColor3 = Color3.fromRGB(236, 241, 249),
         TextSize = 11,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -1165,9 +1159,8 @@ local function createUi()
 
     ui.pause = makeUiButton(buttonRow, "PAUSE", 0, 75, Color3.fromRGB(65, 77, 99))
     ui.flush = makeUiButton(buttonRow, "FLUSH", 82, 75, Color3.fromRGB(65, 77, 99))
-    ui.copy = makeUiButton(buttonRow, "COPY LAST 200", 164, 112, Color3.fromRGB(65, 77, 99))
-    ui.stop = makeUiButton(buttonRow, "STOP", 283, 75, Color3.fromRGB(166, 63, 72))
-    ui.close = makeUiButton(buttonRow, "CLOSE", 365, 67, Color3.fromRGB(45, 53, 68))
+    ui.export = makeUiButton(buttonRow, "EXPORT & STOP", 164, 126, Color3.fromRGB(54, 125, 91))
+    ui.close = makeUiButton(buttonRow, "CLOSE", 299, 67, Color3.fromRGB(45, 53, 68))
 
     addUiConnection(ui.pause.MouseButton1Click:Connect(function()
         if not running then return end
@@ -1190,20 +1183,14 @@ local function createUi()
         updateStatus("manual flush")
     end))
 
-    addUiConnection(ui.copy.MouseButton1Click:Connect(function()
-        local text = table.concat(recentLines, "\n")
-        if type(setclipboard) == "function" then
-            local ok = pcall(setclipboard, text)
-            updateStatus(ok and "last 200 copied" or "clipboard failed")
-        else
-            updateStatus("clipboard API unavailable")
-            print(text)
-        end
-    end))
-
-    addUiConnection(ui.stop.MouseButton1Click:Connect(function()
+    addUiConnection(ui.export.MouseButton1Click:Connect(function()
         if running then
-            sharedEnv.__CURecorderStop("ui_button")
+            emit("export_requested", {
+                file_path = filePath,
+                queued_events = #queue,
+                storage_mode = storageMode,
+            }, true)
+            sharedEnv.__CURecorderStop("export_button")
         end
     end))
 
@@ -1376,10 +1363,10 @@ local function stopRecorder(reason)
         end)
     end
     connections = {}
-    if ui.stop then
+    if ui.export then
         pcall(function()
-            ui.stop.Text = "STOPPED"
-            ui.stop.Active = false
+            ui.export.Text = "SAVING..."
+            ui.export.Active = false
         end)
     end
     if ui.pause then
@@ -1414,7 +1401,24 @@ local function stopRecorder(reason)
         end
     end
 
-    updateStatus("stopped; " .. tostring(totalBytes) .. " bytes written")
+    local exportSucceeded = storageMode == "append"
+        or storageMode == "written_at_stop"
+        or storageMode == "written_recovery"
+
+    if ui.export then
+        pcall(function()
+            ui.export.Text = not exportSucceeded and "NO FILE"
+                or (storageMode == "written_recovery" and "2 FILES SAVED" or "EXPORTED")
+        end)
+    end
+
+    local exportStatus = "EXPORT FAILED - check executor file API"
+    if storageMode == "written_recovery" then
+        exportStatus = "LOG EXPORTED IN 2 FILES | " .. tostring(totalBytes) .. " bytes"
+    elseif exportSucceeded then
+        exportStatus = "FULL LOG EXPORTED | " .. tostring(totalBytes) .. " bytes"
+    end
+    updateStatus(exportStatus)
     if recoveryFilePath then
         warn("[CU Recorder] Earlier log: " .. tostring(filePath))
         warn("[CU Recorder] Remainder log: " .. tostring(recoveryFilePath))
@@ -1437,7 +1441,7 @@ initializeStorage()
 
 emit("session_start", {
     recorder = "Cultivation Unbound Full Session Recorder",
-    version = "1.0",
+    version = "1.1",
     place_id = game.PlaceId,
     game_id = game.GameId,
     job_id = game.JobId,
@@ -1511,5 +1515,6 @@ updateStatus("initial recording active")
 print("[CU Recorder] FULL SESSION RECORDING ACTIVE")
 print("[CU Recorder] File: " .. tostring(filePath))
 print("[CU Recorder] Storage: " .. tostring(storageMode))
-print("[CU Recorder] Use the GUI to pause, flush, copy recent lines, or stop.")
+print("[CU Recorder] Press EXPORT & STOP to finalize the complete JSONL file.")
+print("[CU Recorder] Find it in the executor workspace: " .. tostring(filePath))
 print("[CU Recorder] Read-only: it does not click, fire remotes, or modify gameplay.")
