@@ -1,1297 +1,158 @@
 --[[
-    CULTIVATION UNBOUND - FULL SESSION RECORDER
-    Version: 1.3
+    CULTIVATION UNBOUND - AUTO BREAKTHROUGH
+    Version: 0.1
 
-    Read-only client observer for a fresh progression session.
+    Shared Qi + Body breakthrough automation.
 
-    Captures:
-      * Local player, character, PlayerGui, leaderstats, backpack and attributes
-      * Qi / Body cultivation, realms, layers, mastery, multipliers and progress UI
-      * Minimal breakthroughs and tribulation UI state
-      * Trial ring / glow / seal / tap geometry and visual changes at render rate
-      * GUI text, visibility, colors, buttons and button activations
-      * Relevant Workspace entities, NPCs, herbs, bosses, drops and prompts
-      * Tools, proximity prompts, click detectors and Humanoid state / health
-      * Input began / ended events (does not record text typed into TextBoxes)
-      * Relevant inbound RemoteEvent traffic where visible to the client
-      * Periodic compact checkpoints and local character position changes
+    What it does:
+      1. Reads the currently selected cultivation bar (Qi or Body).
+      2. Waits for that bar to reach 100%.
+      3. Clicks the game's Breakthrough button once.
+      4. If a tribulation UI appears, reads its live hit count.
+      5. Clicks the current prompt's transparent Tap button when the
+         contracting ring is gold and nearly matches the target seal.
+      6. Verifies progress through the game's score UI.
 
-    Storage:
-      * appendfile available: rotates JSONL parts at a configurable size
-      * writefile only: writes bounded JSONL segment files
-      * Manifest lists every exported part and session totals
-      * No intentional event-count cap
+    It does NOT:
+      - Start meditation or Body training.
+      - Fire game remotes.
+      - Change stats or inventory.
+      - Press the displayed letter keys.
 
-    Safety:
-      * Does not click, fire remotes, change stats, move the character or automate play
-      * Does not install namecall / metamethod hooks for outbound remote spying
-      * Does not record mouse movement or chat message contents
-      * GUI background is click-through; only its buttons receive clicks
-
-    IMPORTANT:
-      * Client-visible data only. Server-only state is not accessible.
-      * Executor must support appendfile or writefile for reliable disk export.
+    Input is a simulated left mouse click on the actual GUI button.
 ]]
 
 local Players = game:GetService("Players")
-local HttpService = game:GetService("HttpService")
-local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local CollectionService = game:GetService("CollectionService")
+local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ReplicatedFirst = game:GetService("ReplicatedFirst")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    warn("[CU Recorder] LocalPlayer is unavailable. Run from a client executor.")
+    warn("[CU AutoBreakthrough] LocalPlayer unavailable.")
     return
 end
 
-local sharedEnv = _G
+local Env = _G
 if type(getgenv) == "function" then
-    local ok, env = pcall(getgenv)
-    if ok and type(env) == "table" then
-        sharedEnv = env
+    local ok, result = pcall(getgenv)
+    if ok and type(result) == "table" then
+        Env = result
     end
 end
 
-if type(sharedEnv.__CURecorderStop) == "function" then
-    pcall(sharedEnv.__CURecorderStop, "replaced_by_v1_3")
+if type(Env.__CUAutoBreakthroughStop) == "function" then
+    pcall(Env.__CUAutoBreakthroughStop, "replaced")
 end
-if sharedEnv.__CURecorderGui then
-    pcall(function()
-        sharedEnv.__CURecorderGui:Destroy()
-    end)
-end
-
-local CONFIG = {
-    OUTPUT_FOLDER = "CultivationUnbound_Logs",
-    FLUSH_INTERVAL = 1.0,
-    FLUSH_BATCH_EVENTS = 800,
-    APPEND_PART_BYTES = 16 * 1024 * 1024,
-    WRITEFILE_SEGMENT_BYTES = 512 * 1024,
-    WRITEFILE_SEGMENT_SECONDS = 5,
-    CHECKPOINT_INTERVAL = 30,
-    CHARACTER_POSITION_INTERVAL = 1,
-    CHARACTER_POSITION_MIN_DELTA = 0.75,
-    TRIAL_SAMPLE_HZ = 60,
-    MAX_NORMALIZE_DEPTH = 6,
-    MAX_TABLE_ENTRIES = 600,
-    MAX_STRING_LENGTH = 2400,
-    LOG_RELEVANT_INBOUND_REMOTES = true,
-    LOG_ALL_INBOUND_REMOTES = true,
-}
 
 local running = true
 local paused = false
-local stopping = false
-local flushing = false
-local totalEvents = 0
-local totalInstances = 0
-local droppedEvents = 0
-local sequence = 0
-local startedClock = os.clock()
-local startedUnix = os.time()
-local queue = {}
+local autoEnabled = true
 local connections = {}
-local uiConnections = {}
-local tracked = setmetatable({}, { __mode = "k" })
-local trialSet = setmetatable({}, { __mode = "k" })
-local trialObjects = {}
-local trialSampleCache = setmetatable({}, { __mode = "k" })
-local eventCounts = {}
-local partPaths = {}
-local partBytes = {}
-local partIndex = 0
-local currentPartPath = nil
-local currentPartBytes = 0
-local segmentBuffer = ""
-local segmentLastWrite = os.clock()
-local totalBytes = 0
-local storageMode = "checking"
-local storageError = nil
-local outputFolder = CONFIG.OUTPUT_FOLDER
-local baseName = nil
-local manifestPath = nil
+local qiState = nil
+local bodyState = nil
+local activeTrialGui = nil
+local attemptedPrompts = {}
+local previousRingSizes = {}
+local lastTrialScore = nil
+local lastTrialRequired = nil
+local lastPrompt1Ref = nil
+local lastBreakthroughKey = nil
+local lastBreakthroughAt = 0
+local breakthroughAttempts = 0
+local lastAction = "Starting..."
+local lastError = ""
+local lastMode = "Unknown"
+local lastPercent = nil
+local lastTrialText = "Trial: idle"
 local gui = nil
-local ui = {}
-local trialWasActive = false
-local trialFrame = 0
-local lastTrialSample = 0
-local lastTrialPrune = 0
-local lastPositionSample = 0
-local lastCharacterPosition = nil
-local lastCheckpoint = 0
-local checkpointSignatures = {}
-local initialScanComplete = false
-local flushRequested = false
+local panel = nil
+local modeLabel = nil
+local progressLabel = nil
+local statusLabel = nil
+local trialLabel = nil
+local pauseButton = nil
+local autoButton = nil
 
-local sessionStamp = os.date("%Y%m%d_%H%M%S") .. "_" .. tostring(math.floor((os.clock() % 1) * 1000))
-baseName = "CU_Recorder_" .. sessionStamp .. "_" .. tostring(LocalPlayer.UserId)
-
-local function safeGet(instance, property)
-    local ok, value = pcall(function()
-        return instance[property]
-    end)
-    if ok then
-        return value
-    end
-    return nil
-end
-
-local function safeClass(instance)
-    local ok, value = pcall(function()
-        return instance.ClassName
-    end)
-    return ok and tostring(value) or "Unknown"
-end
-
-local function safePath(instance)
-    if not instance then
-        return "<nil>"
-    end
-    local ok, value = pcall(function()
-        return instance:GetFullName()
-    end)
-    if ok and value then
-        return tostring(value)
-    end
-    local name = safeGet(instance, "Name")
-    return name and tostring(name) or "<unparented>"
-end
-
-local function safeIsA(instance, className)
-    local ok, result = pcall(function()
-        return instance:IsA(className)
-    end)
-    return ok and result == true
-end
-
-local function safeDescendantOf(instance, ancestor)
-    if not instance or not ancestor then
-        return false
-    end
-    local ok, result = pcall(function()
-        return instance == ancestor or instance:IsDescendantOf(ancestor)
-    end)
-    return ok and result == true
-end
-
-local function truncateString(value, maxLength)
-    local text = tostring(value)
-    if #text > maxLength then
-        return string.sub(text, 1, maxLength - 3) .. "..."
-    end
-    return text
-end
-
-local function normalize(value, depth, seen)
-    depth = depth or 0
-    seen = seen or {}
-    if value == nil then
-        return nil
-    end
-
-    local valueType = typeof(value)
-    if valueType == "Instance" then
-        return {
-            __type = "Instance",
-            class = safeClass(value),
-            name = truncateString(safeGet(value, "Name") or "?", 120),
-            path = truncateString(safePath(value), 360),
-        }
-    elseif valueType == "Vector2" then
-        return { __type = "Vector2", x = value.X, y = value.Y }
-    elseif valueType == "Vector3" then
-        return { __type = "Vector3", x = value.X, y = value.Y, z = value.Z }
-    elseif valueType == "Vector2int16" then
-        return { __type = "Vector2int16", x = value.X, y = value.Y }
-    elseif valueType == "Vector3int16" then
-        return { __type = "Vector3int16", x = value.X, y = value.Y, z = value.Z }
-    elseif valueType == "Color3" then
-        return { __type = "Color3", r = value.R, g = value.G, b = value.B }
-    elseif valueType == "CFrame" then
-        local components = { value:GetComponents() }
-        return { __type = "CFrame", components = components }
-    elseif valueType == "UDim" then
-        return { __type = "UDim", scale = value.Scale, offset = value.Offset }
-    elseif valueType == "UDim2" then
-        return {
-            __type = "UDim2",
-            x = { scale = value.X.Scale, offset = value.X.Offset },
-            y = { scale = value.Y.Scale, offset = value.Y.Offset },
-        }
-    elseif valueType == "Rect" then
-        return {
-            __type = "Rect",
-            min = normalize(value.Min, depth + 1, seen),
-            max = normalize(value.Max, depth + 1, seen),
-        }
-    elseif valueType == "Ray" then
-        return {
-            __type = "Ray",
-            origin = normalize(value.Origin, depth + 1, seen),
-            direction = normalize(value.Direction, depth + 1, seen),
-        }
-    elseif valueType == "BrickColor" then
-        return { __type = "BrickColor", name = value.Name, number = value.Number }
-    elseif valueType == "EnumItem" then
-        return tostring(value)
-    elseif valueType == "NumberRange" then
-        return { __type = "NumberRange", min = value.Min, max = value.Max }
-    elseif valueType == "DateTime" then
-        return { __type = "DateTime", unixTimestampMillis = value.UnixTimestampMillis }
-    end
-
-    if type(value) == "number" then
-        if value ~= value then return "NaN" end
-        if value == math.huge then return "Infinity" end
-        if value == -math.huge then return "-Infinity" end
-        return value
-    elseif type(value) == "string" then
-        return truncateString(value, CONFIG.MAX_STRING_LENGTH)
-    elseif type(value) == "boolean" then
-        return value
-    elseif type(value) == "function" then
-        return "<function>"
-    elseif type(value) == "thread" then
-        return "<thread>"
-    elseif type(value) == "userdata" then
-        return truncateString(tostring(value), 300)
-    elseif type(value) == "table" then
-        if depth >= CONFIG.MAX_NORMALIZE_DEPTH then
-            return "<max_depth>"
-        end
-        if seen[value] then
-            return "<cycle>"
-        end
-        seen[value] = true
-        local result = {}
-        local count = 0
-        for key, item in pairs(value) do
-            count = count + 1
-            if count > CONFIG.MAX_TABLE_ENTRIES then
-                result.__truncated = true
-                break
-            end
-            result[truncateString(key, 100)] = normalize(item, depth + 1, seen)
-        end
-        seen[value] = nil
-        return result
-    end
-
-    return truncateString(tostring(value), 300)
-end
-
-local function pathContainsAny(path, words)
-    local lower = string.lower(tostring(path or ""))
-    for _, word in ipairs(words) do
-        if string.find(lower, word, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
-local MECHANIC_WORDS = {
-    "cultivat", "qi", "body", "realm", "trial", "tribulation", "breakthrough",
-    "quest", "inventory", "backpack", "skill", "boss", "enemy", "herb", "pill",
-    "sect", "event", "silver", "stone", "soul", "leaderstat", "npc", "merchant",
-    "reward", "stats", "trait", "race", "clan", "manual", "training", "weight",
-    "meditat", "aura", "sense", "zone", "shop", "currency", "party", "spirit",
-    "map", "teleport", "resource", "drop", "chest", "treasure", "dialog", "tracker",
-    "title", "potion", "elixir", "pvp", "arena", "damage", "health", "combat",
-    "fight", "refin", "meridian", "dantian", "mastery", "progress", "multiplier",
-    "speed", "realmdisplay", "worldboss", "worldevent", "qisense", "qi_sense",
+local COLORS = {
+    bg = Color3.fromRGB(17, 20, 28),
+    panel = Color3.fromRGB(27, 32, 43),
+    panel2 = Color3.fromRGB(36, 43, 57),
+    text = Color3.fromRGB(235, 239, 247),
+    muted = Color3.fromRGB(157, 169, 188),
+    qi = Color3.fromRGB(105, 190, 255),
+    body = Color3.fromRGB(255, 177, 112),
+    accent = Color3.fromRGB(145, 130, 255),
+    success = Color3.fromRGB(112, 211, 151),
+    warning = Color3.fromRGB(245, 190, 91),
+    danger = Color3.fromRGB(226, 91, 102),
 }
 
-local TRIAL_WORDS = { "trial", "tribulation", "breakthrough", "breakthroughmg", "breakthroughgui" }
-local REMOTE_WORDS = {
-    "cultivat", "qi", "body", "realm", "trial", "breakthrough", "quest", "inventory",
-    "skill", "boss", "herb", "pill", "sect", "event", "reward", "shop", "purchase",
-    "player", "character", "stat", "progress", "update", "sync", "state", "notify",
-    "action", "data", "world", "spirit", "soul",
-}
-
-local function classifyPath(path)
-    local lower = string.lower(tostring(path or ""))
-    local tags = {}
-    local map = {
-        { "qi", "qi" }, { "body", "body" }, { "trial", "trial" },
-        { "tribulation", "tribulation" }, { "breakthrough", "breakthrough" },
-        { "cultivat", "cultivation" }, { "realm", "realm" }, { "quest", "quest" },
-        { "inventory", "inventory" }, { "backpack", "inventory" }, { "skill", "skill" },
-        { "boss", "boss" }, { "enemy", "enemy" }, { "herb", "herb" },
-        { "pill", "pill" }, { "sect", "sect" }, { "event", "world_event" },
-        { "silver", "currency" }, { "stone", "currency" }, { "soul", "soul" },
-        { "trait", "trait" }, { "npc", "npc" }, { "merchant", "merchant" },
-        { "party", "party" }, { "leaderstat", "leaderstats" },
-    }
-    local seen = {}
-    for _, pair in ipairs(map) do
-        if string.find(lower, pair[1], 1, true) and not seen[pair[2]] then
-            seen[pair[2]] = true
-            table.insert(tags, pair[2])
-        end
-    end
-    return tags
-end
-
-local function isTrialPath(path)
-    return pathContainsAny(path, TRIAL_WORDS)
-end
-
-local function getAttributes(instance)
-    local ok, attributes = pcall(function()
-        return instance:GetAttributes()
-    end)
-    if ok and type(attributes) == "table" then
-        return normalize(attributes)
-    end
-    return {}
-end
-
-local function getTags(instance)
-    local ok, tags = pcall(function()
-        return CollectionService:GetTags(instance)
-    end)
-    if ok and type(tags) == "table" then
-        return tags
-    end
-    return {}
-end
-
-local function getTimestampMillis()
-    local ok, result = pcall(function()
-        return DateTime.now().UnixTimestampMillis
-    end)
-    if ok and result then
-        return result
-    end
-    return os.time() * 1000
-end
-
-local function getPartPath(index)
-    return outputFolder .. "/" .. baseName .. "_part" .. string.format("%03d", index) .. ".jsonl"
-end
-
-local function getManifestData(finalState)
-    return {
-        recorder = "Cultivation Unbound Full Session Recorder",
-        version = "1.3",
-        place_id = game.PlaceId,
-        game_id = game.GameId,
-        job_id = game.JobId,
-        player_name = LocalPlayer.Name,
-        display_name = LocalPlayer.DisplayName,
-        user_id = LocalPlayer.UserId,
-        started_unix = startedUnix,
-        ended_unix = finalState and os.time() or nil,
-        status = finalState and "stopped" or "recording",
-        storage_mode = storageMode,
-        total_events = totalEvents,
-        total_instances = totalInstances,
-        dropped_events = droppedEvents,
-        total_bytes = totalBytes,
-        parts = partPaths,
-        event_counts = eventCounts,
-        storage_error = storageError,
-    }
-end
-
-local function writeManifest(finalState)
-    local manifest = getManifestData(finalState)
-    local okEncode, encoded = pcall(function()
-        return HttpService:JSONEncode(manifest)
-    end)
-    if not okEncode then
-        return false, tostring(encoded)
-    end
-
-    if type(writefile) == "function" then
-        local ok, err = pcall(writefile, manifestPath, encoded)
-        if ok then
-            return true
-        end
-        storageError = "Manifest write failed: " .. tostring(err)
-    end
-
-    if type(appendfile) == "function" then
-        local appendPath = manifestPath:gsub("%.json$", ".jsonl")
-        local ok, err = pcall(appendfile, appendPath, encoded .. "\n")
-        if ok then
-            manifestPath = appendPath
-            return true
-        end
-        storageError = "Manifest append failed: " .. tostring(err)
-    end
-
-    return false, storageError or "No manifest file API"
-end
-
-local function createFolderIfPossible()
-    if type(makefolder) == "function" then
-        pcall(makefolder, outputFolder)
-    else
-        outputFolder = "."
-    end
-end
-
-local function initializeStorageAt(folder)
-    local canAppend = type(appendfile) == "function"
-    local canWrite = type(writefile) == "function"
-
-    partIndex = 0
-    currentPartPath = nil
-    currentPartBytes = 0
-    outputFolder = folder
-    manifestPath = outputFolder .. "/" .. baseName .. (canWrite and "_manifest.json" or "_manifest.jsonl")
-
-    if canAppend then
-        partIndex = 1
-        currentPartPath = getPartPath(partIndex)
-        local created = false
-        if canWrite then
-            local ok = pcall(writefile, currentPartPath, "")
-            created = ok
-        end
-        if not created then
-            local ok = pcall(appendfile, currentPartPath, "")
-            created = ok
-        end
-        if created then
-            storageMode = "append"
-            table.insert(partPaths, currentPartPath)
-            partBytes[currentPartPath] = 0
-            writeManifest(false)
-            return true
-        end
-        storageError = "appendfile could not create the first JSONL part"
-    end
-
-    if canWrite then
-        -- Use the manifest itself as a writefile probe, then replace it with
-        -- the real manifest. This avoids leaving a disposable probe file.
-        local probeOk = pcall(writefile, manifestPath, "{}")
-        if probeOk then
-            storageMode = "segments"
-            writeManifest(false)
-            return true
-        end
-        storageError = "writefile could not create the manifest in " .. tostring(folder)
-    end
-
-    return false
-end
-
-local function initializeStorage()
-    local canAppend = type(appendfile) == "function"
-    local canWrite = type(writefile) == "function"
-    if not canAppend and not canWrite then
-        storageMode = "unavailable"
-        storageError = "Executor has neither appendfile nor writefile. Recording was not started."
-        return false
-    end
-
-    createFolderIfPossible()
-    if initializeStorageAt(outputFolder) then
-        return true
-    end
-
-    if outputFolder ~= "." then
-        warn("[CU Recorder] Output folder failed; trying executor workspace root.")
-        if initializeStorageAt(".") then
-            return true
-        end
-    end
-
-    storageMode = "unavailable"
-    storageError = storageError or "Could not initialize an output file"
-    return false
-end
-
-local function updateStatus(extra)
-    local mode = storageMode == "append" and "DISK / ROTATING"
-        or storageMode == "segments" and "DISK / SEGMENTS"
-        or storageMode == "unavailable" and "NO DISK - STOPPED"
-        or tostring(storageMode):upper()
-    local state = paused and "PAUSED" or (running and "RECORDING" or "STOPPED")
-    local text = string.format("%s | %d events | %d instances | %d parts | %s", state, totalEvents, totalInstances, #partPaths, mode)
-    if extra then
-        text = text .. " | " .. tostring(extra)
-    end
-    if ui.status then
-        pcall(function()
-            ui.status.Text = text
-        end)
-    end
-    if ui.path then
-        pcall(function()
-            ui.path.Text = outputFolder .. "/" .. baseName .. "_part*.jsonl"
-        end)
-    end
-end
-
-local function writeNewSegment(content)
-    if content == "" then
-        return true
-    end
-    if type(writefile) ~= "function" then
-        return false, "writefile unavailable"
-    end
-
-    partIndex = partIndex + 1
-    local path = getPartPath(partIndex)
-    local ok, err = pcall(writefile, path, content)
-    if not ok then
-        partIndex = partIndex - 1
-        return false, tostring(err)
-    end
-
-    table.insert(partPaths, path)
-    partBytes[path] = #content
-    totalBytes = totalBytes + #content
-    return true
-end
-
-local function rotateAppendPart()
-    partIndex = partIndex + 1
-    currentPartPath = getPartPath(partIndex)
-    local created = false
-    if type(writefile) == "function" then
-        local ok = pcall(writefile, currentPartPath, "")
-        created = ok
-    end
-    if not created and type(appendfile) == "function" then
-        local ok = pcall(appendfile, currentPartPath, "")
-        created = ok
-    end
-    if not created then
-        return false, "Could not create rotated JSONL part"
-    end
-    currentPartBytes = 0
-    table.insert(partPaths, currentPartPath)
-    partBytes[currentPartPath] = 0
-    writeManifest(false)
-    return true
-end
-
-local function flushQueue(forceSegment)
-    if flushing then
-        return false
-    end
-    if #queue == 0 and segmentBuffer == "" then
-        return true
-    end
-
-    flushing = true
-    local batch = ""
-    if #queue > 0 then
-        batch = table.concat(queue, "\n") .. "\n"
-        queue = {}
-    end
-
-    local success = true
-    if storageMode == "append" then
-        if batch ~= "" then
-            if currentPartBytes + #batch > CONFIG.APPEND_PART_BYTES and currentPartBytes > 0 then
-                local rotateOk, rotateError = rotateAppendPart()
-                if not rotateOk then
-                    storageError = tostring(rotateError)
-                    storageMode = type(writefile) == "function" and "segments" or "unavailable"
-                end
-            end
-            if storageMode == "append" then
-                local ok, err = pcall(appendfile, currentPartPath, batch)
-                if ok then
-                    currentPartBytes = currentPartBytes + #batch
-                    totalBytes = totalBytes + #batch
-                    partBytes[currentPartPath] = currentPartBytes
-                else
-                    storageError = "appendfile failed: " .. tostring(err)
-                    storageMode = type(writefile) == "function" and "segments" or "unavailable"
-                    segmentBuffer = segmentBuffer .. batch
-                    success = false
-                end
-            else
-                segmentBuffer = segmentBuffer .. batch
-            end
-        end
-    elseif storageMode == "segments" then
-        if batch ~= "" then
-            segmentBuffer = segmentBuffer .. batch
-        end
-        local shouldWrite = forceSegment
-            or #segmentBuffer >= CONFIG.WRITEFILE_SEGMENT_BYTES
-            or (segmentBuffer ~= "" and os.clock() - segmentLastWrite >= CONFIG.WRITEFILE_SEGMENT_SECONDS)
-        if shouldWrite and segmentBuffer ~= "" then
-            local content = segmentBuffer
-            local ok, err = writeNewSegment(content)
-            if ok then
-                segmentBuffer = ""
-                segmentLastWrite = os.clock()
-            else
-                storageError = "writefile segment failed: " .. tostring(err)
-                paused = true
-                warn("[CU Recorder] Disk write failed; recording paused to prevent memory growth: " .. tostring(err))
-                success = false
-            end
-        end
-    else
-        if batch ~= "" then
-            droppedEvents = droppedEvents + 1
-            storageError = storageError or "Storage unavailable; event batch could not be persisted"
-            success = false
-        end
-    end
-
-    if totalEvents > 0 and (totalEvents % 5000 == 0 or forceSegment) then
-        writeManifest(false)
-    end
-
-    flushing = false
-    updateStatus()
-    return success
-end
-
-local function emit(eventName, data, force)
-    if not running and not force then
-        return
-    end
-    if paused and not force then
-        return
-    end
-
-    sequence = sequence + 1
-    totalEvents = totalEvents + 1
-    eventCounts[eventName] = (eventCounts[eventName] or 0) + 1
-
-    local row = {
-        seq = sequence,
-        unix_ms = getTimestampMillis(),
-        time_local = os.date("%Y-%m-%d %H:%M:%S"),
-        time_utc = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        elapsed_s = math.floor((os.clock() - startedClock) * 1000) / 1000,
-        event = eventName,
-        tags = data and data.path and classifyPath(data.path) or nil,
-        data = normalize(data or {}),
-    }
-
-    local ok, encoded = pcall(function()
-        return HttpService:JSONEncode(row)
-    end)
-    if not ok then
-        droppedEvents = droppedEvents + 1
-        local fallback = {
-            seq = sequence,
-            unix_ms = getTimestampMillis(),
-            elapsed_s = math.floor((os.clock() - startedClock) * 1000) / 1000,
-            event = "encode_error",
-            data = { failed_event = eventName, error = truncateString(encoded, 500) },
-        }
-        local fallbackOk, fallbackEncoded = pcall(function()
-            return HttpService:JSONEncode(fallback)
-        end)
-        if fallbackOk then
-            encoded = fallbackEncoded
-        else
-            return
-        end
-    end
-
-    table.insert(queue, encoded)
-    if #queue >= CONFIG.FLUSH_BATCH_EVENTS then
-        flushRequested = true
-    end
-end
-
-local function addConnection(connection)
-    if connection then
-        table.insert(connections, connection)
-    end
-    return connection
-end
-
-local function addUiConnection(connection)
-    if connection then
-        table.insert(uiConnections, connection)
-    end
-    return connection
-end
-
-local function connectSignal(instance, signalName, callback, bucket)
-    local ok, signal = pcall(function()
-        return instance[signalName]
-    end)
-    if not ok or not signal then
-        return nil
-    end
-    local connected, connection = pcall(function()
+local function addConnection(signal, callback)
+    local ok, connection = pcall(function()
         return signal:Connect(callback)
     end)
-    if connected then
-        if bucket == "ui" then
-            addUiConnection(connection)
-        else
-            addConnection(connection)
-        end
+    if ok and connection then
+        table.insert(connections, connection)
         return connection
     end
     return nil
 end
 
-local function shouldSkipInstance(instance)
-    if not instance then
-        return true
+local function disconnectAll()
+    for _, connection in ipairs(connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
     end
-    if gui and safeDescendantOf(instance, gui) then
-        return true
-    end
-    return false
+    table.clear(connections)
 end
 
-local function isRelevantInstance(instance)
-    if not instance or shouldSkipInstance(instance) then
-        return false
+local function setStatus(message, color)
+    lastAction = tostring(message or "")
+    if statusLabel then
+        statusLabel.Text = lastAction
+        statusLabel.TextColor3 = color or COLORS.muted
     end
-
-    if instance == LocalPlayer or safeDescendantOf(instance, LocalPlayer) then
-        return true
-    end
-
-    local character = LocalPlayer.Character
-    if character and safeDescendantOf(instance, character) then
-        return true
-    end
-
-    local className = safeClass(instance)
-    if className == "Humanoid" or className == "ProximityPrompt" or className == "ClickDetector" or className == "Tool" then
-        return true
-    end
-
-    if className == "RemoteEvent" or className == "RemoteFunction" then
-        return true
-    end
-
-    return pathContainsAny(safePath(instance), MECHANIC_WORDS)
 end
 
-local function isEffectivelyVisible(instance)
-    local current = instance
-    while current and current ~= game do
-        if safeIsA(current, "GuiObject") and safeGet(current, "Visible") == false then
-            return false
-        end
-        if safeIsA(current, "LayerCollector") and safeGet(current, "Enabled") == false then
-            return false
-        end
-        current = safeGet(current, "Parent")
-    end
-    return true
-end
-
-local function propertiesFor(instance)
-    local props = { "Name", "ClassName" }
-    local function add(list)
-        for _, property in ipairs(list) do
-            table.insert(props, property)
-        end
-    end
-
-    if safeIsA(instance, "GuiObject") then
-        add({
-            "Visible", "Active", "Selectable", "Position", "Size", "AbsolutePosition",
-            "AbsoluteSize", "AnchorPoint", "Rotation", "ZIndex", "LayoutOrder",
-            "BackgroundColor3", "BackgroundTransparency", "BorderColor3", "BorderSizePixel",
-            "ClipsDescendants",
-        })
-    end
-
-    if safeIsA(instance, "LayerCollector") then
-        add({ "Enabled", "DisplayOrder", "ZIndexBehavior" })
-    end
-
-    if safeIsA(instance, "TextLabel") or safeIsA(instance, "TextButton") or safeIsA(instance, "TextBox") then
-        add({
-            "Text", "TextColor3", "TextTransparency", "TextStrokeColor3", "TextStrokeTransparency",
-            "TextSize", "TextScaled", "TextWrapped", "RichText", "Font", "TextXAlignment",
-            "TextYAlignment", "PlaceholderText",
-        })
-    end
-
-    if safeIsA(instance, "ImageLabel") or safeIsA(instance, "ImageButton") then
-        add({ "Image", "ImageColor3", "ImageTransparency", "ImageRectOffset", "ImageRectSize", "ScaleType" })
-    end
-
-    if safeIsA(instance, "UIStroke") then
-        add({ "Color", "Thickness", "Transparency", "Enabled" })
-    end
-    if safeIsA(instance, "UIGradient") then
-        add({ "Color", "Transparency", "Rotation", "Offset", "Enabled" })
-    end
-    if safeIsA(instance, "UIScale") then
-        add({ "Scale" })
-    end
-    if safeIsA(instance, "ValueBase") then
-        add({ "Value" })
-    end
-
-    if safeIsA(instance, "BasePart") then
-        local path = safePath(instance)
-        local character = LocalPlayer.Character
-        local inCharacter = character and safeDescendantOf(instance, character)
-        if inCharacter or pathContainsAny(path, {
-            "npc", "boss", "herb", "quest", "merchant", "event", "trial", "cultivation",
-            "spawn", "resource", "drop", "zone", "training", "weight", "item", "chest",
-        }) then
-            add({ "CFrame", "Position", "Orientation", "Size", "Anchored", "CanCollide", "Transparency", "Color", "Material" })
-        end
-    end
-
-    if safeIsA(instance, "Model") then
-        add({ "PrimaryPart", "WorldPivot" })
-    end
-
-    if safeIsA(instance, "Humanoid") then
-        add({
-            "Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight", "UseJumpPower",
-            "HipHeight", "Sit", "PlatformStand", "MoveDirection", "FloorMaterial", "AutoRotate",
-            "RigType", "DisplayName",
-        })
-    end
-
-    if safeIsA(instance, "Tool") then
-        add({ "Enabled", "CanBeDropped", "RequiresHandle", "ToolTip" })
-    end
-
-    if safeIsA(instance, "ProximityPrompt") then
-        add({
-            "ActionText", "ObjectText", "Enabled", "HoldDuration", "MaxActivationDistance",
-            "RequiresLineOfSight", "KeyboardKeyCode", "GamepadKeyCode", "ClickablePrompt",
-        })
-    end
-
-    if safeIsA(instance, "ClickDetector") then
-        add({ "MaxActivationDistance", "CursorIcon" })
-    end
-
-    if safeIsA(instance, "RemoteEvent") or safeIsA(instance, "RemoteFunction") then
-        add({ "Name", "ClassName" })
-    end
-
-    local unique = {}
-    local result = {}
-    for _, property in ipairs(props) do
-        if not unique[property] then
-            unique[property] = true
-            table.insert(result, property)
-        end
-    end
-    return result
-end
-
-local function snapshotProperties(instance)
-    local result = {}
-    for _, property in ipairs(propertiesFor(instance)) do
-        local value = safeGet(instance, property)
-        if value ~= nil then
-            result[property] = normalize(value)
-        end
-    end
-    return result
-end
-
-local function shouldWatchChanged(instance)
-    return safeIsA(instance, "ValueBase")
-        or safeIsA(instance, "GuiObject")
-        or safeIsA(instance, "LayerCollector")
-        or safeIsA(instance, "Humanoid")
-        or safeIsA(instance, "ProximityPrompt")
-        or safeIsA(instance, "ClickDetector")
-        or safeIsA(instance, "Tool")
-end
-
-local function shouldLogPropertyChange(instance, propertyName)
-    if safeIsA(instance, "ValueBase") then
-        return propertyName == "Value"
-    end
-
-    if safeIsA(instance, "Humanoid") then
-        return propertyName == "Health" or propertyName == "MaxHealth"
-            or propertyName == "WalkSpeed" or propertyName == "JumpPower"
-            or propertyName == "JumpHeight" or propertyName == "Sit"
-            or propertyName == "PlatformStand" or propertyName == "MoveDirection"
-            or propertyName == "FloorMaterial" or propertyName == "AutoRotate"
-    end
-
-    if safeIsA(instance, "LayerCollector") then
-        return propertyName == "Enabled" or propertyName == "DisplayOrder"
-    end
-
-    if safeIsA(instance, "GuiObject") then
-        local path = safePath(instance)
-        if isTrialPath(path) then
-            return propertyName == "Visible" or propertyName == "Position" or propertyName == "Size"
-                or propertyName == "AbsolutePosition" or propertyName == "AbsoluteSize"
-                or propertyName == "BackgroundColor3" or propertyName == "BackgroundTransparency"
-                or propertyName == "ImageColor3" or propertyName == "ImageTransparency"
-                or propertyName == "Rotation" or propertyName == "Text" or propertyName == "TextColor3"
-                or propertyName == "TextTransparency" or propertyName == "TextSize"
-                or propertyName == "Active" or propertyName == "Selectable"
-        end
-        return propertyName == "Visible" or propertyName == "Enabled" or propertyName == "Text"
-            or propertyName == "TextColor3" or propertyName == "TextTransparency"
-            or propertyName == "BackgroundColor3" or propertyName == "BackgroundTransparency"
-            or propertyName == "ImageColor3" or propertyName == "ImageTransparency"
-            or propertyName == "Active" or propertyName == "Selectable"
-    end
-
-    if safeIsA(instance, "ProximityPrompt") then
-        return propertyName == "ActionText" or propertyName == "ObjectText"
-            or propertyName == "Enabled" or propertyName == "HoldDuration"
-            or propertyName == "MaxActivationDistance" or propertyName == "RequiresLineOfSight"
-    end
-
-    if safeIsA(instance, "ClickDetector") then
-        return propertyName == "MaxActivationDistance" or propertyName == "CursorIcon"
-    end
-
-    if safeIsA(instance, "Tool") then
-        return propertyName == "Enabled" or propertyName == "ToolTip"
-    end
-
-    return false
-end
-
-local function packArguments(...)
-    local count = select("#", ...)
-    local values = {}
-    local limit = math.min(count, 50)
-    for index = 1, limit do
-        values[index] = normalize(select(index, ...))
-    end
-    return { n = count, values = values, truncated = count > limit }
-end
-
-local function logButtonEvent(instance, eventName, extra)
-    emit(eventName, {
-        path = safePath(instance),
-        class = safeClass(instance),
-        name = safeGet(instance, "Name"),
-        text = safeGet(instance, "Text"),
-        visible = safeGet(instance, "Visible"),
-        extra = extra or {},
-    })
-end
-
-local function remoteShouldLog(remote)
-    if CONFIG.LOG_ALL_INBOUND_REMOTES then
-        return true
-    end
-    return CONFIG.LOG_RELEVANT_INBOUND_REMOTES and pathContainsAny(safePath(remote), REMOTE_WORDS)
-end
-
-local recordInstance
-
-local function registerEntityFromHumanoid(humanoid)
-    local model = safeGet(humanoid, "Parent")
-    if not model or not safeIsA(model, "Model") then
+local function stop(reason)
+    if not running then
         return
     end
-
-    if not tracked[model] then
-        recordInstance(model, "entity_model", true)
+    running = false
+    disconnectAll()
+    if gui then
+        pcall(function()
+            gui:Destroy()
+        end)
+        gui = nil
     end
-
-    local rootNames = { "HumanoidRootPart", "PrimaryPart", "Head", "Torso", "UpperTorso" }
-    for _, name in ipairs(rootNames) do
-        local part = safeGet(model, name)
-        if part and safeIsA(part, "BasePart") and not tracked[part] then
-            recordInstance(part, "entity_part", true)
-        end
-    end
+    Env.__CUAutoBreakthroughStop = nil
+    Env.__CUAutoBreakthroughState = nil
+    print("[CU AutoBreakthrough] Stopped: " .. tostring(reason or "manual"))
 end
 
-recordInstance = function(instance, origin, force)
-    if not running or shouldSkipInstance(instance) or tracked[instance] then
-        return
-    end
-    if not force and not isRelevantInstance(instance) then
-        return
-    end
-
-    tracked[instance] = true
-    totalInstances = totalInstances + 1
-
-    local path = safePath(instance)
-    local className = safeClass(instance)
-    local attributes = getAttributes(instance)
-
-    if isTrialPath(path) and not trialSet[instance] then
-        trialSet[instance] = true
-        table.insert(trialObjects, instance)
-    end
-
-    local isInitialOrigin = string.find(tostring(origin or ""), "initial", 1, true) == 1
-    emit(isInitialOrigin and "instance_snapshot" or "instance_added", {
-        origin = origin,
-        path = path,
-        class = className,
-        name = safeGet(instance, "Name"),
-        parent = safePath(safeGet(instance, "Parent")),
-        properties = snapshotProperties(instance),
-        attributes = attributes,
-        tags = getTags(instance),
-        mechanic_tags = classifyPath(path),
-    })
-
-    if shouldWatchChanged(instance) then
-        connectSignal(instance, "Changed", function(changed)
-            local propertyName
-            if safeIsA(instance, "ValueBase") then
-                propertyName = "Value"
-            elseif type(changed) == "string" then
-                propertyName = changed
-            else
-                return
-            end
-            if not shouldLogPropertyChange(instance, propertyName) then
-                return
-            end
-            emit("property_changed", {
-                path = safePath(instance),
-                class = className,
-                property = propertyName,
-                value = safeGet(instance, propertyName),
-            })
-        end)
-    end
-
-    local characterForAttributes = LocalPlayer.Character
-    local shouldWatchAttributes = next(attributes) ~= nil
-        or safeDescendantOf(instance, LocalPlayer)
-        or (characterForAttributes and safeDescendantOf(instance, characterForAttributes))
-        or pathContainsAny(path, MECHANIC_WORDS)
-        or safeIsA(instance, "Humanoid")
-    if shouldWatchAttributes then
-        connectSignal(instance, "AttributeChanged", function(attributeName)
-            local attributeValue = nil
-            local attributeOk, attributeResult = pcall(function()
-                return instance:GetAttribute(attributeName)
-            end)
-            if attributeOk then
-                attributeValue = attributeResult
-            end
-            emit("attribute_changed", {
-                path = safePath(instance),
-                class = className,
-                attribute = attributeName,
-                value = attributeValue,
-            })
-        end)
-    end
-
-    if safeIsA(instance, "RemoteEvent") then
-        emit("remote_discovered", { path = path, class = className, name = safeGet(instance, "Name") })
-        if remoteShouldLog(instance) then
-            connectSignal(instance, "OnClientEvent", function(...)
-                emit("remote_inbound", {
-                    remote = safePath(instance),
-                    arguments = packArguments(...),
-                })
-            end)
-        end
-    elseif safeIsA(instance, "RemoteFunction") then
-        emit("remote_discovered", { path = path, class = className, name = safeGet(instance, "Name"), inbound_callback = "not_hooked" })
-    end
-
-    if safeIsA(instance, "BindableEvent") and pathContainsAny(path, MECHANIC_WORDS) then
-        connectSignal(instance, "Event", function(...)
-            emit("bindable_event", { path = safePath(instance), arguments = packArguments(...) })
-        end)
-    end
-
-    if safeIsA(instance, "GuiButton") then
-        connectSignal(instance, "Activated", function(inputObject, clickCount)
-            logButtonEvent(instance, "gui_button_activated", {
-                input_type = inputObject and tostring(safeGet(inputObject, "UserInputType")) or nil,
-                key_code = inputObject and tostring(safeGet(inputObject, "KeyCode")) or nil,
-                click_count = clickCount,
-            })
-        end)
-        connectSignal(instance, "MouseButton2Click", function()
-            logButtonEvent(instance, "gui_button_mouse2_click")
-        end)
-    end
-
-    if safeIsA(instance, "ProximityPrompt") then
-        local promptSignals = {
-            "PromptButtonHoldBegan", "PromptButtonHoldEnded", "Triggered",
-            "TriggerEnded", "PromptShown", "PromptHidden",
+Env.__CUAutoBreakthroughStop = stop
+Env.__CUAutoBreakthroughState = {
+    getStatus = function()
+        return {
+            running = running,
+            paused = paused,
+            autoEnabled = autoEnabled,
+            mode = lastMode,
+            percent = lastPercent,
+            action = lastAction,
+            trial = lastTrialText,
+            error = lastError,
         }
-        for _, signalName in ipairs(promptSignals) do
-            connectSignal(instance, signalName, function(...)
-                emit("proximity_prompt_" .. string.lower(signalName), {
-                    path = safePath(instance),
-                    action_text = safeGet(instance, "ActionText"),
-                    object_text = safeGet(instance, "ObjectText"),
-                    arguments = packArguments(...),
-                })
-            end)
-        end
-    end
+    end,
+    stop = stop,
+}
 
-    if safeIsA(instance, "Tool") then
-        for _, signalName in ipairs({ "Activated", "Deactivated", "Equipped", "Unequipped" }) do
-            connectSignal(instance, signalName, function(...)
-                emit("tool_" .. string.lower(signalName), { path = safePath(instance), arguments = packArguments(...) })
-            end)
-        end
-    end
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-    if safeIsA(instance, "ProximityPrompt") or safeIsA(instance, "ClickDetector") then
-        local parentPart = safeGet(instance, "Parent")
-        if parentPart and safeIsA(parentPart, "BasePart") then
-            if not tracked[parentPart] then
-                recordInstance(parentPart, "interactable_parent", true)
-            end
-            local model = parentPart:FindFirstAncestorOfClass("Model")
-            if model and not tracked[model] then
-                recordInstance(model, "interactable_model", true)
-            end
-        end
-    end
-
-    if safeIsA(instance, "Humanoid") then
-        connectSignal(instance, "Died", function()
-            emit("humanoid_died", { path = safePath(instance), model = safePath(safeGet(instance, "Parent")) })
-        end)
-        connectSignal(instance, "StateChanged", function(oldState, newState)
-            emit("humanoid_state_changed", {
-                path = safePath(instance),
-                old_state = tostring(oldState),
-                new_state = tostring(newState),
-                health = safeGet(instance, "Health"),
-            })
-        end)
-        connectSignal(instance, "HealthChanged", function(health)
-            emit("humanoid_health_changed", {
-                path = safePath(instance),
-                health = health,
-                max_health = safeGet(instance, "MaxHealth"),
-            })
-        end)
-        registerEntityFromHumanoid(instance)
-    end
-end
-
-local function getInputDetails(inputObject, processed)
-    local inputType = inputObject and safeGet(inputObject, "UserInputType")
-    local keyCode = inputObject and safeGet(inputObject, "KeyCode")
-    local data = {
-        user_input_type = inputType and tostring(inputType) or nil,
-        key_code = keyCode and tostring(keyCode) or nil,
-        position = inputObject and normalize(safeGet(inputObject, "Position")) or nil,
-        processed = processed == true,
-    }
-
-    if inputObject then
-        local state = safeGet(inputObject, "UserInputState")
-        data.user_input_state = state and tostring(state) or nil
-    end
-
-    if inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.MouseButton2 then
-        local locationOk, location = pcall(function()
-            return UserInputService:GetMouseLocation()
-        end)
-        if locationOk then
-            data.mouse_location = normalize(location)
-        end
-        local mouseOk, mouse = pcall(function()
-            return LocalPlayer:GetMouse()
-        end)
-        if mouseOk and mouse then
-            data.mouse_target = normalize(safeGet(mouse, "Target"))
-            data.mouse_hit = normalize(safeGet(mouse, "Hit"))
-        end
-    end
-
-    return data
-end
-
-local function connectGlobalSignals()
-    addConnection(game.DescendantAdded:Connect(function(instance)
-        if isRelevantInstance(instance) then
-            recordInstance(instance, "live")
-        end
-    end))
-
-    addConnection(game.DescendantRemoving:Connect(function(instance)
-        if tracked[instance] then
-            emit("instance_removing", {
-                path = safePath(instance),
-                class = safeClass(instance),
-                name = safeGet(instance, "Name"),
-                parent = safePath(safeGet(instance, "Parent")),
-                properties = snapshotProperties(instance),
-            })
-        end
-    end))
-
-    addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
-        if UserInputService:GetFocusedTextBox() then
-            return
-        end
-        emit("input_began", getInputDetails(inputObject, processed))
-    end))
-
-    addConnection(UserInputService.InputEnded:Connect(function(inputObject, processed)
-        if UserInputService:GetFocusedTextBox() then
-            return
-        end
-        emit("input_ended", getInputDetails(inputObject, processed))
-    end))
-
-    addConnection(Players.PlayerAdded:Connect(function(player)
-        emit("player_added", { name = player.Name, user_id = player.UserId, display_name = player.DisplayName })
-    end))
-
-    addConnection(Players.PlayerRemoving:Connect(function(player)
-        emit("player_removing", { name = player.Name, user_id = player.UserId })
-    end))
-
-    addConnection(LocalPlayer.CharacterAdded:Connect(function(character)
-        emit("local_character_added", { path = safePath(character), name = character.Name })
-        recordInstance(character, "character_added", true)
-        for _, descendant in ipairs(character:GetDescendants()) do
-            recordInstance(descendant, "character_added", true)
-        end
-    end))
-
-    addConnection(LocalPlayer.CharacterRemoving:Connect(function(character)
-        emit("local_character_removing", { path = safePath(character), name = character.Name })
-    end))
-end
-
-local function getGuiParent()
-    if type(gethui) == "function" then
-        local ok, result = pcall(gethui)
-        if ok and result then
-            return result
-        end
-    end
-
-    local ok, coreGui = pcall(function()
-        return game:GetService("CoreGui")
-    end)
-    if ok and coreGui then
-        return coreGui
-    end
-
-    return LocalPlayer:WaitForChild("PlayerGui")
-end
-
-local function makeUiObject(className, properties, parent)
+local function make(className, properties, parent)
     local object = Instance.new(className)
     for property, value in pairs(properties or {}) do
         pcall(function()
@@ -1302,646 +163,752 @@ local function makeUiObject(className, properties, parent)
     return object
 end
 
-local function roundUi(object, radius)
-    makeUiObject("UICorner", { CornerRadius = UDim.new(0, radius or 7) }, object)
+local function round(object, radius)
+    make("UICorner", {
+        CornerRadius = UDim.new(0, radius or 8),
+    }, object)
 end
 
-local function makeUiButton(parent, text, x, width, color)
-    local button = makeUiObject("TextButton", {
-        Position = UDim2.fromOffset(x, 0),
-        Size = UDim2.fromOffset(width, 28),
-        BackgroundColor3 = color,
-        BorderSizePixel = 0,
-        Active = true,
-        Selectable = false,
-        AutoButtonColor = true,
-        Font = Enum.Font.GothamBold,
-        Text = text,
-        TextColor3 = Color3.fromRGB(238, 242, 249),
-        TextSize = 10,
-    }, parent)
-    roundUi(button, 6)
-    return button
+local function getGuiParent()
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok and hidden then
+            return hidden
+        end
+    end
+    return PlayerGui
 end
 
-local function createUi()
-    gui = makeUiObject("ScreenGui", {
-        Name = "CU_FullSessionRecorder_v13",
+local function createGui()
+    local parent = getGuiParent()
+    local old = parent:FindFirstChild("CUAutoBreakthrough_v01")
+    if old then
+        pcall(function()
+            old:Destroy()
+        end)
+    end
+
+    gui = make("ScreenGui", {
+        Name = "CUAutoBreakthrough_v01",
         ResetOnSpawn = false,
-        IgnoreGuiInset = true,
+        IgnoreGuiInset = false,
+        DisplayOrder = 999900,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-        DisplayOrder = 20,
-    }, getGuiParent())
-    sharedEnv.__CURecorderGui = gui
+    }, parent)
 
-    local main = makeUiObject("Frame", {
-        Name = "Main",
-        Position = UDim2.new(1, -400, 0, 12),
-        Size = UDim2.fromOffset(388, 126),
-        BackgroundColor3 = Color3.fromRGB(17, 21, 29),
+    panel = make("Frame", {
+        Name = "Panel",
+        AnchorPoint = Vector2.new(0, 0),
+        Position = UDim2.new(0, 14, 0, 82),
+        Size = UDim2.fromOffset(270, 116),
+        BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.08,
         BorderSizePixel = 0,
         Active = false,
         Selectable = false,
     }, gui)
-    roundUi(main, 9)
+    round(panel, 10)
 
-    local header = makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(10, 6),
-        Size = UDim2.new(1, -20, 0, 20),
+    make("TextLabel", {
+        Position = UDim2.fromOffset(11, 7),
+        Size = UDim2.new(1, -22, 0, 19),
         BackgroundTransparency = 1,
-        Active = false,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND | SESSION RECORDER v1.3",
-        TextColor3 = Color3.fromRGB(238, 242, 249),
+        Text = "CU AUTO BREAKTHROUGH  v0.1",
+        TextColor3 = COLORS.text,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Active = false,
+    }, panel)
+
+    modeLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 29),
+        Size = UDim2.new(1, -22, 0, 16),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "Mode: waiting for cultivation UI",
+        TextColor3 = COLORS.qi,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Active = false,
+    }, panel)
+
+    progressLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 47),
+        Size = UDim2.new(1, -22, 0, 15),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Progress: --",
+        TextColor3 = COLORS.text,
         TextSize = 10,
         TextXAlignment = Enum.TextXAlignment.Left,
-    }, main)
-
-    ui.status = makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(10, 30),
-        Size = UDim2.new(1, -20, 0, 20),
-        BackgroundTransparency = 1,
         Active = false,
-        Font = Enum.Font.GothamBold,
-        Text = "CHECKING STORAGE...",
-        TextColor3 = Color3.fromRGB(117, 214, 153),
+    }, panel)
+
+    statusLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 64),
+        Size = UDim2.new(1, -22, 0, 15),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Waiting...",
+        TextColor3 = COLORS.muted,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Active = false,
+    }, panel)
+
+    trialLabel = make("TextLabel", {
+        Position = UDim2.fromOffset(11, 80),
+        Size = UDim2.new(1, -22, 0, 14),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Trial: idle",
+        TextColor3 = COLORS.warning,
         TextSize = 9,
         TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-    }, main)
-
-    ui.path = makeUiObject("TextLabel", {
-        Position = UDim2.fromOffset(10, 51),
-        Size = UDim2.new(1, -20, 0, 17),
-        BackgroundTransparency = 1,
         Active = false,
-        Font = Enum.Font.Code,
-        Text = outputFolder .. "/" .. baseName,
-        TextColor3 = Color3.fromRGB(164, 176, 195),
-        TextSize = 8,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-    }, main)
+    }, panel)
 
-    local row = makeUiObject("Frame", {
-        Position = UDim2.fromOffset(10, 82),
-        Size = UDim2.new(1, -20, 0, 28),
-        BackgroundTransparency = 1,
-        Active = false,
-    }, main)
+    local function makeButton(text, x, width, color)
+        local button = make("TextButton", {
+            Position = UDim2.fromOffset(x, 96),
+            Size = UDim2.fromOffset(width, 16),
+            BackgroundColor3 = color or COLORS.panel2,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+            Font = Enum.Font.GothamBold,
+            Text = text,
+            TextColor3 = COLORS.text,
+            TextSize = 9,
+            Active = true,
+            Selectable = true,
+        }, panel)
+        round(button, 5)
+        return button
+    end
 
-    ui.pause = makeUiButton(row, "PAUSE", 0, 66, Color3.fromRGB(65, 77, 99))
-    ui.flush = makeUiButton(row, "FLUSH", 72, 66, Color3.fromRGB(65, 77, 99))
-    ui.export = makeUiButton(row, "EXPORT & STOP", 144, 112, Color3.fromRGB(54, 125, 91))
-    ui.hide = makeUiButton(row, "HIDE", 262, 66, Color3.fromRGB(45, 53, 68))
+    autoButton = makeButton("AUTO: ON", 10, 75, COLORS.success)
+    pauseButton = makeButton("PAUSE", 91, 75, COLORS.panel2)
+    local hideButton = makeButton("HIDE", 172, 42, COLORS.panel2)
+    local stopButton = makeButton("STOP", 218, 42, COLORS.danger)
 
-    addUiConnection(ui.pause.MouseButton1Click:Connect(function()
-        if not running then return end
-        if paused then
-            paused = false
-            emit("recording_resumed", { reason = "ui_button" }, true)
-            ui.pause.Text = "PAUSE"
-        else
-            emit("recording_paused", { reason = "ui_button" }, true)
-            paused = true
-            ui.pause.Text = "RESUME"
+    addConnection(autoButton.MouseButton1Click, function()
+        autoEnabled = not autoEnabled
+        autoButton.Text = autoEnabled and "AUTO: ON" or "AUTO: OFF"
+        autoButton.BackgroundColor3 = autoEnabled and COLORS.success or COLORS.panel2
+        setStatus(autoEnabled and "Automation enabled." or "Automation disabled.", autoEnabled and COLORS.success or COLORS.warning)
+    end)
+
+    addConnection(pauseButton.MouseButton1Click, function()
+        paused = not paused
+        pauseButton.Text = paused and "RESUME" or "PAUSE"
+        pauseButton.BackgroundColor3 = paused and COLORS.warning or COLORS.panel2
+        setStatus(paused and "Paused; no clicks will be sent." or "Resumed.", paused and COLORS.warning or COLORS.success)
+    end)
+
+    addConnection(hideButton.MouseButton1Click, function()
+        if panel then
+            panel.Visible = false
         end
-        updateStatus()
-    end))
+    end)
 
-    addUiConnection(ui.flush.MouseButton1Click:Connect(function()
-        emit("manual_flush_requested", { queued = #queue }, true)
-        flushQueue(true)
-        updateStatus("manual flush")
-    end))
-
-    addUiConnection(ui.export.MouseButton1Click:Connect(function()
-        if running then
-            stopRecorder("export_button")
-        end
-    end))
-
-    addUiConnection(ui.hide.MouseButton1Click:Connect(function()
-        if gui then
-            gui.Enabled = false
-        end
-    end))
+    addConnection(stopButton.MouseButton1Click, function()
+        stop("stop button")
+    end)
 end
 
-local function trialIsActive()
-    for _, instance in ipairs(trialObjects) do
-        if instance and safeGet(instance, "Parent") then
-            if safeIsA(instance, "GuiObject") and safeGet(instance, "Visible") == true and isEffectivelyVisible(instance) then
-                return true
-            end
-            if safeIsA(instance, "LayerCollector") and safeGet(instance, "Enabled") == true then
-                -- A visible child will confirm activity; this only keeps the root tracked.
+local function parsePercent(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+    local number = string.match(text, "([%d%.]+)%s*%%")
+    return tonumber(number)
+end
+
+local function ratioPercent(current, maximum)
+    current = tonumber(current)
+    maximum = tonumber(maximum)
+    if not current or not maximum or maximum <= 0 then
+        return nil
+    end
+    return math.clamp((current / maximum) * 100, 0, 100)
+end
+
+local function getActiveMode()
+    local cultivationGui = PlayerGui:FindFirstChild("CultivationGui")
+    local statusPanel = cultivationGui and cultivationGui:FindFirstChild("StatusPanel")
+    if not statusPanel then
+        return nil
+    end
+
+    local mainFrame = statusPanel:FindFirstChild("MainFrame")
+    local bodyFrame = statusPanel:FindFirstChild("BodyFrame")
+    local mainVisible = mainFrame and mainFrame.Visible
+    local bodyVisible = bodyFrame and bodyFrame.Visible
+
+    if mainVisible and not bodyVisible then
+        return "Qi", mainFrame, statusPanel
+    end
+    if bodyVisible and not mainVisible then
+        return "Body", bodyFrame, statusPanel
+    end
+
+    if mainVisible and bodyVisible then
+        if bodyState and bodyState.isPushingUp and not (qiState and qiState.isMeditating) then
+            return "Body", bodyFrame, statusPanel
+        end
+        if qiState and qiState.isMeditating then
+            return "Qi", mainFrame, statusPanel
+        end
+    end
+
+    return nil
+end
+
+local function getModeProgress(mode, frame)
+    local label
+    local fill
+    local state
+
+    if mode == "Qi" then
+        label = frame:FindFirstChild("ProgressLabel")
+        local block = frame:FindFirstChild("Block")
+        local bar = block and block:FindFirstChild("QiBarFrame")
+        fill = bar and bar:FindFirstChild("QiBarFill")
+        state = qiState
+    else
+        label = frame:FindFirstChild("BodyProgressLabel")
+        local block = frame:FindFirstChild("Block")
+        local bar = block and block:FindFirstChild("BodyBarFrame")
+        fill = bar and bar:FindFirstChild("BodyBarFill")
+        state = bodyState
+    end
+
+    -- Use the most conservative live reading if multiple sources exist.
+    -- This avoids a stale 100% label causing a second click after a reset.
+    local percent = nil
+    local function includePercent(value)
+        if type(value) == "number" then
+            value = math.clamp(value, 0, 100)
+            if percent == nil or value < percent then
+                percent = value
             end
         end
+    end
+
+    if label then
+        includePercent(parsePercent(label.Text))
+    end
+
+    if fill then
+        local ok, scale = pcall(function()
+            return fill.Size.X.Scale
+        end)
+        if ok and type(scale) == "number" then
+            includePercent(scale * 100)
+        end
+    end
+
+    if state then
+        if mode == "Qi" then
+            includePercent(ratioPercent(state.qi, state.maxQi))
+        else
+            includePercent(ratioPercent(state.bodyExp, state.maxBodyExp))
+        end
+    end
+
+    local realmName
+    local layer
+    if mode == "Qi" then
+        realmName = state and (state.realmName or tostring(state.realm or "Qi")) or "Qi"
+        layer = state and state.layer or nil
+    else
+        realmName = state and (state.bodyRealmName or tostring(state.bodyRealm or "Body")) or "Body"
+        layer = state and state.bodyLayer or nil
+    end
+
+    if not layer then
+        local layerLabel = frame:FindFirstChild("LayerLabel") or frame:FindFirstChild("BodyLayerLabel")
+        if layerLabel and type(layerLabel.Text) == "string" then
+            layer = string.match(layerLabel.Text, "Layer%s+(%d+)")
+        end
+    end
+
+    local signature = mode .. ":" .. tostring(realmName) .. ":" .. tostring(layer or "?")
+    return percent, signature
+end
+
+local function isGold(color)
+    if not color then
+        return false
+    end
+    return color.R >= 0.90 and color.G >= 0.75 and color.B <= 0.65
+end
+
+local function getScoreInfo(trialGui)
+    local header = trialGui:FindFirstChild("TrialHeader", true)
+    local scorePill = header and header:FindFirstChild("ScorePill", true)
+    local scoreObject = scorePill and scorePill:FindFirstChild("Score", true)
+    local scoreText = scoreObject and scoreObject.Text or nil
+
+    if not scoreText then
+        for _, descendant in ipairs(trialGui:GetDescendants()) do
+            if descendant:IsA("TextLabel") then
+                local text = descendant.Text
+                if type(text) == "string" and string.match(text, "%d+%s*/%s*%d+%s*hits") then
+                    scoreText = text
+                    break
+                end
+            end
+        end
+    end
+
+    if type(scoreText) ~= "string" then
+        return nil, nil, nil
+    end
+
+    local current, required = string.match(scoreText, "(%d+)%s*/%s*(%d+)")
+    return tonumber(current), tonumber(required), scoreText
+end
+
+local function isTrialRootActive(candidate)
+    if candidate:IsA("ScreenGui") then
+        return candidate.Enabled
+    end
+    if candidate:IsA("GuiObject") then
+        return candidate.Visible
     end
     return false
 end
 
-local TRIAL_SAMPLE_PROPERTIES = {
-    "Visible", "Active", "Selectable", "Position", "Size", "AbsolutePosition", "AbsoluteSize",
-    "BackgroundColor3", "BackgroundTransparency", "ImageColor3", "ImageTransparency", "Image",
-    "Rotation", "Text", "TextColor3", "TextTransparency", "TextSize", "ZIndex",
-    "Color", "Thickness", "Transparency", "Offset", "Scale", "Enabled",
-}
-
-local function sampleTrialFrame()
-    if not running or paused then
-        return
+local function getActiveTrialGui()
+    local mode = lastMode
+    local names
+    if mode == "Body" then
+        names = {"BodyTrialGui", "BreakthroughMG"}
+    else
+        names = {"BreakthroughMG", "BodyTrialGui"}
     end
-    local now = os.clock()
-    if now - lastTrialSample < (1 / CONFIG.TRIAL_SAMPLE_HZ) then
-        return
-    end
-    lastTrialSample = now
 
-    local active = trialIsActive()
-    if now - lastTrialPrune >= 1 then
-        lastTrialPrune = now
-        for index = #trialObjects, 1, -1 do
-            local instance = trialObjects[index]
-            if not instance or not safeGet(instance, "Parent") then
-                if instance then
-                    trialSet[instance] = nil
-                    trialSampleCache[instance] = nil
-                end
-                table.remove(trialObjects, index)
+    for _, name in ipairs(names) do
+        local candidate = PlayerGui:FindFirstChild(name)
+        if candidate and isTrialRootActive(candidate) then
+            if candidate:FindFirstChild("TrialHeader", true) then
+                return candidate
             end
         end
     end
 
-    if active and not trialWasActive then
-        trialWasActive = true
-        trialFrame = 0
-        emit("trial_ui_became_active", { tracked_objects = #trialObjects })
-    elseif not active and trialWasActive then
-        trialWasActive = false
-        emit("trial_ui_became_inactive", { tracked_objects = #trialObjects })
-    end
-
-    if not active then
-        return
-    end
-
-    trialFrame = trialFrame + 1
-    for _, instance in ipairs(trialObjects) do
-        if instance and safeGet(instance, "Parent") then
-            local className = safeClass(instance)
-            local isSampleClass = safeIsA(instance, "GuiObject")
-                or className == "UIStroke" or className == "UIGradient" or className == "UIScale"
-            if isSampleClass then
-                local properties = {}
-                for _, property in ipairs(TRIAL_SAMPLE_PROPERTIES) do
-                    local value = safeGet(instance, property)
-                    if value ~= nil then
-                        properties[property] = normalize(value)
-                    end
-                end
-                if next(properties) ~= nil then
-                    local ok, signature = pcall(function()
-                        return HttpService:JSONEncode(properties)
-                    end)
-                    if ok and trialSampleCache[instance] ~= signature then
-                        trialSampleCache[instance] = signature
-                        emit("trial_visual_sample", {
-                            frame = trialFrame,
-                            path = safePath(instance),
-                            class = className,
-                            properties = properties,
-                        })
-                    end
-                end
+    for _, child in ipairs(PlayerGui:GetChildren()) do
+        if child:IsA("ScreenGui") and child.Enabled and string.find(string.lower(child.Name), "trial") then
+            if child:FindFirstChild("TrialHeader", true) then
+                return child
             end
         end
     end
+
+    return nil
 end
 
-local function collectCheckpoint()
-    local snapshot = {
-        player = {
-            name = LocalPlayer.Name,
-            display_name = LocalPlayer.DisplayName,
-            user_id = LocalPlayer.UserId,
-            account_age_days = LocalPlayer.AccountAge,
-            attributes = getAttributes(LocalPlayer),
-        },
-        values = {},
-        gui_text = {},
-        tools = {},
-    }
-
-    local descendants = {}
-    local ok, result = pcall(function()
-        return LocalPlayer:GetDescendants()
-    end)
-    if ok then
-        descendants = result
+local function getLatestPrompt(trialGui)
+    local prompts = {}
+    local function consider(object)
+        local number = string.match(object.Name, "^Prompt(%d+)$")
+        if number and (object:IsA("CanvasGroup") or object:IsA("Frame")) then
+            table.insert(prompts, {
+                number = tonumber(number),
+                object = object,
+            })
+        end
     end
 
-    for _, instance in ipairs(descendants) do
-        if safeIsA(instance, "ValueBase") and #snapshot.values < 350 then
-            table.insert(snapshot.values, {
-                path = safePath(instance),
-                class = safeClass(instance),
-                value = safeGet(instance, "Value"),
-            })
-        elseif safeIsA(instance, "Tool") and #snapshot.tools < 100 then
-            table.insert(snapshot.tools, {
-                path = safePath(instance),
-                name = safeGet(instance, "Name"),
-                enabled = safeGet(instance, "Enabled"),
-                tooltip = safeGet(instance, "ToolTip"),
-            })
-        elseif (safeIsA(instance, "TextLabel") or safeIsA(instance, "TextButton")) and #snapshot.gui_text < 450 then
-            local text = safeGet(instance, "Text")
-            local path = safePath(instance)
-            if type(text) == "string" and text ~= "" and (pathContainsAny(path, MECHANIC_WORDS) or pathContainsAny(text, MECHANIC_WORDS)) then
-                table.insert(snapshot.gui_text, {
-                    path = path,
-                    text = truncateString(text, 500),
-                    visible = safeGet(instance, "Visible"),
+    for _, child in ipairs(trialGui:GetChildren()) do
+        consider(child)
+    end
+
+    if #prompts == 0 then
+        for _, descendant in ipairs(trialGui:GetDescendants()) do
+            consider(descendant)
+        end
+    end
+
+    -- Fallback for the Body trial variant if its prompt container is named
+    -- differently but still contains the same Ring / Seal / Tap controls.
+    if #prompts == 0 then
+        for _, descendant in ipairs(trialGui:GetDescendants()) do
+            local ring = descendant:FindFirstChild("Ring")
+            local seal = descendant:FindFirstChild("Seal")
+            local isPromptContainer = descendant:IsA("CanvasGroup") or descendant:IsA("Frame")
+            if isPromptContainer and ring and seal then
+                local number = tonumber(string.match(descendant.Name, "%d+")) or (#prompts + 1)
+                table.insert(prompts, {
+                    number = number,
+                    object = descendant,
                 })
             end
         end
     end
 
-    local character = LocalPlayer.Character
-    if character then
-        local humanoid = character:FindFirstChildOfClass("Humanoid")
-        local root = character:FindFirstChild("HumanoidRootPart")
-        snapshot.character = {
-            name = character.Name,
-            humanoid = humanoid and {
-                health = humanoid.Health,
-                max_health = humanoid.MaxHealth,
-                walk_speed = humanoid.WalkSpeed,
-                jump_power = humanoid.JumpPower,
-                state = tostring(humanoid:GetState()),
-            } or nil,
-            root_position = root and normalize(root.Position) or nil,
-            root_cframe = root and normalize(root.CFrame) or nil,
-        }
+    table.sort(prompts, function(a, b)
+        return a.number < b.number
+    end)
+
+    for index = #prompts, 1, -1 do
+        local prompt = prompts[index].object
+        if prompt.Visible then
+            return prompts[index].number, prompt
+        end
     end
 
-    return snapshot
+    return nil, nil
 end
 
-local function checkpoint()
-    if not running or paused then
-        return
+local function clickGuiButton(button)
+    if not button or not button:IsA("GuiButton") then
+        return false, "not a GuiButton"
     end
-    local snapshot = collectCheckpoint()
-    local ok, signature = pcall(function()
-        return HttpService:JSONEncode(snapshot)
+    if not button.Visible or not button.Active then
+        return false, "button not visible/active"
+    end
+
+    local position = button.AbsolutePosition
+    local size = button.AbsoluteSize
+    local x = math.floor(position.X + size.X / 2 + 0.5)
+    local y = math.floor(position.Y + size.Y / 2 + 0.5)
+
+    -- Preferred: actual simulated left mouse click at the button center.
+    local okVim, vimError = pcall(function()
+        local virtualInput = game:GetService("VirtualInputManager")
+        virtualInput:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.delay(0.025, function()
+            pcall(function()
+                virtualInput:SendMouseButtonEvent(x, y, 0, false, game, 0)
+            end)
+        end)
     end)
-    if ok then
-        if checkpointSignatures.last ~= signature then
-            checkpointSignatures.last = signature
-            emit("player_checkpoint", snapshot)
+    if okVim then
+        return true, "VirtualInputManager"
+    end
+
+    -- Executor mouse API fallback.
+    if type(mousemoveabs) == "function" and type(mouse1click) == "function" then
+        local okMouse = pcall(function()
+            mousemoveabs(x, y)
+            mouse1click()
+        end)
+        if okMouse then
+            return true, "executor mouse1click"
+        end
+    end
+
+    -- Roblox GuiButton activation fallback.
+    local okActivate = pcall(function()
+        button:Activate()
+    end)
+    if okActivate then
+        return true, "GuiButton:Activate"
+    end
+
+    -- Signal fallback for executors that expose firesignal.
+    if type(firesignal) == "function" then
+        local okSignal = pcall(function()
+            firesignal(button.Activated)
+        end)
+        if okSignal then
+            return true, "firesignal(Activated)"
+        end
+    end
+
+    return false, tostring(vimError or "no supported click backend")
+end
+
+local function processTrial()
+    local trialGui = getActiveTrialGui()
+    if not trialGui then
+        if activeTrialGui then
+            activeTrialGui = nil
+            attemptedPrompts = {}
+            previousRingSizes = {}
+            lastTrialScore = nil
+            lastTrialRequired = nil
+            lastPrompt1Ref = nil
+            lastTrialText = "Trial: idle"
+        end
+        return false
+    end
+
+    if activeTrialGui ~= trialGui then
+        activeTrialGui = trialGui
+        attemptedPrompts = {}
+        previousRingSizes = {}
+        lastTrialScore = nil
+        lastTrialRequired = nil
+        lastPrompt1Ref = nil
+        lastTrialText = "Trial detected: " .. trialGui.Name
+        setStatus("Tribulation detected; tracking timing ring.", COLORS.warning)
+    end
+
+    local current, required, scoreText = getScoreInfo(trialGui)
+    if current == nil or required == nil then
+        lastTrialText = "Trial active; waiting for score UI"
+        return true
+    end
+
+    if lastTrialRequired ~= nil and (required ~= lastTrialRequired or (lastTrialScore ~= nil and current < lastTrialScore)) then
+        attemptedPrompts = {}
+        previousRingSizes = {}
+    end
+    local prompt1Ref = trialGui:FindFirstChild("Prompt1") or trialGui:FindFirstChild("Prompt1", true)
+    if lastPrompt1Ref ~= nil and prompt1Ref ~= nil and prompt1Ref ~= lastPrompt1Ref then
+        attemptedPrompts = {}
+        previousRingSizes = {}
+    end
+    if prompt1Ref ~= nil then
+        lastPrompt1Ref = prompt1Ref
+    end
+
+    lastTrialRequired = required
+    lastTrialScore = current
+
+    lastTrialText = "Trial: " .. tostring(current) .. "/" .. tostring(required) .. " hits"
+    if current >= required then
+        setStatus("Required hits reached; waiting for breakthrough result.", COLORS.success)
+        return true
+    end
+
+    local promptNumber, prompt = getLatestPrompt(trialGui)
+    if not promptNumber or not prompt then
+        setStatus("Trial active; waiting for next prompt.", COLORS.warning)
+        return true
+    end
+
+    local promptKey = trialGui.Name .. ":Prompt" .. tostring(promptNumber)
+    if attemptedPrompts[promptKey] then
+        setStatus("Prompt " .. tostring(promptNumber) .. " already clicked; waiting for next.", COLORS.muted)
+        return true
+    end
+
+    local ring = prompt:FindFirstChild("Ring")
+    local seal = prompt:FindFirstChild("Seal")
+    local tap = seal and seal:FindFirstChild("Tap")
+
+    if not ring or not seal or not tap or not tap:IsA("GuiButton") then
+        setStatus("Prompt " .. tostring(promptNumber) .. ": expected Ring/Seal/Tap not found.", COLORS.warning)
+        return true
+    end
+
+    if not prompt.Visible or not ring.Visible or not seal.Visible or not tap.Visible or not tap.Active then
+        return true
+    end
+
+    local ringSize = ring.AbsoluteSize.X
+    local sealSize = seal.AbsoluteSize.X
+    if ringSize <= 0 or sealSize <= 0 then
+        return true
+    end
+
+    local previous = previousRingSizes[promptKey]
+    local shrinking = previous ~= nil and ringSize < previous - 0.1
+    previousRingSizes[promptKey] = ringSize
+
+    local ratio = ringSize / sealSize
+    local stroke = ring:FindFirstChildOfClass("UIStroke")
+    local gold = true
+    if stroke then
+        gold = isGold(stroke.Color) and stroke.Transparency <= 0.16
+    end
+
+    -- The recorded successful clicks landed when the ring was about the same
+    -- size as the 90px target seal (roughly 1.00-1.03x). The gold stroke is an
+    -- approach indicator; size alignment prevents clicking too early.
+    local aligned = ratio >= 0.97 and ratio <= 1.025
+
+    if gold and aligned and shrinking then
+        local sent, backend = clickGuiButton(tap)
+        if sent then
+            attemptedPrompts[promptKey] = true
+            setStatus(
+                "Clicked Prompt " .. tostring(promptNumber)
+                    .. " at " .. string.format("%.3fx", ratio)
+                    .. " (" .. backend .. ").",
+                COLORS.success
+            )
+            print("[CU AutoBreakthrough] Trial click: " .. promptKey .. " ratio=" .. string.format("%.3f", ratio))
         else
-            emit("checkpoint_heartbeat", { unchanged = true })
+            setStatus("Click failed: " .. tostring(backend), COLORS.danger)
         end
     else
-        emit("checkpoint_error", { error = tostring(signature) })
+        local phase = gold and "gold; waiting for alignment" or "waiting for gold ring"
+        setStatus(
+            "Prompt " .. tostring(promptNumber) .. " " .. phase
+                .. " (" .. string.format("%.2fx", ratio) .. ").",
+            COLORS.warning
+        )
     end
+
+    return true
 end
 
-local function sampleCharacterPosition()
-    if not running or paused then
+local function processBreakthrough()
+    local mode, frame, statusPanel = getActiveMode()
+    if not mode or not frame then
+        lastMode = "Unknown"
+        lastPercent = nil
         return
     end
+
+    lastMode = mode
+    local percent, signature = getModeProgress(mode, frame)
+    lastPercent = percent
+
+    if modeLabel then
+        modeLabel.Text = "Mode: " .. mode
+        modeLabel.TextColor3 = mode == "Qi" and COLORS.qi or COLORS.body
+    end
+    if progressLabel then
+        progressLabel.Text = "Progress: " .. (percent and string.format("%.2f%%", percent) or "--")
+    end
+
+    if not autoEnabled then
+        setStatus("Auto is OFF; monitoring only.", COLORS.muted)
+        return
+    end
+
+    if percent == nil or percent < 99.95 then
+        if percent then
+            setStatus("Cultivating; waiting for 100%.", COLORS.muted)
+        else
+            setStatus("Waiting for " .. mode .. " progress data.", COLORS.muted)
+        end
+        return
+    end
+
+    local row = statusPanel:FindFirstChild("BreakthroughRow")
+    local button = row and row:FindFirstChild("BreakthroughBanner")
+    if not button or not button:IsA("GuiButton") then
+        setStatus("100% reached; Breakthrough button not found.", COLORS.warning)
+        return
+    end
+    if not row.Visible or not button.Visible or not button.Active then
+        setStatus("100% reached; waiting for Breakthrough button to activate.", COLORS.warning)
+        return
+    end
+
     local now = os.clock()
-    if now - lastPositionSample < CONFIG.CHARACTER_POSITION_INTERVAL then
-        return
-    end
-    lastPositionSample = now
-
-    local character = LocalPlayer.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if not root then
-        return
+    if lastBreakthroughKey ~= signature then
+        lastBreakthroughKey = signature
+        lastBreakthroughAt = 0
+        breakthroughAttempts = 0
     end
 
-    local position = root.Position
-    if not lastCharacterPosition or (position - lastCharacterPosition).Magnitude >= CONFIG.CHARACTER_POSITION_MIN_DELTA then
-        lastCharacterPosition = position
-        emit("character_position", {
-            position = position,
-            cframe = root.CFrame,
-            velocity = root.AssemblyLinearVelocity,
-        })
-    end
-end
-
-local function scanInitial()
-    local playerDescendants = {}
-    local okPlayer, playerResult = pcall(function()
-        return LocalPlayer:GetDescendants()
-    end)
-    if okPlayer then
-        playerDescendants = playerResult
-    end
-
-    emit("initial_scan_started", {
-        local_player_descendants = #playerDescendants,
-        workspace_scan = "selective",
-        replicated_storage_scan = "remote_metadata_and_relevant_paths",
-    })
-
-    for index, instance in ipairs(playerDescendants) do
-        recordInstance(instance, "initial")
-        if index % 400 == 0 then
-            updateStatus("player snapshot " .. index .. "/" .. #playerDescendants)
-            task.wait()
-        end
-    end
-    recordInstance(LocalPlayer, "initial_root", true)
-
-    local character = LocalPlayer.Character
-    if character then
-        recordInstance(character, "initial_character", true)
-        local charDescendants = character:GetDescendants()
-        for index, instance in ipairs(charDescendants) do
-            recordInstance(instance, "initial_character")
-            if index % 300 == 0 then
-                task.wait()
-            end
-        end
-    end
-
-    local workspaceDescendants = {}
-    local okWorkspace, workspaceResult = pcall(function()
-        return workspace:GetDescendants()
-    end)
-    if okWorkspace then
-        workspaceDescendants = workspaceResult
-    end
-
-    for index, instance in ipairs(workspaceDescendants) do
-        if isRelevantInstance(instance) then
-            recordInstance(instance, "initial_workspace")
-        end
-        if index % 1200 == 0 then
-            updateStatus("world scan " .. index .. "/" .. #workspaceDescendants)
-            task.wait()
-        end
-    end
-
-    local replicatedDescendants = {}
-    local okReplicated, replicatedResult = pcall(function()
-        return ReplicatedStorage:GetDescendants()
-    end)
-    if okReplicated then
-        replicatedDescendants = replicatedResult
-    end
-    for index, instance in ipairs(replicatedDescendants) do
-        local className = safeClass(instance)
-        if className == "RemoteEvent" or className == "RemoteFunction" or pathContainsAny(safePath(instance), MECHANIC_WORDS) then
-            recordInstance(instance, "initial_replicated_storage", true)
-        end
-        if index % 600 == 0 then
-            task.wait()
-        end
-    end
-
-    local firstDescendants = {}
-    local okFirst, firstResult = pcall(function()
-        return ReplicatedFirst:GetDescendants()
-    end)
-    if okFirst then
-        firstDescendants = firstResult
-    end
-    for index, instance in ipairs(firstDescendants) do
-        local className = safeClass(instance)
-        if className == "RemoteEvent" or className == "RemoteFunction" or pathContainsAny(safePath(instance), MECHANIC_WORDS) then
-            recordInstance(instance, "initial_replicated_first", true)
-        end
-        if index % 600 == 0 then
-            task.wait()
-        end
-    end
-
-    emit("initial_scan_finished", {
-        player_descendants = #playerDescendants,
-        workspace_descendants_examined = #workspaceDescendants,
-        replicated_storage_descendants_examined = #replicatedDescendants,
-        replicated_first_descendants_examined = #firstDescendants,
-        tracked_instances = totalInstances,
-        trial_objects = #trialObjects,
-    })
-    initialScanComplete = true
-end
-
-local function stopRecorder(reason)
-    if stopping or not running then
-        return
-    end
-    stopping = true
-
-    emit("session_stop", {
-        reason = reason or "manual",
-        total_events_before_stop = totalEvents,
-        total_instances = totalInstances,
-        elapsed_seconds = math.floor((os.clock() - startedClock) * 1000) / 1000,
-        dropped_events = droppedEvents,
-    }, true)
-
-    running = false
-    sharedEnv.__CURecorderStop = nil
-    sharedEnv.__CURecorderNeedsFlush = nil
-
-    for _, connection in ipairs(connections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    connections = {}
-    for _, connection in ipairs(uiConnections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    uiConnections = {}
-
-    while flushing do
-        task.wait(0.05)
-    end
-
-    flushQueue(true)
-    if storageMode == "segments" and segmentBuffer ~= "" then
-        local content = segmentBuffer
-        local ok, err = writeNewSegment(content)
-        if ok then
-            segmentBuffer = ""
+    if breakthroughAttempts == 0 or (breakthroughAttempts == 1 and now - lastBreakthroughAt >= 2.5) then
+        local sent, backend = clickGuiButton(button)
+        breakthroughAttempts = breakthroughAttempts + 1
+        lastBreakthroughAt = now
+        if sent then
+            setStatus(
+                mode .. " at 100%; clicked Breakthrough (attempt " .. tostring(breakthroughAttempts) .. ").",
+                COLORS.success
+            )
+            print("[CU AutoBreakthrough] " .. mode .. " 100% -> Breakthrough click, " .. signature .. " via " .. backend)
         else
-            storageError = "Final segment write failed: " .. tostring(err)
+            setStatus("Breakthrough click failed (attempt " .. tostring(breakthroughAttempts) .. "): " .. tostring(backend), COLORS.danger)
         end
-    end
-
-    writeManifest(true)
-
-    local saved = storageMode == "append" or (storageMode == "segments" and #partPaths > 0)
-    local message = saved and "EXPORTED - upload every part + manifest" or "EXPORT FAILED - check executor file APIs"
-    updateStatus(message)
-
-    if ui.export then
-        pcall(function()
-            ui.export.Text = saved and "EXPORTED" or "NO FILE"
-            ui.export.Active = false
-        end)
-    end
-    if ui.pause then
-        pcall(function()
-            ui.pause.Text = "STOPPED"
-            ui.pause.Active = false
-        end)
-    end
-
-    warn("[CU Recorder] Stopped. Events=" .. tostring(totalEvents)
-        .. " Instances=" .. tostring(totalInstances)
-        .. " Parts=" .. tostring(#partPaths)
-        .. " Bytes=" .. tostring(totalBytes))
-    warn("[CU Recorder] Output folder: " .. tostring(outputFolder))
-    warn("[CU Recorder] Manifest: " .. tostring(manifestPath))
-    if storageError then
-        warn("[CU Recorder] Storage note: " .. tostring(storageError))
-    end
-end
-
-sharedEnv.__CURecorderStop = stopRecorder
-
-local function togglePause(reason)
-    if not running then
-        return
-    end
-    if paused then
-        paused = false
-        emit("recording_resumed", { reason = reason or "hotkey" }, true)
-        if ui.pause then ui.pause.Text = "PAUSE" end
     else
-        emit("recording_paused", { reason = reason or "hotkey" }, true)
-        paused = true
-        if ui.pause then ui.pause.Text = "RESUME" end
+        setStatus("Breakthrough click sent; waiting for layer/realm update or tribulation.", COLORS.warning)
     end
-    updateStatus()
 end
 
-local function connectHotkeys()
-    addConnection(UserInputService.InputBegan:Connect(function(inputObject, processed)
-        if processed or UserInputService:GetFocusedTextBox() then
-            return
-        end
-        local key = safeGet(inputObject, "KeyCode")
-        local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
-            or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
-        if not ctrl then
-            return
-        end
-        if key == Enum.KeyCode.Home then
-            if gui then gui.Enabled = not gui.Enabled end
-        elseif key == Enum.KeyCode.End then
-            stopRecorder("emergency_hotkey")
-        elseif key == Enum.KeyCode.P then
-            togglePause("hotkey")
-        elseif key == Enum.KeyCode.F then
-            emit("manual_flush_requested", { queued = #queue }, true)
-            flushQueue(true)
-        end
-    end))
-end
-
-local function main()
-    local uiOk, uiError = pcall(createUi)
-    if not uiOk then
-        warn("[CU Recorder] GUI creation failed: " .. tostring(uiError))
+-- Read replicated cultivation state without modifying or intercepting remotes.
+do
+    local eventsFolder = ReplicatedStorage:FindFirstChild("CultivationEvents")
+    if not eventsFolder then
+        pcall(function()
+            eventsFolder = ReplicatedStorage:WaitForChild("CultivationEvents", 8)
+        end)
     end
 
-    local storageOk = initializeStorage()
-    if not storageOk then
-        if ui.status then
-            ui.status.Text = "STORAGE UNAVAILABLE - RECORDING NOT STARTED"
-            ui.status.TextColor3 = Color3.fromRGB(235, 110, 110)
+    if eventsFolder then
+        local qiRemote = eventsFolder:FindFirstChild("UpdateClient")
+        if qiRemote and qiRemote:IsA("RemoteEvent") then
+            addConnection(qiRemote.OnClientEvent, function(data)
+                if type(data) == "table" then
+                    qiState = data
+                end
+            end)
         end
-        warn("[CU Recorder] " .. tostring(storageError))
-        running = false
-        sharedEnv.__CURecorderStop = nil
+
+        local bodyRemote = eventsFolder:FindFirstChild("UpdateBodyClient")
+        if bodyRemote and bodyRemote:IsA("RemoteEvent") then
+            addConnection(bodyRemote.OnClientEvent, function(data)
+                if type(data) == "table" then
+                    bodyState = data
+                end
+            end)
+        end
+    end
+end
+
+createGui()
+
+-- Keyboard controls:
+-- RightCtrl + Home: show/hide panel
+-- RightCtrl + P: pause/resume
+-- RightCtrl + End: stop script
+addConnection(UserInputService.InputBegan, function(input, gameProcessed)
+    if gameProcessed or not running then
+        return
+    end
+    if not UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
         return
     end
 
-    emit("session_start", {
-        recorder = "Cultivation Unbound Full Session Recorder",
-        version = "1.3",
-        place_id = game.PlaceId,
-        game_id = game.GameId,
-        job_id = game.JobId,
-        creator_id = game.CreatorId,
-        player_name = LocalPlayer.Name,
-        display_name = LocalPlayer.DisplayName,
-        user_id = LocalPlayer.UserId,
-        account_age_days = LocalPlayer.AccountAge,
-        started_unix = startedUnix,
-        output_folder = outputFolder,
-        manifest_path = manifestPath,
-        storage_mode = storageMode,
-        config = CONFIG,
-        capability = {
-            inbound_remote_events = CONFIG.LOG_RELEVANT_INBOUND_REMOTES or CONFIG.LOG_ALL_INBOUND_REMOTES,
-            outbound_remote_events = false,
-            outbound_remote_reason = "No namecall/metamethod hook installed; avoided to protect input and game stability",
-            mouse_move_logging = false,
-            chat_content_logging = false,
-        },
-    })
-
-    connectGlobalSignals()
-    connectHotkeys()
-
-    task.spawn(function()
-        while running do
-            task.wait(CONFIG.FLUSH_INTERVAL)
-            if #queue > 0 or flushRequested then
-                flushRequested = false
-                flushQueue(false)
-            elseif storageMode == "segments" and segmentBuffer ~= "" and os.clock() - segmentLastWrite >= CONFIG.WRITEFILE_SEGMENT_SECONDS then
-                flushQueue(false)
-            end
-            updateStatus()
+    if input.KeyCode == Enum.KeyCode.Home then
+        if panel then
+            panel.Visible = not panel.Visible
         end
-    end)
+    elseif input.KeyCode == Enum.KeyCode.P then
+        paused = not paused
+        if pauseButton then
+            pauseButton.Text = paused and "RESUME" or "PAUSE"
+            pauseButton.BackgroundColor3 = paused and COLORS.warning or COLORS.panel2
+        end
+        setStatus(paused and "Paused; no clicks will be sent." or "Resumed.", paused and COLORS.warning or COLORS.success)
+    elseif input.KeyCode == Enum.KeyCode.End then
+        stop("RightCtrl+End")
+    end
+end)
 
-    task.spawn(function()
-        while running do
-            task.wait(CONFIG.CHECKPOINT_INTERVAL)
-            if running and not paused then
-                checkpoint()
-                writeManifest(false)
+-- High-frequency trial timing + low-cost cultivation checks.
+local frameCounter = 0
+addConnection(RunService.RenderStepped, function()
+    if not running or paused then
+        return
+    end
+
+    frameCounter = frameCounter + 1
+    local ok, trialActiveOrError = pcall(processTrial)
+    if not ok then
+        lastError = tostring(trialActiveOrError)
+        setStatus("Trial monitor error: " .. lastError, COLORS.danger)
+        return
+    end
+
+    if not trialActiveOrError then
+        if frameCounter % 6 == 0 then
+            local okBreak, breakError = pcall(processBreakthrough)
+            if not okBreak then
+                lastError = tostring(breakError)
+                setStatus("Breakthrough monitor error: " .. lastError, COLORS.danger)
             end
         end
-    end)
+    end
 
-    addConnection(RunService.RenderStepped:Connect(function()
-        if running and not paused then
-            sampleTrialFrame()
-        end
-    end))
+    if trialLabel then
+        trialLabel.Text = lastTrialText
+    end
+end)
 
-    addConnection(RunService.Heartbeat:Connect(function()
-        if running and not paused then
-            sampleCharacterPosition()
-        end
-    end))
-
-    scanInitial()
-    checkpoint()
-    updateStatus("initial scan complete")
-
-    print("[CU Recorder] v1.3 recording active")
-    print("[CU Recorder] Folder: " .. tostring(outputFolder))
-    print("[CU Recorder] Manifest: " .. tostring(manifestPath))
-    print("[CU Recorder] Storage: " .. tostring(storageMode))
-    print("[CU Recorder] Ctrl+Home show/hide | Ctrl+P pause | Ctrl+F flush | Ctrl+End export/stop")
-    print("[CU Recorder] Read-only: no clicks, remote firing, stat edits or movement")
-end
-
-main()
+print("[CU AutoBreakthrough] Loaded. Shared Qi + Body breakthrough automation is ON.")
+print("[CU AutoBreakthrough] It only clicks at 100% and during gold-ring alignment; it does not start cultivation.")
+setStatus("Loaded; waiting for Qi or Body to reach 100%.", COLORS.success)
