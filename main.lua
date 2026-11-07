@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.1
+    Version: 1.0.3
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -20,6 +20,10 @@
         timed Stoke at the center of the Perfect band, and automatic claiming.
       - Auto Chest: scans Workspace.ChestSpots, applies tier filters, opens
         Celestial > Jade > Bronze > Wooden, and verifies ChestWorldOpened.
+      - Chest Teleporter: independent one-shot teleport to the best eligible chest;
+        manual E opening, automatic return after the local chest reward event, or manual return button.
+      - Herb age filters: independently select 1/10/100/1000-year herbs, including a 1000-year-only preset;
+        when no matching herb exists, cultivation remains active and the scanner watches for respawns.
       - Herb Monitor: live age counts split between normal and SpiritWorld nodes,
         including disabled/locked prompt counts.
       - Economy dashboard: Silver and Primordial Stone balances, NPC Silver rewards,
@@ -64,6 +68,14 @@ if type(getgenv) == "function" then
     end
 end
 
+-- A prior v1.0.2 outbound hook cannot be safely unhooked from this session,
+-- but its callback can be disabled. Rejoin once after upgrading to clear the
+-- old executor __namecall wrapper completely.
+if type(Env.__CUOutboundRemoteAudit) == "table" then
+    Env.__CUOutboundRemoteAudit.enabled = false
+    Env.__CUOutboundRemoteAudit.callback = nil
+end
+
 if type(Env.__CUAutoCultivationStop) == "function" then
     pcall(Env.__CUAutoCultivationStop, "replaced")
 end
@@ -83,6 +95,11 @@ local CHEST = {
     autoEnabled = false,
     taskRunning = false,
     busy = false,
+    teleportActive = false,
+    teleportReturnCFrame = nil,
+    teleportResumeMode = nil,
+    teleportTargetSpot = nil,
+    teleportTargetPrompt = nil,
     openedCount = 0,
     failedCount = 0,
     activeName = "idle",
@@ -96,7 +113,7 @@ local CHEST = {
     tierSelection = {Celestial = true, Jade = true, Bronze = true, Wooden = true},
     tierOrder = {Celestial = 4, Jade = 3, Bronze = 2, Wooden = 1},
 }
-local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0}
+local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0, ageOptions = {1000, 100, 10, 1}, ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}}
 local QUICK_INTERACT = {enabled = false, chestEnabled = true, attempts = 0, successes = 0, fallbacks = 0}
 local EXPERIMENT = {
     remoteAuditEnabled = false,
@@ -138,8 +155,13 @@ local SILVER = {
     failed = 0,
     lastReward = 0,
     lastTargetAt = 0,
-    autoDrawEnabled = true,
+    autoDrawEnabled = false,
     jAttemptedCharacter = nil,
+    targetMode = "SAFE", -- SAFE chooses the weakest eligible non-boss camp NPC.
+    attackInterval = 0.18,
+    clickHold = 0.045,
+    retreatHealthFraction = 0.35,
+    returnCFrame = nil,
     blacklist = setmetatable({}, {__mode = "k"}),
 }
 -- Multiple pill recipes can be queued. Qi + Body are enabled by default.
@@ -174,7 +196,7 @@ local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
 local herbFilterButton = nil
-local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}}
+local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -529,74 +551,16 @@ end
 -- FireServer/InvokeServer calls and passes them through unchanged. It never
 -- replays, edits, blocks, or fabricates a request. Enable only during a test.
 EXPERIMENT.installRemoteAudit = function()
-    local shared = Env.__CUOutboundRemoteAudit
-    if type(shared) == "table" and shared.installed == true then
-        shared.callback = function(method, remote, packed)
-            local args = {}
-            for i = 1, math.min(packed.n, 8) do args[i] = diagClean(packed[i], 0, {}) end
-            EXPERIMENT.remoteAuditCount = EXPERIMENT.remoteAuditCount + 1
-            DIAG.log("INFO", "EXPERIMENT", "outbound_remote_observed", {method = method, remote = remote.Name, path = remote:GetFullName(), args = args, argCount = packed.n})
-        end
-        EXPERIMENT.remoteAuditShared = shared
-        EXPERIMENT.remoteAuditInstalled = true
-        EXPERIMENT.remoteAuditStatus = "Existing passive hook reused"
-        return true, EXPERIMENT.remoteAuditStatus
-    end
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" or type(newcclosure) ~= "function" then
-        EXPERIMENT.remoteAuditStatus = "Unsupported: executor hook APIs unavailable"
-        return false, EXPERIMENT.remoteAuditStatus
-    end
-    shared = {installed = false, enabled = false, callback = nil}
-    local function relevant(remote)
-        local name = string.lower(tostring(remote.Name or ""))
-        local full = ""
-        pcall(function() full = string.lower(remote:GetFullName()) end)
-        local hay = name .. " " .. full
-        if string.find(full, "cultivationevents", 1, true) then return true end
-        for _, word in ipairs({"herb", "chest", "reroll", "roll", "cultivation", "breakthrough", "meditate", "pushup", "silver", "primordial", "cauldron", "stoke", "claim", "weapon", "attack", "coin", "reward"}) do
-            if string.find(hay, word, 1, true) then return true end
-        end
-        return false
-    end
-    local oldNamecall
-    local wrapper = newcclosure(function(self, ...)
-        local method = ""
-        pcall(function() method = getnamecallmethod() end)
-        if shared.enabled and type(shared.callback) == "function"
-            and (method == "FireServer" or method == "InvokeServer")
-            and typeof(self) == "Instance"
-            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
-            and relevant(self) then
-            local executorCaller = false
-            if type(checkcaller) == "function" then
-                local okCaller, value = pcall(checkcaller)
-                executorCaller = okCaller and value == true
-            end
-            if not executorCaller then
-                local packed = table.pack(...)
-                pcall(shared.callback, method, self, packed)
-            end
-        end
-        return oldNamecall(self, ...)
-    end)
-    local ok, previous = pcall(hookmetamethod, game, "__namecall", wrapper)
-    if not ok or type(previous) ~= "function" then
-        EXPERIMENT.remoteAuditStatus = "Install failed: " .. tostring(previous)
-        return false, EXPERIMENT.remoteAuditStatus
-    end
-    oldNamecall = previous
-    shared.installed = true
-    shared.callback = function(method, remote, packed)
-        local args = {}
-        for i = 1, math.min(packed.n, 8) do args[i] = diagClean(packed[i], 0, {}) end
-        EXPERIMENT.remoteAuditCount = EXPERIMENT.remoteAuditCount + 1
-        DIAG.log("INFO", "EXPERIMENT", "outbound_remote_observed", {method = method, remote = remote.Name, path = remote:GetFullName(), args = args, argCount = packed.n})
-    end
-    Env.__CUOutboundRemoteAudit = shared
-    EXPERIMENT.remoteAuditShared = shared
+    -- Deliberately do not hook __namecall/FireServer. v1.0.2's persistent hook
+    -- may interfere with reroll testing in some executors. Reroll UI clicks,
+    -- currency deltas, and inbound server result/update events are observed by
+    -- the dedicated listeners later in this file without intercepting requests.
+    EXPERIMENT.remoteAuditStatus = "Passive reroll/result monitor ready; no network hook installed"
     EXPERIMENT.remoteAuditInstalled = true
-    EXPERIMENT.remoteAuditStatus = "Installed; passive logging only"
-    DIAG.log("INFO", "EXPERIMENT", "remote_audit_installed", {note = "Calls are passed through unchanged; no requests are forged."})
+    EXPERIMENT.remoteAuditShared = nil
+    DIAG.log("INFO", "EXPERIMENT", "passive_reroll_monitor_ready", {
+        note = "UI clicks, balance changes and inbound result events only; outbound calls are not hooked."
+    })
     return true, EXPERIMENT.remoteAuditStatus
 end
 
@@ -680,6 +644,7 @@ local function stop(reason)
     autoBrewEnabled = false
     autoBrewBusy = false
     CHEST.autoEnabled = false
+    if CHEST.returnFromTeleport then pcall(CHEST.returnFromTeleport, "script stopped", true) end
     SILVER.autoEnabled = false
     SILVER.busy = false
     EXPERIMENT.remoteAuditEnabled = false
@@ -721,6 +686,8 @@ Env.__CUAutoCultivationState = {
             diagnosticErrors = DIAG.errorCount,
             diagnosticWarnings = DIAG.warningCount,
             autoHerbsEnabled = autoHerbsEnabled,
+            herbAgeSelection = { [1] = HERB_MONITOR.ageSelection[1], [10] = HERB_MONITOR.ageSelection[10], [100] = HERB_MONITOR.ageSelection[100], [1000] = HERB_MONITOR.ageSelection[1000] },
+            chestTeleportActive = CHEST.teleportActive,
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
             autoChestEnabled = CHEST.autoEnabled,
@@ -1569,7 +1536,7 @@ local function teleportToZone(mode, zone)
     task.spawn(function()
         -- Cancel a pending travel if the user switches Auto Cultivation OFF
         -- or changes to the other mode before the teleport task runs.
-        if not running or paused or selectedAutoMode ~= mode then
+        if not running or paused or selectedAutoMode ~= mode or CHEST.teleportActive then
             teleporting = false
             return
         end
@@ -1715,7 +1682,7 @@ local function stopAutomationOwnedTraining(mode)
 end
 
 local function processAutoCultivation()
-    if herbCollectorBusy or CHEST.busy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
+    if herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
         return
     end
     -- Never relocate or restart training while a breakthrough/tribulation is
@@ -1890,6 +1857,32 @@ local function isHerbSpeciesAllowed(species)
     return true
 end
 
+HERB_MONITOR.isAgeAllowed = function(age)
+    -- Unknown ages are only allowed when every age tier is selected. This is
+    -- important for strict filters such as 1000-year-only: unknown is not 1000.
+    if age == nil then
+        for _, knownAge in ipairs(HERB_MONITOR.ageOptions) do
+            if not HERB_MONITOR.ageSelection[knownAge] then return false end
+        end
+        return true
+    end
+    if HERB_MONITOR.ageSelection[age] ~= nil then
+        return HERB_MONITOR.ageSelection[age] == true
+    end
+    for _, knownAge in ipairs(HERB_MONITOR.ageOptions) do
+        if not HERB_MONITOR.ageSelection[knownAge] then return false end
+    end
+    return true
+end
+
+HERB_MONITOR.getAgeScanInterval = function()
+    local only1000 = HERB_MONITOR.ageSelection[1000] == true
+        and HERB_MONITOR.ageSelection[100] ~= true
+        and HERB_MONITOR.ageSelection[10] ~= true
+        and HERB_MONITOR.ageSelection[1] ~= true
+    return only1000 and 0.85 or 1.5
+end
+
 local function getHerbFolders()
     local folders = {}
     local normal = Workspace:FindFirstChild("HerbSpots")
@@ -1935,7 +1928,7 @@ local function findNearestHerbPrompt()
                 local coolingDown = lastAttempt and (now - lastAttempt < 12)
                 if descendant.Enabled and not alreadyCollected and not picked and not coolingDown then
                     local species, age = getHerbMetadata(descendant)
-                    if isHerbSpeciesAllowed(species) then
+                    if isHerbSpeciesAllowed(species) and HERB_MONITOR.isAgeAllowed(age) then
                         local position = getHerbPromptPosition(descendant)
                         if position then
                             local distance = (root.Position - position).Magnitude
@@ -2214,7 +2207,7 @@ SILVER.findTarget = function()
 
     local bestModel, bestHumanoid, bestRoot, bestRealm = nil, nil, nil, nil
     local bestDistance = math.huge
-    for _, model in ipairs(camps:GetChildren()) do
+    for _, model in ipairs(camps:GetDescendants()) do
         if model:IsA("Model") and model:GetAttribute("IsCultivator") == true
             and model:GetAttribute("IsBoss") ~= true then
             local realm = tonumber(model:GetAttribute("QiRealm"))
@@ -2224,8 +2217,22 @@ SILVER.findTarget = function()
             local blocked = blockedUntil and os.clock() < blockedUntil
             if realm and realm <= playerRealm and humanoid and humanoid.Health > 0 and npcRoot and not blocked then
                 local distance = (playerRoot.Position - npcRoot.Position).Magnitude
-                -- Prefer the strongest non-boss cultivator the player's Qi realm can face.
-                if not bestModel or realm > bestRealm or (realm == bestRealm and distance < bestDistance) then
+                -- SAFE mode chooses the weakest eligible realm first so a fresh/low-HP
+                -- character is not sent straight to the strongest NPC it can technically face.
+                -- STRONG mode retains the old highest-realm behavior.
+                local better = false
+                if not bestModel then
+                    better = true
+                elseif SILVER.targetMode == "STRONG" then
+                    better = realm > bestRealm
+                        or (realm == bestRealm and humanoid.MaxHealth < bestHumanoid.MaxHealth)
+                        or (realm == bestRealm and humanoid.MaxHealth == bestHumanoid.MaxHealth and distance < bestDistance)
+                else
+                    better = realm < bestRealm
+                        or (realm == bestRealm and humanoid.MaxHealth < bestHumanoid.MaxHealth)
+                        or (realm == bestRealm and humanoid.MaxHealth == bestHumanoid.MaxHealth and distance < bestDistance)
+                end
+                if better then
                     bestModel, bestHumanoid, bestRoot, bestRealm, bestDistance = model, humanoid, npcRoot, realm, distance
                 end
             end
@@ -2350,7 +2357,7 @@ SILVER.basicAttack = function(targetRoot)
         end
     end
     local downOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
-    task.wait(0.06)
+    task.wait(SILVER.clickHold or 0.045)
     local upOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
     if cameraChanged and oldCamera then
         pcall(function() camera.CFrame = oldCamera end)
@@ -2363,6 +2370,15 @@ end
 SILVER.run = function()
     if SILVER.taskRunning then return end
     SILVER.taskRunning = true
+    local startRoot = getCharacterParts()
+    if startRoot and not SILVER.returnCFrame then
+        SILVER.returnCFrame = startRoot.CFrame
+    end
+    DIAG.log("INFO", "SILVER", "silver_run_started", {
+        targetMode = SILVER.targetMode,
+        attackInterval = SILVER.attackInterval,
+        autoDraw = SILVER.autoDrawEnabled,
+    })
     task.spawn(function()
         while running and SILVER.autoEnabled do
             if paused then
@@ -2393,7 +2409,7 @@ SILVER.run = function()
                         SILVER.currentTarget = target
                         SILVER.currentTargetRealm = targetRealm
                         SILVER.setStatus("targeting " .. target.Name .. " (Qi " .. tostring(targetRealm) .. ")")
-                        DIAG.log("INFO", "SILVER", "target_selected", {target = target.Name, realm = targetRealm, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, distance = (playerRoot.Position - targetRoot.Position).Magnitude, playerRealm = playerRealm})
+                        DIAG.log("INFO", "SILVER", "target_selected", {target = target.Name, realm = targetRealm, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, distance = (playerRoot.Position - targetRoot.Position).Magnitude, playerRealm = playerRealm, targetMode = SILVER.targetMode})
 
                         if selectedAutoMode then
                             stopAutomationOwnedTraining(selectedAutoMode)
@@ -2440,6 +2456,24 @@ SILVER.run = function()
                             local attackDeadline = os.clock() + 35
                             while running and SILVER.autoEnabled and not paused and target.Parent and targetHumanoid.Health > 0 and os.clock() < attackDeadline do
                                 if activeTrialGui or getActiveTrialGui() or CHEST.busy or herbCollectorBusy or autoBrewBusy then break end
+                                local liveRoot, liveHumanoid = getCharacterParts()
+                                if liveHumanoid and liveHumanoid.MaxHealth > 0
+                                    and liveHumanoid.Health / liveHumanoid.MaxHealth <= SILVER.retreatHealthFraction then
+                                    DIAG.log("WARN", "SILVER", "low_health_retreat", {
+                                        health = liveHumanoid.Health,
+                                        maxHealth = liveHumanoid.MaxHealth,
+                                        threshold = SILVER.retreatHealthFraction,
+                                        target = target.Name,
+                                    })
+                                    SILVER.setStatus("low health; stopping farm and returning to start position")
+                                    SILVER.autoEnabled = false
+                                    if UI.silverButton then
+                                        UI.silverButton.Text = "AUTO SILVER: OFF"
+                                        UI.silverButton.BackgroundColor3 = COLORS.panel2
+                                    end
+                                    updateModeButtons()
+                                    break
+                                end
                                 local okAttack, backend = SILVER.basicAttack(targetRoot)
                                 if not okAttack then
                                     SILVER.setStatus("attack stopped: " .. tostring(backend))
@@ -2455,7 +2489,7 @@ SILVER.run = function()
                                     SILVER.blacklist[target] = os.clock() + 20
                                     break
                                 end
-                                task.wait(0.28)
+                                task.wait(SILVER.attackInterval or 0.18)
                                 local healthNow = targetHumanoid.Health
                                 if healthNow < lastHealth - 0.1 then
                                     local previousHealth = lastHealth
@@ -2495,6 +2529,18 @@ SILVER.run = function()
         SILVER.busy = false
         SILVER.currentTarget = nil
         SILVER.currentTargetRealm = nil
+        if not SILVER.autoEnabled and SILVER.returnCFrame then
+            local returnRoot = getCharacterParts()
+            if returnRoot then
+                pcall(function()
+                    returnRoot.AssemblyLinearVelocity = Vector3.zero
+                    returnRoot.AssemblyAngularVelocity = Vector3.zero
+                    returnRoot.CFrame = SILVER.returnCFrame
+                end)
+                DIAG.log("INFO", "SILVER", "returned_to_start_position", {})
+            end
+            SILVER.returnCFrame = nil
+        end
         SILVER.taskRunning = false
         SILVER.setStatus(SILVER.autoEnabled and "waiting" or "OFF")
         updateModeButtons()
@@ -2512,7 +2558,7 @@ local function runHerbCollector()
             if paused then
                 setHerbStatus("paused")
                 task.wait(0.25)
-            elseif CHEST.busy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 setHerbStatus("waiting for breakthrough")
                 task.wait(0.25)
             else
@@ -2545,7 +2591,7 @@ local function runHerbCollector()
                         else
                             setHerbStatus("scanning enabled prompts")
                         end
-                        task.wait(3.0)
+                        task.wait(HERB_MONITOR.getAgeScanInterval())
                     end
                 end
             end
@@ -2798,7 +2844,7 @@ CHEST.updateMonitor = function()
     )
 end
 
-CHEST.findBestPrompt = function()
+CHEST.findBestPrompt = function(ignoreCooldown)
     local root = getCharacterParts()
     if not root then
         return nil, nil, nil, nil, nil
@@ -2817,7 +2863,7 @@ CHEST.findBestPrompt = function()
         end
         local lastAttempt = CHEST.attemptTimes[spot]
         local coolingDown = lastAttempt and (now - lastAttempt < 12)
-        if not opened and not openedUntil and prompt.Enabled and CHEST.tierSelection[tier] and not coolingDown then
+        if not opened and not openedUntil and prompt.Enabled and CHEST.tierSelection[tier] and (ignoreCooldown == true or not coolingDown) then
             local distance = (root.Position - entry.position).Magnitude
             local rank = CHEST.tierOrder[tier] or 0
             if rank > bestRank or (rank == bestRank and distance < bestDistance) then
@@ -2831,6 +2877,125 @@ CHEST.findBestPrompt = function()
         return nil, nil, nil, nil, nil
     end
     return best.spot, best.prompt, best.position, best.tier, bestDistance
+end
+
+CHEST.returnFromTeleport = function(reason, stopping)
+    if not CHEST.teleportActive then return false end
+    local returnCFrame = CHEST.teleportReturnCFrame
+    local resumeMode = CHEST.teleportResumeMode
+    CHEST.teleportActive = false
+    CHEST.teleportReturnCFrame = nil
+    CHEST.teleportResumeMode = nil
+    CHEST.teleportTargetSpot = nil
+    CHEST.teleportTargetPrompt = nil
+
+    local root = getCharacterParts()
+    if root and returnCFrame then
+        local ok, err = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = returnCFrame
+        end)
+        DIAG.log(ok and "INFO" or "WARN", "CHEST", "teleport_return", {reason = reason or "manual return", success = ok, error = ok and nil or tostring(err)})
+    else
+        DIAG.log("WARN", "CHEST", "teleport_return_no_character", {reason = reason or "manual return"})
+    end
+
+    if not stopping and running and not paused and resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then
+        task.delay(0.65, function()
+            if running and not paused and not CHEST.teleportActive and not isTrainingActive(resumeMode) then
+                activateTraining(resumeMode)
+            end
+        end)
+    end
+    CHEST.setStatus(reason or "returned to previous position")
+    updateModeButtons()
+    return true
+end
+
+CHEST.teleportToBest = function()
+    if CHEST.teleportActive then
+        return CHEST.returnFromTeleport("returned to previous position")
+    end
+    if CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or SILVER.autoEnabled or autoBrewBusy or cauldronPanelIsOpen() then
+        CHEST.setStatus("turn off Auto Chest / finish current activity before using Chest Teleport")
+        return false
+    end
+    if activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+        CHEST.setStatus("wait until breakthrough/tribulation finishes before chest teleport")
+        return false
+    end
+
+    local spot, prompt, position, tier, distance = CHEST.findBestPrompt(true)
+    if not spot or not prompt then
+        CHEST.setStatus("no unopened chest matching the selected tier filter")
+        DIAG.log("WARN", "CHEST", "manual_teleport_no_target", {filter = CHEST.getFilterSummary()})
+        return false
+    end
+
+    local root = getCharacterParts()
+    if not root then
+        CHEST.setStatus("character unavailable")
+        return false
+    end
+
+    local returnCFrame = root.CFrame
+    local resumeMode = getHerbResumeMode()
+    CHEST.teleportReturnCFrame = returnCFrame
+    CHEST.teleportResumeMode = resumeMode
+    CHEST.teleportTargetSpot = spot
+    CHEST.teleportTargetPrompt = prompt
+    CHEST.teleportActive = true
+
+    if resumeMode and isTrainingActive(resumeMode) then
+        local key = resumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
+        local sent, backend = sendKey(key)
+        if not sent then
+            CHEST.teleportActive = false
+            CHEST.teleportReturnCFrame = nil
+            CHEST.teleportResumeMode = nil
+            CHEST.teleportTargetSpot = nil
+            CHEST.teleportTargetPrompt = nil
+            CHEST.setStatus("could not pause current cultivation: " .. tostring(backend))
+            updateModeButtons()
+            return false
+        end
+        task.wait(0.3)
+    end
+
+    local promptPosition = CHEST.getPromptWorldPosition(prompt, position)
+    local destination, lookAt = CHEST.getPromptApproach(prompt, position)
+    local moved, moveError = pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = CFrame.lookAt(destination, lookAt)
+    end)
+    if not moved then
+        CHEST.teleportActive = false
+        CHEST.teleportReturnCFrame = nil
+        CHEST.teleportResumeMode = nil
+        CHEST.teleportTargetSpot = nil
+        CHEST.teleportTargetPrompt = nil
+        if resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then activateTraining(resumeMode) end
+        CHEST.setStatus("chest teleport failed: " .. tostring(moveError))
+        updateModeButtons()
+        return false
+    end
+
+    task.wait(0.9)
+    root = getCharacterParts()
+    local actualDistance = root and (root.Position - (CHEST.getPromptWorldPosition(prompt, position) or promptPosition)).Magnitude or math.huge
+    local maxDistance = tonumber(prompt.MaxActivationDistance) or 12
+    DIAG.log(actualDistance <= maxDistance and "INFO" or "WARN", "CHEST", "manual_teleport_arrival", {chest = spot.Name, tier = tier, distance = actualDistance, maxDistance = maxDistance, promptKey = tostring(prompt.KeyboardKeyCode), holdDuration = prompt.HoldDuration})
+
+    if actualDistance > maxDistance then
+        CHEST.returnFromTeleport("server did not retain chest teleport; returned to training")
+        return false
+    end
+
+    CHEST.setStatus(string.format("At %s (%s). Hold %s for %.2fs manually; return button restores your position.", spot.Name, tier, tostring(prompt.KeyboardKeyCode), tonumber(prompt.HoldDuration) or 1))
+    updateModeButtons()
+    return true
 end
 
 CHEST.wait = function(seconds)
@@ -3181,7 +3346,7 @@ CHEST.run = function()
             if paused then
                 CHEST.setStatus("paused")
                 task.wait(0.2)
-            elseif herbCollectorBusy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 if CHEST.busy then
                     CHEST.finishSweep("pausing chest sweep for another activity")
                 end
@@ -3882,6 +4047,36 @@ local function updateHerbFilterPicker()
     end
 end
 
+HERB_MONITOR.getAgeFilterSummary = function()
+    local count = 0
+    for _, age in ipairs(HERB_MONITOR.ageOptions) do
+        if HERB_MONITOR.ageSelection[age] then count = count + 1 end
+    end
+    if count == #HERB_MONITOR.ageOptions then return "HERB AGE: ALL" end
+    if count == 1 and HERB_MONITOR.ageSelection[1000] then return "HERB AGE: 1K ONLY" end
+    if count == 0 then return "HERB AGE: NONE" end
+    return "HERB AGE: " .. tostring(count) .. "/4"
+end
+
+HERB_MONITOR.updateAgeFilterPicker = function()
+    for age, button in pairs(UI.herbAgeFilterToggleButtons) do
+        if button then
+            local selected = HERB_MONITOR.ageSelection[age] == true
+            local ageText = age == 1000 and "1,000 years" or (tostring(age) .. " years")
+            button.Text = (selected and "[ON] " or "[  ] ") .. ageText
+            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
+        end
+    end
+    if UI.herbAgeFilterButton then
+        UI.herbAgeFilterButton.Text = HERB_MONITOR.getAgeFilterSummary()
+        local count = 0
+        for _, age in ipairs(HERB_MONITOR.ageOptions) do
+            if HERB_MONITOR.ageSelection[age] then count = count + 1 end
+        end
+        UI.herbAgeFilterButton.BackgroundColor3 = count == #HERB_MONITOR.ageOptions and COLORS.panel2 or (count == 0 and COLORS.danger or COLORS.accent)
+    end
+end
+
 updateModeButtons = function()
     if qiButton then
         qiButton.Text = selectedAutoMode == "Qi" and "QI AUTO: ON" or "QI AUTO: OFF"
@@ -3911,6 +4106,10 @@ updateModeButtons = function()
         UI.chestButton.Text = CHEST.autoEnabled and "CHESTS: ON" or "CHESTS: OFF"
         UI.chestButton.BackgroundColor3 = CHEST.autoEnabled and COLORS.success or COLORS.panel2
     end
+    if UI.chestTeleportButton then
+        UI.chestTeleportButton.Text = CHEST.teleportActive and "RETURN TO TRAINING" or "CHEST TP: NEXT"
+        UI.chestTeleportButton.BackgroundColor3 = CHEST.teleportActive and COLORS.warning or COLORS.accent
+    end
     if UI.silverButton then
         UI.silverButton.Text = SILVER.autoEnabled and "AUTO SILVER: ON" or "AUTO SILVER: OFF"
         UI.silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
@@ -3923,8 +4122,12 @@ updateModeButtons = function()
         UI.silverDrawButton.Text = SILVER.autoDrawEnabled and "AUTO DRAW (J): ON" or "AUTO DRAW (J): OFF"
         UI.silverDrawButton.BackgroundColor3 = SILVER.autoDrawEnabled and COLORS.success or COLORS.panel2
     end
+    if UI.silverTargetModeButton then
+        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET MODE: SAFE" or "TARGET MODE: STRONG"
+        UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
+    end
     if UI.remoteAuditButton then
-        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REMOTE AUDIT: ON" or "REMOTE AUDIT: OFF"
+        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REROLL MONITOR: ON" or "REROLL MONITOR: OFF"
         UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
     end
     if UI.remoteAuditStatusLabel then
@@ -3953,6 +4156,7 @@ updateModeButtons = function()
     end
     updateBrewRecipePicker()
     updateHerbFilterPicker()
+    HERB_MONITOR.updateAgeFilterPicker()
     CHEST.updateFilterPicker()
     if herbInfoLabel then
         herbInfoLabel.Text = string.format("Herbs: %d collected | %s", herbCollectedCount, herbActiveName)
@@ -3972,10 +4176,11 @@ local function createGui()
         or parent:FindFirstChild("CUAutoCultivation_v091")
         or parent:FindFirstChild("CUAutoCultivation_v10")
         or parent:FindFirstChild("CUAutoCultivation_v101")
+        or parent:FindFirstChild("CUAutoCultivation_v102")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v101",
+        Name = "CUAutoCultivation_v103",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4035,7 +4240,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.1",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.3",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4117,6 +4322,7 @@ local function createGui()
                 end
             end
             if herbFilterPicker then herbFilterPicker.Visible = false end
+            if UI.herbAgeFilterPicker then UI.herbAgeFilterPicker.Visible = false end
             if brewRecipePicker then brewRecipePicker.Visible = false end
             if UI.chestFilterPicker then UI.chestFilterPicker.Visible = false end
         end)
@@ -4207,23 +4413,26 @@ local function createGui()
     local farmingPage = pageFrames.Farming
     makeLabel(farmingPage, "WORLD COLLECTION AND NPC SILVER FARMING", 16, 10, 600, 20, 11, COLORS.success, Enum.Font.GothamBold)
     local herbCard = makeCard(farmingPage, 16, 38, 292, 152, "HERB COLLECTION", COLORS.success)
-    herbButton = makeButton(herbCard, "HERBS: OFF", 12, 28, 128, COLORS.panel2, 28)
-    herbFilterButton = makeButton(herbCard, "HERB FILTER: ALL", 148, 28, 132, COLORS.panel2, 28)
-    herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 65, 268, 18, 9, COLORS.muted)
-    UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 91, 268, 45, 9, COLORS.muted, Enum.Font.Code)
+    herbButton = makeButton(herbCard, "HERBS: OFF", 12, 28, 128, COLORS.panel2, 27)
+    herbFilterButton = makeButton(herbCard, "HERB FILTER: ALL", 148, 28, 132, COLORS.panel2, 27)
+    UI.herbAgeFilterButton = makeButton(herbCard, "HERB AGE: ALL", 12, 59, 268, COLORS.panel2, 25)
+    herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 88, 268, 16, 9, COLORS.muted)
+    UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 106, 268, 39, 9, COLORS.muted, Enum.Font.Code)
 
     local chestCard = makeCard(farmingPage, 322, 38, 292, 152, "WORLD CHESTS", COLORS.warning)
-    UI.chestButton = makeButton(chestCard, "CHESTS: OFF", 12, 28, 128, COLORS.panel2, 28)
-    UI.chestFilterButton = makeButton(chestCard, "CHEST FILTER: ALL", 148, 28, 132, COLORS.panel2, 28)
-    UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 65, 268, 18, 9, COLORS.muted)
-    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 91, 268, 22, 9, COLORS.muted)
+    UI.chestButton = makeButton(chestCard, "CHESTS: OFF", 12, 28, 128, COLORS.panel2, 27)
+    UI.chestFilterButton = makeButton(chestCard, "CHEST FILTER: ALL", 148, 28, 132, COLORS.panel2, 27)
+    UI.chestTeleportButton = makeButton(chestCard, "CHEST TP: NEXT", 12, 59, 268, COLORS.accent, 25)
+    UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 88, 268, 16, 9, COLORS.muted)
+    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 106, 268, 34, 9, COLORS.muted)
 
     local silverCardFarm = makeCard(farmingPage, 16, 204, 598, 160, "AUTO SILVER - CULTIVATOR CAMPS", COLORS.warning)
     UI.silverButton = makeButton(silverCardFarm, "AUTO SILVER: OFF", 12, 29, 180, COLORS.panel2, 30)
     UI.silverInfoLabel = makeLabel(silverCardFarm, "Auto Silver: idle", 204, 29, 370, 28, 10, COLORS.muted)
-    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO DRAW (J): ON", 12, 65, 180, COLORS.success, 25)
+    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO DRAW (J): OFF", 12, 65, 180, COLORS.panel2, 25)
     UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 204, 65, 370, 25, 10, COLORS.text)
-    makeLabel(silverCardFarm, "Auto-taps J once if no equipped weapon is detectable, then uses normal M1. It never repeatedly toggles J; damage confirms whether the sword is actually drawn.", 12, 99, 570, 44, 9, COLORS.muted)
+    UI.silverTargetModeButton = makeButton(silverCardFarm, "TARGET MODE: SAFE", 12, 98, 180, COLORS.success, 25)
+    makeLabel(silverCardFarm, "SAFE picks the weakest eligible camp first. Draw your sword with J manually; Auto Draw stays OFF because J toggles. M1 interval 0.18s; retreat below 35% HP.", 204, 96, 370, 47, 9, COLORS.muted)
     UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 374, 598, COLORS.panel2, 27)
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
@@ -4308,10 +4517,10 @@ local function createGui()
     -- EXPERIMENTS PAGE: controlled, evidence-first probes. No forged reward calls.
     local experimentsPage = pageFrames.Experiments
     makeLabel(experimentsPage, "EXPERIMENTAL LAB | HYPOTHESIS TESTS, NOT FAKE REWARD REQUESTS", 16, 10, 600, 20, 10, COLORS.warning, Enum.Font.GothamBold)
-    local remoteCard = makeCard(experimentsPage, 16, 38, 598, 104, "PASSIVE OUTBOUND REMOTE AUDIT", COLORS.accent)
-    UI.remoteAuditButton = makeButton(remoteCard, "REMOTE AUDIT: OFF", 12, 29, 190, COLORS.panel2, 28)
-    UI.remoteAuditStatusLabel = makeLabel(remoteCard, "Not installed. Enable only while testing rerolls, chests, herbs, combat or cultivation.", 214, 28, 360, 38, 9, COLORS.muted)
-    makeLabel(remoteCard, "Logs normal game-originated FireServer/InvokeServer names and arguments, then passes each call through unchanged.", 12, 67, 570, 25, 9, COLORS.text)
+    local remoteCard = makeCard(experimentsPage, 16, 38, 598, 104, "PASSIVE REROLL / RESULT MONITOR", COLORS.accent)
+    UI.remoteAuditButton = makeButton(remoteCard, "REROLL MONITOR: OFF", 12, 29, 190, COLORS.panel2, 28)
+    UI.remoteAuditStatusLabel = makeLabel(remoteCard, "Logs reroll clicks, currency deltas and inbound server results. No network hooks.", 214, 28, 360, 38, 9, COLORS.muted)
+    makeLabel(remoteCard, "Non-invasive: observes UI actions and server results without intercepting reroll requests.", 12, 67, 570, 25, 9, COLORS.text)
 
     local progressCard = makeCard(experimentsPage, 16, 152, 292, 104, "FAST PROGRESS EXPERIMENT", COLORS.qi)
     UI.progressProbeButton = makeButton(progressCard, "PROGRESS PROBE: ON", 12, 29, 268, COLORS.success, 27)
@@ -4330,19 +4539,19 @@ local function createGui()
             local ok, message = EXPERIMENT.installRemoteAudit()
             if not ok then
                 EXPERIMENT.remoteAuditEnabled = false
-                setStatus("Remote audit unavailable: " .. tostring(message), COLORS.warning)
+                setStatus("Reroll monitor unavailable: " .. tostring(message), COLORS.warning)
             else
                 EXPERIMENT.remoteAuditEnabled = true
                 if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = true end
-                setStatus("Passive remote audit ON. Requests are observed and passed through unchanged.", COLORS.success)
+                setStatus("Passive reroll/result monitor ON. Rerolls remain on the normal game path.", COLORS.success)
             end
         else
             EXPERIMENT.remoteAuditEnabled = false
             if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = false end
-            EXPERIMENT.remoteAuditStatus = "Installed but logging OFF"
-            setStatus("Remote audit logging OFF. The passive wrapper remains installed until rejoin/cleanup.", COLORS.warning)
+            EXPERIMENT.remoteAuditStatus = "Passive reroll/result monitoring OFF; no network hook installed"
+            setStatus("Reroll/result monitoring OFF. No network hook remains installed by this version.", COLORS.warning)
         end
-        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REMOTE AUDIT: ON" or "REMOTE AUDIT: OFF"
+        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REROLL MONITOR: ON" or "REROLL MONITOR: OFF"
         UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
         if UI.remoteAuditStatusLabel then UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount) end
         DIAG.log("INFO", "EXPERIMENT", "remote_audit_toggled", {enabled = EXPERIMENT.remoteAuditEnabled, status = EXPERIMENT.remoteAuditStatus})
@@ -4396,6 +4605,42 @@ local function createGui()
     end
     local herbFilterDone = makeButton(herbFilterPicker, "DONE", 8, 190, 194, COLORS.accent, 22)
     addConnection(herbFilterDone.MouseButton1Click, function() herbFilterPicker.Visible = false end)
+
+    UI.herbAgeFilterPicker = make("Frame", {
+        Name = "HerbAgeFilterPicker",
+        Position = UDim2.fromOffset(390, 12),
+        Size = UDim2.fromOffset(210, 205),
+        BackgroundColor3 = COLORS.bg,
+        BackgroundTransparency = 0.02,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 22,
+    }, farmingPage)
+    round(UI.herbAgeFilterPicker, 8)
+    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, UI.herbAgeFilterPicker)
+    makeLabel(UI.herbAgeFilterPicker, "SELECT HERB AGE", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
+    addConnection(makeButton(UI.herbAgeFilterPicker, "SELECT ALL AGES", 8, 27, 194, COLORS.accent, 22).MouseButton1Click, function()
+        for _, age in ipairs(HERB_MONITOR.ageOptions) do HERB_MONITOR.ageSelection[age] = true end
+        updateModeButtons()
+        DIAG.log("INFO", "HERBS", "age_filter_preset", {preset = "ALL"})
+        setStatus("All herb ages enabled; oldest available age is prioritized.", COLORS.success)
+    end)
+    addConnection(makeButton(UI.herbAgeFilterPicker, "1,000 YEARS ONLY", 8, 52, 194, COLORS.warning, 22).MouseButton1Click, function()
+        for _, age in ipairs(HERB_MONITOR.ageOptions) do HERB_MONITOR.ageSelection[age] = (age == 1000) end
+        updateModeButtons()
+        DIAG.log("INFO", "HERBS", "age_filter_preset", {preset = "1000_ONLY"})
+        setStatus("Strict 1,000-year-only collection enabled. Lower and unknown ages will be ignored.", COLORS.success)
+    end)
+    for index, age in ipairs(HERB_MONITOR.ageOptions) do
+        UI.herbAgeFilterToggleButtons[age] = makeButton(UI.herbAgeFilterPicker, age == 1000 and "1,000 years" or (tostring(age) .. " years"), 8, 77 + (index - 1) * 25, 194, COLORS.success, 22)
+        addConnection(UI.herbAgeFilterToggleButtons[age].MouseButton1Click, function()
+            HERB_MONITOR.ageSelection[age] = not HERB_MONITOR.ageSelection[age]
+            updateModeButtons()
+            DIAG.log("INFO", "HERBS", "age_filter_changed", {age = age, enabled = HERB_MONITOR.ageSelection[age]})
+            setStatus((age == 1000 and "1,000 years" or (tostring(age) .. " years")) .. (HERB_MONITOR.ageSelection[age] and " enabled." or " excluded."), COLORS.success)
+        end)
+    end
+    addConnection(makeButton(UI.herbAgeFilterPicker, "DONE", 8, 180, 194, COLORS.accent, 20).MouseButton1Click, function() UI.herbAgeFilterPicker.Visible = false end)
 
     brewRecipePicker = make("Frame", {
         Name = "BrewRecipePicker",
@@ -4459,7 +4704,7 @@ local function createGui()
     local chestDone = makeButton(UI.chestFilterPicker, "DONE", 8, 157, 194, COLORS.accent, 22)
     addConnection(chestDone.MouseButton1Click, function() UI.chestFilterPicker.Visible = false end)
 
-    for _, picker in ipairs({herbFilterPicker, brewRecipePicker, UI.chestFilterPicker}) do
+    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker, UI.chestFilterPicker}) do
         for _, descendant in ipairs(picker:GetDescendants()) do
             if descendant:IsA("GuiObject") then descendant.ZIndex = 23 end
         end
@@ -4529,13 +4774,35 @@ local function createGui()
 
     addConnection(herbFilterButton.MouseButton1Click, function()
         herbFilterPicker.Visible = not herbFilterPicker.Visible
+        UI.herbAgeFilterPicker.Visible = false
         brewRecipePicker.Visible = false
         UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Choose which herb species Auto Herbs may collect. Oldest HerbYear is prioritized.", COLORS.success)
     end)
 
+    addConnection(UI.herbAgeFilterButton.MouseButton1Click, function()
+        UI.herbAgeFilterPicker.Visible = not UI.herbAgeFilterPicker.Visible
+        herbFilterPicker.Visible = false
+        brewRecipePicker.Visible = false
+        UI.chestFilterPicker.Visible = false
+        updateModeButtons()
+        setStatus("Choose herb ages. Use 1,000 YEARS ONLY to ignore every lower or unknown age and resume cultivation between spawns.", COLORS.success)
+    end)
+
+    addConnection(UI.chestTeleportButton.MouseButton1Click, function()
+        if CHEST.teleportActive then
+            CHEST.returnFromTeleport("manual return to previous position")
+        else
+            CHEST.teleportToBest()
+        end
+    end)
+
     addConnection(UI.chestButton.MouseButton1Click, function()
+        if not CHEST.autoEnabled and CHEST.teleportActive then
+            CHEST.setStatus("return from manual Chest Teleport before enabling Auto Chest")
+            return
+        end
         CHEST.autoEnabled = not CHEST.autoEnabled
         DIAG.log("INFO", "CHEST", "auto_toggle", {enabled = CHEST.autoEnabled})
         updateModeButtons()
@@ -4552,9 +4819,10 @@ local function createGui()
     addConnection(UI.chestFilterButton.MouseButton1Click, function()
         UI.chestFilterPicker.Visible = not UI.chestFilterPicker.Visible
         herbFilterPicker.Visible = false
+        UI.herbAgeFilterPicker.Visible = false
         brewRecipePicker.Visible = false
         updateModeButtons()
-        CHEST.setStatus("select allowed tiers; highest enabled tier is opened first")
+        CHEST.setStatus("select allowed tiers; highest enabled tier is opened first; Chest TP uses the same filter")
     end)
 
     addConnection(brewButton.MouseButton1Click, function()
@@ -4571,19 +4839,32 @@ local function createGui()
     addConnection(brewRecipeButton.MouseButton1Click, function()
         brewRecipePicker.Visible = not brewRecipePicker.Visible
         herbFilterPicker.Visible = false
+        UI.herbAgeFilterPicker.Visible = false
         UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
+    end)
+
+    addConnection(UI.silverTargetModeButton.MouseButton1Click, function()
+        SILVER.targetMode = SILVER.targetMode == "SAFE" and "STRONG" or "SAFE"
+        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET MODE: SAFE" or "TARGET MODE: STRONG"
+        UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
+        DIAG.log("INFO", "SILVER", "target_mode_changed", {targetMode = SILVER.targetMode})
+        setStatus(SILVER.targetMode == "SAFE" and "Safe target mode: weakest eligible cultivator first." or "Strong target mode: highest eligible realm first.", SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning)
     end)
 
     addConnection(UI.silverDrawButton.MouseButton1Click, function()
         SILVER.autoDrawEnabled = not SILVER.autoDrawEnabled
         DIAG.log("INFO", "SILVER", "auto_draw_toggled", {enabled = SILVER.autoDrawEnabled})
         updateModeButtons()
-        setStatus(SILVER.autoDrawEnabled and "Auto Draw enabled: will tap J at most once per character if no equipped weapon is detectable." or "Auto Draw disabled: Auto Silver will not press J automatically.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
+        setStatus(SILVER.autoDrawEnabled and "Auto Draw enabled: may tap J once if weapon state is unknown. Ensure sword is sheathed first." or "Auto Draw disabled: press J manually to draw your sword before enabling Auto Silver.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
     end)
 
     addConnection(UI.silverButton.MouseButton1Click, function()
+        if not SILVER.autoEnabled and CHEST.teleportActive then
+            SILVER.setStatus("return from Chest Teleport before enabling Auto Silver")
+            return
+        end
         SILVER.autoEnabled = not SILVER.autoEnabled
         DIAG.log("INFO", "SILVER", "auto_toggle", {enabled = SILVER.autoEnabled})
         updateModeButtons()
@@ -4798,6 +5079,17 @@ do
                     end
                     DIAG.rewardFingerprints[fingerprint] = os.clock()
                     CHEST.activeName = "reward event received: " .. tostring(tier or "chest")
+                    if CHEST.teleportActive then
+                        local targetName = CHEST.teleportTargetSpot and CHEST.teleportTargetSpot.Name or nil
+                        if targetName and (chestName == targetName or chest == CHEST.teleportTargetSpot) then
+                            DIAG.log("INFO", "CHEST", "manual_teleport_chest_open_confirmed", {chest = chestName, tier = tier, rewards = rewards})
+                            task.delay(0.8, function()
+                                if running and CHEST.teleportActive then
+                                    CHEST.returnFromTeleport("manual chest opening confirmed; returning to cultivation")
+                                end
+                            end)
+                        end
+                    end
                 end
             end)
         end
@@ -4997,7 +5289,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.1", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.3", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
 DIAG.refreshUI(true)
 
 task.spawn(function()
@@ -5106,11 +5398,11 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v1.0.1 loaded. Integrated diagnostics + Experimental Lab are enabled.")
-print("[CU AutoCultivation] v1.0.1: Chest uses verified E-hold fallback; manual E timing is recorded. Experimental Lab provides passive remote audit only.")
-print("[CU AutoCultivation] Auto Silver still uses normal M1 input; diagnostics now record input, target HP, and server reward confirmations.")
+print("[CU AutoCultivation] v1.0.3 loaded. Integrated diagnostics + Experimental Lab are enabled.")
+print("[CU AutoCultivation] v1.0.3: Chest uses verified E-hold fallback; manual E timing is recorded. Experimental Lab provides passive remote audit only.")
+print("[CU AutoCultivation] Auto Silver uses SAFE weakest-target selection by default, faster bounded M1 input, low-health retreat, and server reward confirmations.")
 print("[CU AutoCultivation] Herb quick interaction is user-toggleable; chest instant probe is independently enabled with a normal E-hold fallback.")
-print("[CU AutoCultivation] Diagnostics/Experiments never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
+print("[CU AutoCultivation] Diagnostics/Experiments do not hook or modify network calls, and never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.1"})
-setStatus("Loaded v1.0.1. Diagnostics are ON; Experimental Lab is available. Auto Chest uses E-hold fallback.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.3"})
+setStatus("Loaded v1.0.3. Diagnostics are ON; Experimental Lab is available. Auto Chest uses E-hold fallback.", COLORS.success)
