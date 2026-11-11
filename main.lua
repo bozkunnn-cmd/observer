@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.3
+    Version: 1.0.4
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -8,8 +8,13 @@
       - Qi Auto Cultivation: select best eligible Qi zone, teleport, meditate.
       - Body Auto Cultivation: select best eligible Body zone, teleport, push-ups.
       - Re-evaluate the best zone after realm breakthroughs.
-      - Preserve the working BreakthroughBanner and tribulation Tap logic.
-      - Tribulation processing does not require a readable hit counter.
+      - Preserve the working BreakthroughBanner and ordinary tribulation Tap logic.
+      - Heavenly Tribulation: detect its live title, track the contracting white
+        timing ring against the gold target, press SPACE near alignment, and lock
+        other automation until the event and Qi progression update finish.
+      - Heavenly Tribulation cadence is every fifth displayed Qi realm; detection
+        uses the live event title rather than assuming internal realm numbering.
+      - Ordinary tribulation processing does not require a readable hit counter.
       - Anti-AFK toggle using LocalPlayer.Idled / VirtualUser.
       - Auto Herb Collection: scans enabled CollectHerbPrompt objects in both
         normal HerbSpots and SpiritWorld.Herbs folders; reads HerbYear and
@@ -220,6 +225,36 @@ local attemptedPrompts = {}
 local previousRingSizes = {}
 local lastTrialText = "Trial: idle"
 local lastTrialScoreText = nil
+
+-- Heavenly Tribulation (every fifth displayed Qi realm). The game displays this
+-- as a separate timing event: press SPACE when the contracting white ring meets
+-- the fixed gold circle. Detection is UI-driven; if the ring objects cannot be
+-- identified confidently, the controller waits instead of guessing or spamming.
+UI.heavenly = {
+    active = false,
+    titleObject = nil,
+    uiRoot = nil,
+    lastTitleScanAt = 0,
+    lastSeenAt = 0,
+    scanAt = 0,
+    whiteRing = nil,
+    goldTarget = nil,
+    ringSource = "none",
+    previousRatio = nil,
+    previousSampleAt = 0,
+    pulseConsumed = false,
+    ringLostAt = 0,
+    inputBusy = false,
+    lastInputAt = 0,
+    successfulInputs = 0,
+    failedInputs = 0,
+    startedAt = 0,
+    lastNoPairLogAt = 0,
+    pairDetected = false,
+    lastFeedback = nil,
+    feedbackValue = nil,
+    feedbackScanAt = 0,
+}
 
 local lastMode = "Unknown"
 local lastPercent = nil
@@ -730,6 +765,9 @@ Env.__CUAutoCultivationState = {
             percent = lastPercent,
             action = lastAction,
             trial = lastTrialText,
+            heavenlyTribulationActive = UI.heavenly.active,
+            heavenlySpaceInputs = UI.heavenly.successfulInputs,
+            heavenlyInputFailures = UI.heavenly.failedInputs,
             error = lastError,
         }
     end,
@@ -1193,7 +1231,380 @@ local function isGold(color)
     return color.R >= 0.90 and color.G >= 0.75 and color.B <= 0.65
 end
 
+-- Heavenly Tribulation detector ----------------------------------------------
+-- The title/instruction is the authoritative active-state signal. The timing
+-- rings are located by their visible circular UIStroke geometry, preferably in
+-- the same ScreenGui/BillboardGui as the title, then on the character/camera.
+
+UI.heavenly.findTitle = function()
+    local now = os.clock()
+    local cached = UI.heavenly.titleObject
+    if cached and cached.Parent and (cached:IsA("TextLabel") or cached:IsA("TextButton")) then
+        local text = string.upper(tostring(cached.Text or ""))
+        if string.find(text, "HEAVENLY TRIBULATION", 1, true) and isVisibleInTree(cached) then
+            return cached
+        end
+    end
+    if now - UI.heavenly.lastTitleScanAt < 0.18 then
+        return nil
+    end
+    UI.heavenly.lastTitleScanAt = now
+
+    local roots = {PlayerGui, LocalPlayer.Character, Workspace.CurrentCamera}
+    for _, root in ipairs(roots) do
+        if root then
+            local ok, descendants = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, object in ipairs(descendants) do
+                    if object:IsA("TextLabel") or object:IsA("TextButton") then
+                        local text = string.upper(tostring(object.Text or ""))
+                        if string.find(text, "HEAVENLY TRIBULATION", 1, true) and isVisibleInTree(object) then
+                            UI.heavenly.titleObject = object
+                            local node = object
+                            while node and not node:IsA("ScreenGui") and not node:IsA("BillboardGui") and not node:IsA("SurfaceGui") do
+                                node = node.Parent
+                            end
+                            UI.heavenly.uiRoot = node or root
+                            return object
+                        end
+                    end
+                end
+            end
+        end
+    end
+    UI.heavenly.titleObject = nil
+    UI.heavenly.uiRoot = nil
+    return nil
+end
+
+UI.heavenly.classifyRingColor = function(color)
+    if not color then return nil end
+    local r, g, b = color.R, color.G, color.B
+    if r >= 0.76 and g >= 0.76 and b >= 0.76 and math.abs(r - g) <= 0.22 and math.abs(g - b) <= 0.22 then
+        return "white"
+    end
+    if r >= 0.66 and g >= 0.38 and g <= 0.92 and b <= 0.42 and r > g then
+        return "gold"
+    end
+    return nil
+end
+
+UI.heavenly.collectRingCandidates = function(root, out)
+    if not root then return end
+    local ok, descendants = pcall(function() return root:GetDescendants() end)
+    if not ok then return end
+    for _, object in ipairs(descendants) do
+        if object:IsA("GuiObject") and object.Visible then
+            local size = object.AbsoluteSize
+            if size.X >= 18 and size.Y >= 18 and size.X <= 900 and size.Y <= 900 then
+                local aspect = size.X / math.max(1, size.Y)
+                if aspect >= 0.82 and aspect <= 1.22 then
+                    local stroke = object:FindFirstChildOfClass("UIStroke")
+                    local kind = nil
+                    if stroke and stroke.Transparency <= 0.42 and stroke.Thickness >= 1 then
+                        kind = UI.heavenly.classifyRingColor(stroke.Color)
+                    end
+                    if not kind and object:IsA("ImageLabel") and object.Image ~= "" and object.ImageTransparency <= 0.42 then
+                        kind = UI.heavenly.classifyRingColor(object.ImageColor3)
+                    end
+                    if kind then
+                            local pos = object.AbsolutePosition
+                            table.insert(out, {
+                                object = object,
+                                kind = kind,
+                                diameter = (size.X + size.Y) * 0.5,
+                                center = Vector2.new(pos.X + size.X * 0.5, pos.Y + size.Y * 0.5),
+                                parent = object.Parent,
+                            })
+                    end
+                end
+            end
+        end
+    end
+end
+
+UI.heavenly.findRingPair = function()
+    local candidates = {}
+    local roots, seen = {}, {}
+    local function addRoot(root)
+        if root and not seen[root] then
+            seen[root] = true
+            table.insert(roots, root)
+        end
+    end
+    addRoot(PlayerGui)
+    addRoot(UI.heavenly.uiRoot)
+    addRoot(LocalPlayer.Character)
+    addRoot(Workspace.CurrentCamera)
+
+    for _, root in ipairs(roots) do
+        UI.heavenly.collectRingCandidates(root, candidates)
+    end
+
+    local whiteCount, goldCount = 0, 0
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "white" then whiteCount = whiteCount + 1 end
+        if candidate.kind == "gold" then goldCount = goldCount + 1 end
+    end
+    local bestWhite, bestGold, bestScore = nil, nil, math.huge
+    for _, white in ipairs(candidates) do
+        if white.kind == "white" then
+            for _, gold in ipairs(candidates) do
+                if gold.kind == "gold" and white.diameter > gold.diameter * 1.12 then
+                    local ratio = white.diameter / gold.diameter
+                    if ratio <= 5.5 then
+                        local centerDistance = (white.center - gold.center).Magnitude
+                        local tolerance = math.max(16, gold.diameter * 0.16)
+                        if centerDistance <= tolerance then
+                            local parentPenalty = white.parent == gold.parent and 0 or 18
+                            local score = centerDistance + parentPenalty + math.abs(ratio - 1.9) * 3
+                            if score < bestScore then
+                                bestWhite, bestGold, bestScore = white, gold, score
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if bestWhite and bestGold then
+        return bestWhite.object, bestGold.object, "matched circular UIStroke pair"
+    end
+    return nil, nil, string.format("no matched pair (white=%d gold=%d candidates=%d)", whiteCount, goldCount, #candidates)
+end
+
+UI.heavenly.readFeedback = function()
+    local now = os.clock()
+    if now - UI.heavenly.feedbackScanAt < 0.12 then
+        return UI.heavenly.feedbackValue
+    end
+    UI.heavenly.feedbackScanAt = now
+    local roots = {UI.heavenly.uiRoot, PlayerGui}
+    for _, root in ipairs(roots) do
+        if root then
+            local ok, descendants = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, object in ipairs(descendants) do
+                    if object:IsA("TextLabel") or object:IsA("TextButton") then
+                        if object.Visible then
+                            local value = string.upper(tostring(object.Text or ""))
+                            if value == "PERFECT!" or value == "PERFECT" or value == "GOOD!" or value == "GOOD" or value == "MISS" or value == "FAILED" then
+                                UI.heavenly.feedbackValue = value
+                                return value
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    UI.heavenly.feedbackValue = nil
+    return nil
+end
+
+UI.heavenly.reset = function(reason)
+    if UI.heavenly.active then
+        DIAG.log("INFO", "HEAVENLY", "tribulation_ui_ended", {
+            reason = reason or "title disappeared",
+            spaceInputs = UI.heavenly.successfulInputs,
+            inputFailures = UI.heavenly.failedInputs,
+            duration = os.clock() - UI.heavenly.startedAt,
+        })
+    end
+    UI.heavenly.active = false
+    UI.heavenly.titleObject = nil
+    UI.heavenly.uiRoot = nil
+    UI.heavenly.whiteRing = nil
+    UI.heavenly.goldTarget = nil
+    UI.heavenly.previousRatio = nil
+    UI.heavenly.previousSampleAt = 0
+    UI.heavenly.pulseConsumed = false
+    UI.heavenly.ringLostAt = 0
+    UI.heavenly.inputBusy = false
+    UI.heavenly.scanAt = 0
+    UI.heavenly.lastFeedback = nil
+    UI.heavenly.feedbackValue = nil
+    UI.heavenly.feedbackScanAt = 0
+    UI.heavenly.lastNoPairLogAt = 0
+    UI.heavenly.pairDetected = false
+end
+
+UI.heavenly.process = function()
+    local now = os.clock()
+    local title = UI.heavenly.findTitle()
+    if title then
+        if not UI.heavenly.active then
+            UI.heavenly.active = true
+            UI.heavenly.startedAt = now
+            UI.heavenly.successfulInputs = 0
+            UI.heavenly.failedInputs = 0
+            UI.heavenly.lastInputAt = 0
+            UI.heavenly.scanAt = 0
+            UI.heavenly.ringLostAt = 0
+            UI.heavenly.feedbackScanAt = 0
+            UI.heavenly.feedbackValue = nil
+            UI.heavenly.lastNoPairLogAt = 0
+            UI.heavenly.pairDetected = false
+            UI.heavenly.previousRatio = nil
+            UI.heavenly.previousSampleAt = 0
+            UI.heavenly.pulseConsumed = false
+            UI.heavenly.whiteRing = nil
+            UI.heavenly.goldTarget = nil
+            breakthroughTrialSeen = true
+            lastTrialText = "Heavenly Tribulation: detecting timing ring"
+            DIAG.log("INFO", "HEAVENLY", "tribulation_detected", {
+                title = tostring(title.Text),
+                qiRealm = type(qiState) == "table" and qiState.realm or nil,
+                note = "Displayed realm cadence is every 5 realms; detection uses the live title, not realm modulo."
+            })
+        end
+        UI.heavenly.lastSeenAt = now
+        breakthroughTrialSeen = true
+    elseif UI.heavenly.active then
+        -- A short grace period prevents a transient title rebuild from releasing
+        -- the cultivation lock while the event is still resolving.
+        if now - UI.heavenly.lastSeenAt <= 1.25 then
+            return true
+        end
+        UI.heavenly.reset("Heavenly Tribulation title disappeared")
+        lastTrialText = "Heavenly Tribulation: finished; waiting for Qi realm/progress update"
+        setStatus("Heavenly Tribulation ended; waiting for the server's Qi progression update before resuming.", COLORS.success)
+        return false
+    else
+        return false
+    end
+
+    if not breakthroughEnabled then
+        lastTrialText = "Heavenly Tribulation: detected; Auto Breakthrough is OFF"
+        setStatus("Heavenly Tribulation detected, but Auto Breakthrough is OFF. SPACE timing is paused.", COLORS.warning)
+        return true
+    end
+
+    local whiteRef = UI.heavenly.whiteRing
+    local goldRef = UI.heavenly.goldTarget
+    local refsInvalid = (whiteRef and (not whiteRef.Parent or not whiteRef.Visible or whiteRef.AbsoluteSize.X < 18))
+        or (goldRef and (not goldRef.Parent or not goldRef.Visible or goldRef.AbsoluteSize.X < 18))
+    local noPair = not whiteRef or not goldRef
+    local shouldRescan = refsInvalid
+        or (noPair and now - UI.heavenly.scanAt >= 0.22)
+        or (not noPair and now - UI.heavenly.scanAt >= 0.90)
+    if shouldRescan then
+        UI.heavenly.scanAt = now
+        local whiteRing, goldTarget, ringSource = UI.heavenly.findRingPair()
+        UI.heavenly.whiteRing = whiteRing
+        UI.heavenly.goldTarget = goldTarget
+        UI.heavenly.ringSource = ringSource or "unavailable"
+        if not UI.heavenly.whiteRing or not UI.heavenly.goldTarget then
+            if UI.heavenly.ringLostAt == 0 then UI.heavenly.ringLostAt = now end
+            UI.heavenly.pairDetected = false
+            if now - UI.heavenly.ringLostAt > 0.28 then
+                UI.heavenly.previousRatio = nil
+                UI.heavenly.previousSampleAt = 0
+                UI.heavenly.pulseConsumed = false
+            end
+            lastTrialText = "Heavenly Tribulation: waiting for ring geometry"
+            if now - UI.heavenly.lastNoPairLogAt >= 1.0 then
+                UI.heavenly.lastNoPairLogAt = now
+                DIAG.log("WARN", "HEAVENLY", "timing_ring_pair_unresolved", {
+                    detail = UI.heavenly.ringSource,
+                    titleRoot = UI.heavenly.uiRoot and UI.heavenly.uiRoot:GetFullName() or "unknown",
+                })
+            end
+            setStatus("Heavenly Tribulation active; waiting for the white ring and gold target to become readable.", COLORS.warning)
+            return true
+        end
+        UI.heavenly.ringLostAt = 0
+        if not UI.heavenly.pairDetected then
+            UI.heavenly.pairDetected = true
+            DIAG.log("INFO", "HEAVENLY", "timing_ring_pair_found", {source = UI.heavenly.ringSource})
+        end
+    end
+
+    local white = UI.heavenly.whiteRing
+    local gold = UI.heavenly.goldTarget
+    if not white or not gold or not white.Parent or not gold.Parent or not white.Visible or not gold.Visible then
+        UI.heavenly.whiteRing = nil
+        UI.heavenly.goldTarget = nil
+        UI.heavenly.ringLostAt = now
+        UI.heavenly.pairDetected = false
+        return true
+    end
+
+    local ws, gs = white.AbsoluteSize, gold.AbsoluteSize
+    local ratio = ((ws.X + ws.Y) * 0.5) / math.max(1, (gs.X + gs.Y) * 0.5)
+    local previous = UI.heavenly.previousRatio
+    local previousAt = UI.heavenly.previousSampleAt
+    local dt = previousAt > 0 and math.max(0.001, now - previousAt) or 0
+    local shrinking = previous ~= nil and ratio < previous - 0.002
+
+    -- A new pulse begins when the ring resets to a clearly larger diameter.
+    if ratio >= 1.22 and (previous == nil or ratio > previous + 0.08) then
+        UI.heavenly.pulseConsumed = false
+    end
+
+    local shouldPress = false
+    local timeToAlignment = nil
+    if not UI.heavenly.pulseConsumed and not UI.heavenly.inputBusy and now - UI.heavenly.lastInputAt >= 0.32
+        and shrinking and dt > 0 then
+        local rate = (ratio - previous) / dt
+        if rate < -0.02 then
+            timeToAlignment = (1.0 - ratio) / rate
+            -- Predict a small input lead so the key-down lands near the visual
+            -- crossing. A just-crossed ring is accepted only within a narrow band.
+            shouldPress = (timeToAlignment >= -0.018 and timeToAlignment <= 0.065)
+                or (ratio <= 1.035 and ratio >= 0.88 and previous > 1.035)
+        end
+    end
+
+    UI.heavenly.previousRatio = ratio
+    UI.heavenly.previousSampleAt = now
+    local feedback = UI.heavenly.readFeedback()
+    if feedback and feedback ~= UI.heavenly.lastFeedback then
+        UI.heavenly.lastFeedback = feedback
+        DIAG.log("INFO", "HEAVENLY", "timing_feedback", {feedback = feedback, ratio = ratio})
+        if feedback == "PERFECT" or feedback == "PERFECT!" or feedback == "GOOD" or feedback == "GOOD!" then
+            UI.heavenly.successfulInputs = UI.heavenly.successfulInputs + 1
+        elseif feedback == "MISS" or feedback == "FAILED" then
+            DIAG.log("WARN", "HEAVENLY", "timing_miss_feedback", {feedback = feedback, ratio = ratio})
+        end
+    elseif not feedback then
+        UI.heavenly.lastFeedback = nil
+    end
+
+    if shouldPress then
+        UI.heavenly.pulseConsumed = true
+        UI.heavenly.inputBusy = true
+        UI.heavenly.lastInputAt = now
+        lastTrialText = "Heavenly Tribulation: SPACE timing input"
+        DIAG.log("INFO", "HEAVENLY", "space_input_attempt", {
+            ringRatio = ratio,
+            previousRatio = previous,
+            timeToAlignment = timeToAlignment,
+            ringSource = UI.heavenly.ringSource,
+        })
+        task.spawn(function()
+            local ok, sent, backend = pcall(sendKey, Enum.KeyCode.Space)
+            UI.heavenly.inputBusy = false
+            if ok and sent then
+                DIAG.log("INFO", "HEAVENLY", "space_input_sent", {backend = backend, ringRatio = ratio})
+                setStatus("Heavenly Tribulation: SPACE sent at predicted ring alignment.", COLORS.success)
+            else
+                UI.heavenly.failedInputs = UI.heavenly.failedInputs + 1
+                DIAG.log("ERROR", "HEAVENLY", "space_input_failed", {error = ok and backend or tostring(sent), ringRatio = ratio})
+                setStatus("Heavenly Tribulation SPACE input failed; waiting for the next ring pulse.", COLORS.danger)
+            end
+        end)
+    else
+        lastTrialText = string.format("Heavenly Tribulation: ring %.2fx | SPACE inputs %d", ratio, UI.heavenly.successfulInputs)
+    end
+    return true
+end
+
 local function processTrial()
+    if UI.heavenly.process() then
+        return true
+    end
     local trialGui = getActiveTrialGui()
     if not trialGui then
         if activeTrialGui then
@@ -1310,7 +1721,7 @@ local function resetBreakthroughState(mode, signature)
 end
 
 local function processBreakthrough()
-    if autoBrewBusy or cauldronPanelIsOpen() then
+    if UI.heavenly.active or autoBrewBusy or cauldronPanelIsOpen() then
         return
     end
     local mode, frame, statusPanel = getActiveMode()
@@ -1682,12 +2093,12 @@ local function stopAutomationOwnedTraining(mode)
 end
 
 local function processAutoCultivation()
-    if herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
+    if UI.heavenly.active or herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
         return
     end
     -- Never relocate or restart training while a breakthrough/tribulation is
     -- loading, active, or waiting for its progression update.
-    if activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen then
+    if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen then
         return
     end
 
@@ -1957,7 +2368,7 @@ end
 local function herbWait(seconds)
     local finishAt = os.clock() + seconds
     while os.clock() < finishAt do
-        if not running or not autoHerbsEnabled or paused then
+        if not running or not autoHerbsEnabled or paused or UI.heavenly.active then
             return false
         end
         task.wait(0.05)
@@ -2078,7 +2489,7 @@ local function finishHerbSweep(reason)
 
     -- With Auto Cultivation enabled, its normal controller will return to the
     -- best unlocked zone. Otherwise restore the user's previous position.
-    if not selectedAutoMode and herbReturnCFrame then
+    if not UI.heavenly.active and not selectedAutoMode and herbReturnCFrame then
         local root = getCharacterParts()
         if root then
             pcall(function()
@@ -2094,7 +2505,7 @@ local function finishHerbSweep(reason)
     herbReturnCFrame = nil
     herbResumeMode = nil
 
-    if not selectedAutoMode and resumeMode and running and not paused then
+    if not UI.heavenly.active and not selectedAutoMode and resumeMode and running and not paused then
         if not isTrainingActive(resumeMode) then
             activateTraining(resumeMode)
         end
@@ -2177,6 +2588,7 @@ local function collectHerbPrompt(prompt, position, herbName, herbAge)
 end
 
 local function isBreakthroughPending()
+    if UI.heavenly.active then return true end
     if not breakthroughEnabled then
         return false
     end
@@ -2244,7 +2656,7 @@ end
 SILVER.wait = function(seconds)
     local untilTime = os.clock() + seconds
     while os.clock() < untilTime do
-        if not running or not SILVER.autoEnabled or paused then return false end
+        if not running or not SILVER.autoEnabled or paused or UI.heavenly.active then return false end
         task.wait(0.05)
     end
     return true
@@ -2384,7 +2796,7 @@ SILVER.run = function()
             if paused then
                 SILVER.setStatus("paused")
                 task.wait(0.25)
-            elseif herbCollectorBusy or CHEST.busy or autoBrewBusy or cauldronPanelIsOpen()
+            elseif UI.heavenly.active or herbCollectorBusy or CHEST.busy or autoBrewBusy or cauldronPanelIsOpen()
                 or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 SILVER.setStatus("waiting for herb/chest/brew/breakthrough")
                 task.wait(0.3)
@@ -2455,7 +2867,7 @@ SILVER.run = function()
                             local startRewardCount = ECONOMY.npcKillCount
                             local attackDeadline = os.clock() + 35
                             while running and SILVER.autoEnabled and not paused and target.Parent and targetHumanoid.Health > 0 and os.clock() < attackDeadline do
-                                if activeTrialGui or getActiveTrialGui() or CHEST.busy or herbCollectorBusy or autoBrewBusy then break end
+                                if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or CHEST.busy or herbCollectorBusy or autoBrewBusy then break end
                                 local liveRoot, liveHumanoid = getCharacterParts()
                                 if liveHumanoid and liveHumanoid.MaxHealth > 0
                                     and liveHumanoid.Health / liveHumanoid.MaxHealth <= SILVER.retreatHealthFraction then
@@ -2558,7 +2970,7 @@ local function runHerbCollector()
             if paused then
                 setHerbStatus("paused")
                 task.wait(0.25)
-            elseif CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif UI.heavenly.active or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 setHerbStatus("waiting for breakthrough")
                 task.wait(0.25)
             else
@@ -2901,7 +3313,7 @@ CHEST.returnFromTeleport = function(reason, stopping)
         DIAG.log("WARN", "CHEST", "teleport_return_no_character", {reason = reason or "manual return"})
     end
 
-    if not stopping and running and not paused and resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then
+    if not stopping and running and not paused and not UI.heavenly.active and resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then
         task.delay(0.65, function()
             if running and not paused and not CHEST.teleportActive and not isTrainingActive(resumeMode) then
                 activateTraining(resumeMode)
@@ -2917,7 +3329,7 @@ CHEST.teleportToBest = function()
     if CHEST.teleportActive then
         return CHEST.returnFromTeleport("returned to previous position")
     end
-    if CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or SILVER.autoEnabled or autoBrewBusy or cauldronPanelIsOpen() then
+    if UI.heavenly.active or CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or SILVER.autoEnabled or autoBrewBusy or cauldronPanelIsOpen() then
         CHEST.setStatus("turn off Auto Chest / finish current activity before using Chest Teleport")
         return false
     end
@@ -3001,10 +3413,10 @@ end
 CHEST.wait = function(seconds)
     local deadline = os.clock() + seconds
     while os.clock() < deadline do
-        if not running or not CHEST.autoEnabled or paused then
+        if not running or not CHEST.autoEnabled or paused or UI.heavenly.active then
             return false
         end
-        if activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
+        if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
             return false
         end
         task.wait(0.05)
@@ -3213,7 +3625,7 @@ CHEST.finishSweep = function(reason)
         return
     end
     CHEST.busy = false
-    if not selectedAutoMode and CHEST.returnCFrame then
+    if not UI.heavenly.active and not selectedAutoMode and CHEST.returnCFrame then
         local root = getCharacterParts()
         if root then
             pcall(function()
@@ -3227,7 +3639,7 @@ CHEST.finishSweep = function(reason)
     local resumeMode = CHEST.resumeMode
     CHEST.returnCFrame = nil
     CHEST.resumeMode = nil
-    if not selectedAutoMode and resumeMode and running then
+    if not UI.heavenly.active and not selectedAutoMode and resumeMode and running then
         if paused then
             CHEST.pendingManualResume = resumeMode
         elseif not isTrainingActive(resumeMode) then
@@ -3311,7 +3723,7 @@ CHEST.collect = function(spot, prompt, position, tier)
     local deadline = os.clock() + 4.5
     local stateChanged = false
     while running and CHEST.autoEnabled and os.clock() < deadline do
-        if paused or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
+        if UI.heavenly.active or paused or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
             return false, "cancelled by pause, breakthrough, tribulation, or cauldron"
         end
         local event = CHEST.getLocalOpenEvent(spot, tier, revisionBefore)
@@ -3346,7 +3758,7 @@ CHEST.run = function()
             if paused then
                 CHEST.setStatus("paused")
                 task.wait(0.2)
-            elseif herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif UI.heavenly.active or herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 if CHEST.busy then
                     CHEST.finishSweep("pausing chest sweep for another activity")
                 end
@@ -3436,7 +3848,7 @@ end
 local function brewWaitFor(predicate, timeout)
     local deadline = os.clock() + (timeout or 2)
     while running and autoBrewEnabled do
-        if paused then
+        if paused or UI.heavenly.active then
             task.wait(0.1)
             deadline = deadline + 0.1
         else
@@ -3714,7 +4126,7 @@ local function processAutoStoke(stoke)
     local startedAt = os.clock()
     local previousCenter = nil
 
-    while running and autoBrewEnabled
+    while running and autoBrewEnabled and not UI.heavenly.active
         and stoke and stoke.Parent and stoke.Visible
         and serial == cauldronBrewSerial do
 
@@ -3837,7 +4249,7 @@ local function runAutoBrew()
         while running and autoBrewEnabled do
             if paused then
                 task.wait(0.15)
-            elseif CHEST.busy or SILVER.busy then
+            elseif UI.heavenly.active or CHEST.busy or SILVER.busy then
                 setStatus("Auto Brew waiting for chest or Silver farming to finish.", COLORS.warning)
                 task.wait(0.2)
             else
@@ -4240,7 +4652,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.3",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.4",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -5289,7 +5701,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.3", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.4", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
 DIAG.refreshUI(true)
 
 task.spawn(function()
@@ -5372,7 +5784,7 @@ addConnection(RunService.RenderStepped, function()
         end
     end
 
-    if CHEST.pendingManualResume and not paused and not CHEST.busy and not SILVER.busy and not herbCollectorBusy and not autoBrewBusy then
+    if CHEST.pendingManualResume and not UI.heavenly.active and not paused and not CHEST.busy and not SILVER.busy and not herbCollectorBusy and not autoBrewBusy then
         local resumeMode = CHEST.pendingManualResume
         CHEST.pendingManualResume = nil
         if running and not isTrainingActive(resumeMode) then
@@ -5398,11 +5810,11 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v1.0.3 loaded. Integrated diagnostics + Experimental Lab are enabled.")
-print("[CU AutoCultivation] v1.0.3: Chest uses verified E-hold fallback; manual E timing is recorded. Experimental Lab provides passive remote audit only.")
+print("[CU AutoCultivation] v1.0.4 loaded. Heavenly Tribulation timing controller + integrated diagnostics are enabled.")
+print("[CU AutoCultivation] v1.0.4: Heavenly Tribulation is detected by its live title; SPACE timing uses matched white/gold ring geometry. Existing chest behavior is unchanged.")
 print("[CU AutoCultivation] Auto Silver uses SAFE weakest-target selection by default, faster bounded M1 input, low-health retreat, and server reward confirmations.")
 print("[CU AutoCultivation] Herb quick interaction is user-toggleable; chest instant probe is independently enabled with a normal E-hold fallback.")
 print("[CU AutoCultivation] Diagnostics/Experiments do not hook or modify network calls, and never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.3"})
-setStatus("Loaded v1.0.3. Diagnostics are ON; Experimental Lab is available. Auto Chest uses E-hold fallback.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.4"})
+setStatus("Loaded v1.0.4. Heavenly Tribulation controller is integrated; waiting for Qi trial.", COLORS.success)
