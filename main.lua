@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.4
+    Version: 1.0.5
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -33,8 +33,11 @@
         including disabled/locked prompt counts.
       - Economy dashboard: Silver and Primordial Stone balances, NPC Silver rewards,
         session deltas, and Destiny reroll probability/cost estimates.
-      - Auto Silver: targets eligible non-boss cultivators in Workspace.CultivatorCamps
-        using normal client-side weapon input; no fabricated reward remotes.
+      - Silver Target Scan: selects eligible non-boss cultivators without camera or mouse input.
+        Autonomous combat remains disabled until a non-click attack activation is verified.
+      - Auto Immortal Inheritance: observes the Inheritance server event, pauses cultivation,
+        travels to a staging point, walks into the 50-stud claim area, waits for server result,
+        then returns and resumes the prior cultivation mode.
       - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics, Experiments.
       - Integrated bounded diagnostics for module actions, server confirmations, errors, and fast-progress rate sampling.
       - Manual Destiny reroll audit: records displayed odds, click category/batch, balances, and server result updates.
@@ -42,7 +45,8 @@
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
-      - Chest reward confirmation uses the inbound ChestWorldOpened event only.
+      - Chest and Inheritance event confirmation use inbound server events only.
+      - Silver target scanning does not synthesize mouse input or move the camera.
       - Teleport uses local character CFrame and may be corrected by the server.
       - Zone activation is checked against replicated zone multipliers before
         the script starts meditation or push-ups.
@@ -118,6 +122,26 @@ local CHEST = {
     tierSelection = {Celestial = true, Jade = true, Bronze = true, Wooden = true},
     tierOrder = {Celestial = 4, Jade = 3, Bronze = 2, Wooden = 1},
 }
+local INHERITANCE = {
+    autoEnabled = false,
+    active = false,
+    busy = false,
+    taskRunning = false,
+    state = "unknown",
+    holder = nil,
+    progress = 0,
+    position = nil,
+    radius = 50,
+    endsAt = nil,
+    winner = nil,
+    lastEventKey = nil,
+    attemptedEventKey = nil,
+    returnCFrame = nil,
+    resumeMode = nil,
+    resumeWasAuto = false,
+    claimEnteredAt = nil,
+    activeName = "waiting for event",
+}
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0, ageOptions = {1000, 100, 10, 1}, ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}}
 local QUICK_INTERACT = {enabled = false, chestEnabled = true, attempts = 0, successes = 0, fallbacks = 0}
 local EXPERIMENT = {
@@ -161,7 +185,7 @@ local SILVER = {
     lastReward = 0,
     lastTargetAt = 0,
     autoDrawEnabled = false,
-    jAttemptedCharacter = nil,
+    tAttemptedCharacter = nil,
     targetMode = "SAFE", -- SAFE chooses the weakest eligible non-boss camp NPC.
     attackInterval = 0.18,
     clickHold = 0.045,
@@ -637,7 +661,7 @@ end
 SILVER.setStatus = function(message)
     SILVER.activeName = tostring(message or "idle")
     if UI.silverInfoLabel then
-        UI.silverInfoLabel.Text = "Auto Silver: " .. SILVER.activeName
+        UI.silverInfoLabel.Text = "Silver Scan: " .. SILVER.activeName
     end
     if UI.silverTargetLabel then
         local targetName = SILVER.currentTarget and SILVER.currentTarget.Name or "none"
@@ -680,6 +704,8 @@ local function stop(reason)
     autoBrewBusy = false
     CHEST.autoEnabled = false
     if CHEST.returnFromTeleport then pcall(CHEST.returnFromTeleport, "script stopped", true) end
+    if INHERITANCE.returnToPrevious then pcall(INHERITANCE.returnToPrevious, "script stopped", true) end
+    INHERITANCE.autoEnabled = false
     SILVER.autoEnabled = false
     SILVER.busy = false
     EXPERIMENT.remoteAuditEnabled = false
@@ -727,7 +753,14 @@ Env.__CUAutoCultivationState = {
             autoBrewBusy = autoBrewBusy,
             autoChestEnabled = CHEST.autoEnabled,
             autoSilverEnabled = SILVER.autoEnabled,
+            silverMode = "scan_only_no_mouse_input",
             autoDrawSwordEnabled = SILVER.autoDrawEnabled,
+            autoInheritanceEnabled = INHERITANCE.autoEnabled,
+            inheritanceActive = INHERITANCE.active,
+            inheritanceBusy = INHERITANCE.busy,
+            inheritanceState = INHERITANCE.state,
+            inheritanceHolder = INHERITANCE.holder,
+            inheritanceProgress = INHERITANCE.progress,
             silverBusy = SILVER.busy,
             silverKills = SILVER.kills,
             silverEarned = SILVER.earned,
@@ -2093,7 +2126,7 @@ local function stopAutomationOwnedTraining(mode)
 end
 
 local function processAutoCultivation()
-    if UI.heavenly.active or herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
+    if UI.heavenly.active or INHERITANCE.busy or herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
         return
     end
     -- Never relocate or restart training while a breakthrough/tribulation is
@@ -2600,8 +2633,8 @@ local function isBreakthroughPending()
     return percent ~= nil and percent >= 99.95
 end
 
--- Auto Silver uses visible CultivatorCamps NPCs and normal weapon input only.
--- It never fires NpcKillSilver or any reward/update RemoteEvent.
+-- Silver target scanning uses visible CultivatorCamps NPCs. It sends no attack input
+-- and never fires NpcKillSilver or any reward/update RemoteEvent.
 SILVER.getNpcRoot = function(model)
     if not model then return nil end
     return model:FindFirstChild("HumanoidRootPart")
@@ -2698,112 +2731,59 @@ SILVER.ensureWeaponDrawn = function()
     end
     if not SILVER.autoDrawEnabled then
         DIAG.log("WARN", "SILVER", "weapon_state_unknown", {autoDraw = false, source = source})
-        return true, "weapon state unknown; attempting normal M1 without J toggle"
+        return true, "weapon state unknown; scan-only mode will not send an attack input"
     end
-    if SILVER.jAttemptedCharacter == character then
-        return true, "J was already attempted for this character; no repeated toggle"
+    if SILVER.tAttemptedCharacter == character then
+        return true, "T was already attempted for this character; no repeated toggle"
     end
-    SILVER.jAttemptedCharacter = character
-    DIAG.log("INFO", "SILVER", "sword_draw_key_attempt", {key = "J", priorState = source})
-    local sent, backend = sendKey(Enum.KeyCode.J)
+    SILVER.tAttemptedCharacter = character
+    DIAG.log("INFO", "SILVER", "sword_carry_key_attempt", {key = "T", priorState = source})
+    local sent, backend = sendKey(Enum.KeyCode.T)
     if not sent then
-        DIAG.log("ERROR", "SILVER", "sword_draw_key_failed", {backend = backend})
-        return false, "could not send J to draw sword: " .. tostring(backend)
+        DIAG.log("ERROR", "SILVER", "sword_carry_key_failed", {backend = backend})
+        return false, "could not send T to carry sword: " .. tostring(backend)
     end
     task.wait(0.35)
     local after, afterSource, afterName = SILVER.detectWeaponState()
-    DIAG.log(after and "INFO" or "WARN", "SILVER", "sword_draw_state_after_j", {detected = after, source = afterSource, weapon = afterName, backend = backend})
-    if after then return true, "sword drawn with J" end
+    DIAG.log(after and "INFO" or "WARN", "SILVER", "sword_carry_state_after_t", {detected = after, source = afterSource, weapon = afterName, backend = backend})
+    if after then return true, "sword carried with T" end
     -- Some games render the sword locally without exposing a Tool/Value. Do not
-    -- press J again (it would sheath it); allow one normal M1 damage probe.
-    return true, "J sent once; weapon state hidden, testing M1"
+    -- press T again (it would toggle the sword back); leave attack input to the user.
+    return true, "T sent once; weapon state hidden"
 end
 
-SILVER.basicAttack = function(targetRoot)
-    local character = LocalPlayer.Character
-    if not character or not targetRoot then return false, "character or target unavailable" end
-
-    local camera = Workspace.CurrentCamera
-    local vinput = nil
-    local okService, service = pcall(function() return game:GetService("VirtualInputManager") end)
-    if okService then vinput = service end
-    if not vinput then
-        DIAG.log("ERROR", "SILVER", "attack_preflight_failed", {reason = "VirtualInputManager unavailable"})
-        return false, "VirtualInputManager unavailable for normal M1 input"
-    end
-
-    local screenPoint, onScreen
-    local oldCamera = nil
-    local cameraChanged = false
-    if camera then
-        screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
-        if not onScreen then
-            oldCamera = camera.CFrame
-            cameraChanged = true
-            pcall(function() camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetRoot.Position) end)
-            task.wait(0.08)
-            screenPoint, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
-            if not onScreen then
-                pcall(function() camera.CFrame = oldCamera end)
-                DIAG.log("WARN", "SILVER", "target_not_on_screen", {target = targetRoot.Parent and targetRoot.Parent.Name})
-                return false, "target is not on screen; move camera toward the NPC"
-            end
-        end
-    else
-        return false, "camera unavailable"
-    end
-
-    local x, y = math.floor(screenPoint.X), math.floor(screenPoint.Y)
-    -- Do not click through an active UI overlay.
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if playerGui then
-        local okGui, objects = pcall(function() return playerGui:GetGuiObjectsAtPosition(x, y) end)
-        if okGui and type(objects) == "table" then
-            for _, object in ipairs(objects) do
-                if object:IsA("GuiButton") or object:IsA("TextBox") then
-                    if cameraChanged and oldCamera then pcall(function() camera.CFrame = oldCamera end) end
-                    DIAG.log("WARN", "SILVER", "target_covered_by_gui", {target = targetRoot.Parent and targetRoot.Parent.Name, gui = object:GetFullName()})
-                    return false, "an interactive GUI covers the target; close menus before farming"
-                end
-            end
-        end
-    end
-    local downOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, true, game, 0) end)
-    task.wait(SILVER.clickHold or 0.045)
-    local upOk = pcall(function() vinput:SendMouseButtonEvent(x, y, 0, false, game, 0) end)
-    if cameraChanged and oldCamera then
-        pcall(function() camera.CFrame = oldCamera end)
-    end
-    local ok = downOk and upOk
-    DIAG.log(ok and "INFO" or "ERROR", "SILVER", "m1_input_sent", {target = targetRoot.Parent and targetRoot.Parent.Name, screenX = x, screenY = y, mouseDown = downOk, mouseUp = upOk, cameraAdjusted = cameraChanged})
-    return ok, ok and "normal left-click" or "M1 input failed"
+-- Combat activation is intentionally scan-only in v1.0.5.
+-- Observer v1.3 proves manual M1 -> Action animation -> HitFeedback -> NPC HP change,
+-- but does not expose a verified non-mouse activation API. Never hijack the camera
+-- or synthesize mouse clicks here. Target selection and reward monitoring remain live.
+SILVER.basicAttack = function(_targetRoot)
+    return false, "scan-only: no verified non-click combat activation is available"
 end
 
 SILVER.run = function()
     if SILVER.taskRunning then return end
     SILVER.taskRunning = true
-    local startRoot = getCharacterParts()
-    if startRoot and not SILVER.returnCFrame then
-        SILVER.returnCFrame = startRoot.CFrame
-    end
-    DIAG.log("INFO", "SILVER", "silver_run_started", {
+    DIAG.log("INFO", "SILVER", "target_scan_started", {
         targetMode = SILVER.targetMode,
-        attackInterval = SILVER.attackInterval,
-        autoDraw = SILVER.autoDrawEnabled,
+        combatInput = "disabled_no_mouse_or_camera_input",
+        autoCarry = SILVER.autoDrawEnabled,
     })
     task.spawn(function()
         while running and SILVER.autoEnabled do
             if paused then
                 SILVER.setStatus("paused")
                 task.wait(0.25)
-            elseif UI.heavenly.active or herbCollectorBusy or CHEST.busy or autoBrewBusy or cauldronPanelIsOpen()
+            elseif INHERITANCE.busy or UI.heavenly.active or herbCollectorBusy or CHEST.busy
+                or CHEST.teleportActive or autoBrewBusy or cauldronPanelIsOpen()
                 or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
-                SILVER.setStatus("waiting for herb/chest/brew/breakthrough")
+                SILVER.setStatus("target scan paused for another activity")
                 task.wait(0.3)
             else
-                local playerRoot, playerHumanoid = getCharacterParts()
+                local playerRoot = getCharacterParts()
                 local playerRealm = getRealmNumber("Qi")
-                if not playerRoot or not playerHumanoid then
+                if not playerRoot then
+                    SILVER.currentTarget = nil
+                    SILVER.currentTargetRealm = nil
                     SILVER.setStatus("waiting for character")
                     task.wait(0.5)
                 elseif not playerRealm then
@@ -2815,125 +2795,37 @@ SILVER.run = function()
                         SILVER.currentTarget = nil
                         SILVER.currentTargetRealm = nil
                         SILVER.setStatus("no eligible non-boss CultivatorCamps NPC for Qi Realm " .. tostring(playerRealm))
-                        task.wait(2.0)
+                        task.wait(1.0)
                     else
-                        SILVER.busy = true
+                        local changed = SILVER.currentTarget ~= target
                         SILVER.currentTarget = target
                         SILVER.currentTargetRealm = targetRealm
-                        SILVER.setStatus("targeting " .. target.Name .. " (Qi " .. tostring(targetRealm) .. ")")
-                        DIAG.log("INFO", "SILVER", "target_selected", {target = target.Name, realm = targetRealm, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, distance = (playerRoot.Position - targetRoot.Position).Magnitude, playerRealm = playerRealm, targetMode = SILVER.targetMode})
-
-                        if selectedAutoMode then
-                            stopAutomationOwnedTraining(selectedAutoMode)
+                        if changed then
+                            DIAG.log("INFO", "SILVER", "scan_target_selected", {
+                                target = target.Name,
+                                realm = targetRealm,
+                                hp = targetHumanoid.Health,
+                                maxHp = targetHumanoid.MaxHealth,
+                                distance = (playerRoot.Position - targetRoot.Position).Magnitude,
+                                playerRealm = playerRealm,
+                                targetMode = SILVER.targetMode,
+                            })
                         end
-
+                        if SILVER.autoDrawEnabled then
+                            local ready, message = SILVER.ensureWeaponDrawn()
+                            if not ready then
+                                SILVER.setStatus("auto-carry unavailable: " .. tostring(message))
+                            end
+                        end
                         local distance = (playerRoot.Position - targetRoot.Position).Magnitude
-                        if distance > 11 then
-                            local destination = targetRoot.Position + Vector3.new(0, 0, 7)
-                            local look = targetRoot.Position
-                            local moved = pcall(function()
-                                playerRoot.AssemblyLinearVelocity = Vector3.zero
-                                playerRoot.AssemblyAngularVelocity = Vector3.zero
-                                playerRoot.CFrame = CFrame.lookAt(destination, look)
-                            end)
-                            if not moved or not SILVER.wait(1.25) then
-                                DIAG.log("ERROR", "SILVER", "teleport_failed", {target = target.Name, moved = moved})
-                                SILVER.busy = false
-                                break
-                            end
-                            playerRoot = getCharacterParts()
-                            DIAG.log("INFO", "SILVER", "arrived_near_target", {target = target.Name, playerPosition = playerRoot and playerRoot.Position or nil, targetPosition = targetRoot.Position, distance = playerRoot and (playerRoot.Position - targetRoot.Position).Magnitude or nil})
-                            if not playerRoot or (playerRoot.Position - targetRoot.Position).Magnitude > 20 then
-                                SILVER.blacklist[target] = os.clock() + 12
-                                SILVER.failed = SILVER.failed + 1
-                                SILVER.setStatus("could not reach " .. target.Name .. "; skipping for 12s")
-                                SILVER.busy = false
-                                task.wait(0.25)
-                            end
-                        end
-
-                        if SILVER.busy and running and SILVER.autoEnabled and target.Parent and targetHumanoid.Health > 0 then
-                            local weaponReady, weaponMessage = SILVER.ensureWeaponDrawn()
-                            DIAG.log(weaponReady and "INFO" or "WARN", "SILVER", "weapon_preparation", {result = weaponReady, detail = weaponMessage, autoDraw = SILVER.autoDrawEnabled})
-                            if not weaponReady then
-                                SILVER.setStatus("weapon preparation failed: " .. tostring(weaponMessage))
-                                SILVER.busy = false
-                            end
-                        end
-
-                        if SILVER.busy and running and SILVER.autoEnabled and target.Parent and targetHumanoid.Health > 0 then
-                            local lastHealth = targetHumanoid.Health
-                            local lastDamageAt = os.clock()
-                            local startRewardCount = ECONOMY.npcKillCount
-                            local attackDeadline = os.clock() + 35
-                            while running and SILVER.autoEnabled and not paused and target.Parent and targetHumanoid.Health > 0 and os.clock() < attackDeadline do
-                                if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or CHEST.busy or herbCollectorBusy or autoBrewBusy then break end
-                                local liveRoot, liveHumanoid = getCharacterParts()
-                                if liveHumanoid and liveHumanoid.MaxHealth > 0
-                                    and liveHumanoid.Health / liveHumanoid.MaxHealth <= SILVER.retreatHealthFraction then
-                                    DIAG.log("WARN", "SILVER", "low_health_retreat", {
-                                        health = liveHumanoid.Health,
-                                        maxHealth = liveHumanoid.MaxHealth,
-                                        threshold = SILVER.retreatHealthFraction,
-                                        target = target.Name,
-                                    })
-                                    SILVER.setStatus("low health; stopping farm and returning to start position")
-                                    SILVER.autoEnabled = false
-                                    if UI.silverButton then
-                                        UI.silverButton.Text = "AUTO SILVER: OFF"
-                                        UI.silverButton.BackgroundColor3 = COLORS.panel2
-                                    end
-                                    updateModeButtons()
-                                    break
-                                end
-                                local okAttack, backend = SILVER.basicAttack(targetRoot)
-                                if not okAttack then
-                                    SILVER.setStatus("attack stopped: " .. tostring(backend))
-                                    if string.find(string.lower(tostring(backend)), "draw your weapon", 1, true) then
-                                        SILVER.setStatus("waiting: draw/equip your sword; Auto Silver remains ON")
-                                        task.wait(1.0)
-                                        break
-                                    elseif string.find(string.lower(tostring(backend)), "virtualinputmanager unavailable", 1, true) then
-                                        SILVER.setStatus("waiting: executor has no supported M1 input; Auto Silver remains ON")
-                                        task.wait(1.5)
-                                        break
-                                    end
-                                    SILVER.blacklist[target] = os.clock() + 20
-                                    break
-                                end
-                                task.wait(SILVER.attackInterval or 0.18)
-                                local healthNow = targetHumanoid.Health
-                                if healthNow < lastHealth - 0.1 then
-                                    local previousHealth = lastHealth
-                                    lastHealth = healthNow
-                                    lastDamageAt = os.clock()
-                                    SILVER.setStatus("attacking " .. target.Name .. " | HP " .. ECONOMY.formatNumber(healthNow) .. "/" .. ECONOMY.formatNumber(targetHumanoid.MaxHealth))
-                                    DIAG.log("INFO", "SILVER", "damage_observed", {target = target.Name, previousHp = previousHealth, currentHp = healthNow, damage = previousHealth - healthNow})
-                                elseif os.clock() - lastDamageAt > 4.5 then
-                                    SILVER.setStatus("no damage registered on " .. target.Name .. "; skipping")
-                                    DIAG.log("ERROR", "SILVER", "no_damage_timeout", {target = target.Name, hp = targetHumanoid.Health, maxHp = targetHumanoid.MaxHealth, elapsedWithoutDamage = os.clock() - lastDamageAt})
-                                    SILVER.blacklist[target] = os.clock() + 20
-                                    break
-                                end
-                            end
-
-                            if targetHumanoid.Health <= 0 then
-                                local rewardDeadline = os.clock() + 4
-                                while running and os.clock() < rewardDeadline and ECONOMY.npcKillCount <= startRewardCount do
-                                    task.wait(0.1)
-                                end
-                                if ECONOMY.npcKillCount > startRewardCount then
-                                    SILVER.kills = SILVER.kills + 1
-                                    SILVER.setStatus("defeated " .. target.Name .. " | +" .. ECONOMY.formatNumber(SILVER.lastReward) .. " Silver")
-                                else
-                                    SILVER.setStatus("defeated " .. target.Name .. "; waiting for Silver reward confirmation")
-                                end
-                            end
-                        end
-                        SILVER.busy = false
-                        SILVER.currentTarget = nil
-                        SILVER.currentTargetRealm = nil
-                        if SILVER.autoEnabled then task.wait(0.35) end
+                        SILVER.setStatus(string.format(
+                            "SCAN ONLY: %s | HP %s/%s | %.1f studs | manual M1 required",
+                            target.Name,
+                            ECONOMY.formatNumber(targetHumanoid.Health),
+                            ECONOMY.formatNumber(targetHumanoid.MaxHealth),
+                            distance
+                        ))
+                        task.wait(0.35)
                     end
                 end
             end
@@ -2941,18 +2833,6 @@ SILVER.run = function()
         SILVER.busy = false
         SILVER.currentTarget = nil
         SILVER.currentTargetRealm = nil
-        if not SILVER.autoEnabled and SILVER.returnCFrame then
-            local returnRoot = getCharacterParts()
-            if returnRoot then
-                pcall(function()
-                    returnRoot.AssemblyLinearVelocity = Vector3.zero
-                    returnRoot.AssemblyAngularVelocity = Vector3.zero
-                    returnRoot.CFrame = SILVER.returnCFrame
-                end)
-                DIAG.log("INFO", "SILVER", "returned_to_start_position", {})
-            end
-            SILVER.returnCFrame = nil
-        end
         SILVER.taskRunning = false
         SILVER.setStatus(SILVER.autoEnabled and "waiting" or "OFF")
         updateModeButtons()
@@ -2970,7 +2850,7 @@ local function runHerbCollector()
             if paused then
                 setHerbStatus("paused")
                 task.wait(0.25)
-            elseif UI.heavenly.active or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif UI.heavenly.active or INHERITANCE.busy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 setHerbStatus("waiting for breakthrough")
                 task.wait(0.25)
             else
@@ -3329,7 +3209,7 @@ CHEST.teleportToBest = function()
     if CHEST.teleportActive then
         return CHEST.returnFromTeleport("returned to previous position")
     end
-    if UI.heavenly.active or CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or SILVER.autoEnabled or autoBrewBusy or cauldronPanelIsOpen() then
+    if UI.heavenly.active or INHERITANCE.busy or CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() then
         CHEST.setStatus("turn off Auto Chest / finish current activity before using Chest Teleport")
         return false
     end
@@ -3758,11 +3638,11 @@ CHEST.run = function()
             if paused then
                 CHEST.setStatus("paused")
                 task.wait(0.2)
-            elseif UI.heavenly.active or herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
+            elseif UI.heavenly.active or INHERITANCE.busy or herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
                 if CHEST.busy then
                     CHEST.finishSweep("pausing chest sweep for another activity")
                 end
-                CHEST.setStatus("waiting for herb/brew/breakthrough")
+                CHEST.setStatus("waiting for inheritance/herb/brew/breakthrough")
                 task.wait(0.25)
             else
                 local spot, prompt, position, tier = CHEST.findBestPrompt()
@@ -3806,6 +3686,366 @@ CHEST.run = function()
         CHEST.taskRunning = false
         updateModeButtons()
     end)
+end
+
+-- Immortal Inheritance --------------------------------------------------------
+-- Observes ReplicatedStorage.CultivationEvents.Inheritance only. The Observer
+-- archive confirms: start {endsAt,radius,progress,state,at}, progress
+-- {progress,holder,state}, and won {at,winner,sect}. No remote is fired.
+
+INHERITANCE.setStatus = function(message)
+    INHERITANCE.activeName = tostring(message or "idle")
+    if UI.inheritanceInfoLabel then
+        local percent = math.floor((tonumber(INHERITANCE.progress) or 0) * 100 + 0.5)
+        local holder = INHERITANCE.holder and (" | " .. tostring(INHERITANCE.holder)) or ""
+        UI.inheritanceInfoLabel.Text = string.format(
+            "%s | %d%%%s",
+            INHERITANCE.activeName,
+            percent,
+            holder
+        )
+    end
+end
+
+INHERITANCE.getWorldZone = function()
+    local folder = Workspace:FindFirstChild("Inheritance")
+    local zone = folder and folder:FindFirstChild("InheritanceZone")
+    local pillar = folder and folder:FindFirstChild("InheritancePillar")
+    if zone and zone:IsA("BasePart") then
+        return folder, zone, pillar
+    end
+    return folder, nil, pillar
+end
+
+INHERITANCE.getOwnSectName = function()
+    for _, attributeName in ipairs({"SectName", "Sect", "SectTag", "ClanName"}) do
+        local value = LocalPlayer:GetAttribute(attributeName)
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        for _, valueName in ipairs({"Sect", "SectName", "Clan"}) do
+            local value = leaderstats:FindFirstChild(valueName)
+            if value and value:IsA("StringValue") and value.Value ~= "" then
+                return value.Value
+            end
+        end
+    end
+    return nil
+end
+
+INHERITANCE.returnToPrevious = function(reason, stopping)
+    if not INHERITANCE.busy and not INHERITANCE.returnCFrame then return false end
+    local returnCFrame = INHERITANCE.returnCFrame
+    local resumeMode = INHERITANCE.resumeMode
+    local resumeWasAuto = INHERITANCE.resumeWasAuto
+    INHERITANCE.busy = false
+    INHERITANCE.taskRunning = false
+    INHERITANCE.returnCFrame = nil
+    INHERITANCE.resumeMode = nil
+    INHERITANCE.resumeWasAuto = false
+    INHERITANCE.claimEnteredAt = nil
+
+    local root = getCharacterParts()
+    if root and returnCFrame then
+        local ok, err = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = returnCFrame
+        end)
+        DIAG.log(ok and "INFO" or "WARN", "INHERITANCE", "return_to_previous_position", {
+            reason = reason or "event finished", success = ok, error = ok and nil or tostring(err)
+        })
+    end
+
+    if not stopping and running and not paused and resumeMode and not resumeWasAuto then
+        task.delay(0.75, function()
+            if running and not paused and not INHERITANCE.busy and not selectedAutoMode
+                and not isTrainingActive(resumeMode) then
+                activateTraining(resumeMode)
+            end
+        end)
+    end
+    INHERITANCE.setStatus(reason or "returned to previous position")
+    if updateModeButtons then updateModeButtons() end
+    return true
+end
+
+INHERITANCE.run = function()
+    if INHERITANCE.taskRunning or INHERITANCE.busy then return false end
+    if not INHERITANCE.autoEnabled then return false end
+    if not INHERITANCE.active then
+        INHERITANCE.setStatus("waiting for Immortal Inheritance event")
+        return false
+    end
+    if INHERITANCE.state ~= "empty" then
+        INHERITANCE.setStatus("event is not empty; holder: " .. tostring(INHERITANCE.holder or INHERITANCE.state))
+        return false
+    end
+    if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen
+        or isBreakthroughPending() or CHEST.busy or CHEST.teleportActive or SILVER.busy
+        or herbCollectorBusy or autoBrewBusy or cauldronPanelIsOpen() then
+        INHERITANCE.setStatus("waiting for current activity to finish")
+        return false
+    end
+
+    local position = INHERITANCE.position
+    local radius = math.clamp(tonumber(INHERITANCE.radius) or 50, 10, 100)
+    local root, humanoid = getCharacterParts()
+    if not position or not root or not humanoid then
+        INHERITANCE.setStatus("event coordinates or character unavailable")
+        return false
+    end
+
+    local eventKey = tostring(INHERITANCE.endsAt or "no-end") .. "|"
+        .. string.format("%.2f|%.2f|%.2f", position.X, position.Y, position.Z)
+    if INHERITANCE.attemptedEventKey == eventKey then
+        INHERITANCE.setStatus("already attempted this event; waiting for result/expiry")
+        return false
+    end
+    INHERITANCE.attemptedEventKey = eventKey
+    INHERITANCE.taskRunning = true
+    INHERITANCE.busy = true
+    INHERITANCE.returnCFrame = root.CFrame
+    INHERITANCE.resumeMode = getHerbResumeMode()
+    INHERITANCE.resumeWasAuto = selectedAutoMode ~= nil
+    INHERITANCE.claimEnteredAt = nil
+
+    DIAG.log("INFO", "INHERITANCE", "travel_started", {
+        position = {x = position.X, y = position.Y, z = position.Z},
+        radius = radius,
+        endsAt = INHERITANCE.endsAt,
+        resumeMode = INHERITANCE.resumeMode,
+        resumeWasAuto = INHERITANCE.resumeWasAuto,
+    })
+
+    task.spawn(function()
+        local resumeMode = INHERITANCE.resumeMode
+        if resumeMode and isTrainingActive(resumeMode) then
+            local key = resumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
+            local sent, backend = sendKey(key)
+            DIAG.log(sent and "INFO" or "WARN", "INHERITANCE", "training_pause_input", {
+                mode = resumeMode, sent = sent, backend = backend
+            })
+            if sent then task.wait(0.35) end
+        end
+
+        if not running or not INHERITANCE.autoEnabled or not INHERITANCE.busy then
+            INHERITANCE.returnToPrevious("cancelled before travel")
+            return
+        end
+
+        root, humanoid = getCharacterParts()
+        if not root or not humanoid then
+            INHERITANCE.returnToPrevious("character unavailable before travel")
+            INHERITANCE.taskRunning = false
+            return
+        end
+
+        -- Teleport to the event vicinity OUTSIDE the 50-stud claim radius,
+        -- settle, then use normal Humanoid:MoveTo to walk into the claim zone.
+        local staging = position + Vector3.new(radius + 12, 3, 0)
+        local moved, moveError = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.lookAt(staging, position)
+        end)
+        if not moved then
+            INHERITANCE.returnToPrevious("staging teleport failed: " .. tostring(moveError))
+            INHERITANCE.taskRunning = false
+            return
+        end
+        task.wait(0.85)
+
+        root, humanoid = getCharacterParts()
+        if not root or not humanoid then
+            INHERITANCE.returnToPrevious("character unavailable after staging")
+            INHERITANCE.taskRunning = false
+            return
+        end
+
+        local walkTarget = position + Vector3.new(0, 3, 0)
+        humanoid:MoveTo(walkTarget)
+        INHERITANCE.setStatus("walking into Immortal Inheritance claim area")
+        local walkDeadline = os.clock() + 22
+        local lastMoveAt = os.clock()
+        local entered = false
+
+        while running and INHERITANCE.autoEnabled and INHERITANCE.busy
+            and os.clock() < walkDeadline do
+            if paused or not INHERITANCE.active
+                or (INHERITANCE.endsAt and os.time() >= INHERITANCE.endsAt) then break end
+            root, humanoid = getCharacterParts()
+            if not root or not humanoid then break end
+            local distance = (root.Position - position).Magnitude
+            if distance <= math.max(5, radius - 5) then
+                entered = true
+                INHERITANCE.claimEnteredAt = os.clock()
+                DIAG.log("INFO", "INHERITANCE", "claim_radius_entered", {
+                    distance = distance, radius = radius
+                })
+                break
+            end
+            if INHERITANCE.state == "holding" then
+                -- Another holder began the claim before we entered the zone.
+                INHERITANCE.setStatus("another holder started claiming; aborting approach")
+                break
+            end
+            if os.clock() - lastMoveAt >= 2.0 then
+                humanoid:MoveTo(walkTarget)
+                lastMoveAt = os.clock()
+            end
+            task.wait(0.15)
+        end
+
+        if not entered then
+            INHERITANCE.returnToPrevious("could not enter claim radius; no claim attempted")
+            INHERITANCE.taskRunning = false
+            return
+        end
+
+        INHERITANCE.setStatus("inside claim radius; waiting for server progress and winner")
+        local lastZoneSeenAt = os.clock()
+        while running and INHERITANCE.autoEnabled and INHERITANCE.busy do
+            if paused then
+                INHERITANCE.setStatus("paused inside event area")
+                task.wait(0.25)
+            elseif INHERITANCE.endsAt and os.time() >= INHERITANCE.endsAt then
+                INHERITANCE.returnToPrevious("event expired")
+                break
+            elseif not INHERITANCE.active then
+                INHERITANCE.returnToPrevious("event finished: " .. tostring(INHERITANCE.winner or "winner confirmed"))
+                break
+            else
+                local _, zone = INHERITANCE.getWorldZone()
+                if zone then
+                    lastZoneSeenAt = os.clock()
+                elseif os.clock() - lastZoneSeenAt > 2.0 then
+                    INHERITANCE.returnToPrevious("inheritance zone disappeared")
+                    break
+                end
+                local currentRoot = getCharacterParts()
+                if not currentRoot then
+                    INHERITANCE.returnToPrevious("character lost during claim")
+                    break
+                end
+                local distance = (currentRoot.Position - position).Magnitude
+                if distance > radius then
+                    local currentHumanoid = select(2, getCharacterParts())
+                    if currentHumanoid then currentHumanoid:MoveTo(position + Vector3.new(0, 3, 0)) end
+                    INHERITANCE.setStatus(string.format("returning inside claim radius | %.1f/%.1f", distance, radius))
+                else
+                    INHERITANCE.setStatus(string.format(
+                        "claim area active | server progress %.1f%% | %s",
+                        (tonumber(INHERITANCE.progress) or 0) * 100,
+                        tostring(INHERITANCE.holder or "waiting for holder")
+                    ))
+                end
+                task.wait(0.25)
+            end
+        end
+
+        if INHERITANCE.busy then
+            INHERITANCE.returnToPrevious("event travel ended")
+        end
+        INHERITANCE.taskRunning = false
+    end)
+    if updateModeButtons then updateModeButtons() end
+    return true
+end
+
+INHERITANCE.handleRemote = function(action, payload)
+    action = tostring(action or "")
+    payload = type(payload) == "table" and payload or {}
+
+    if action == "start" then
+        local at = payload.at
+        if typeof(at) == "Vector3" then
+            INHERITANCE.position = at
+        elseif type(at) == "table" and tonumber(at.x) and tonumber(at.y) and tonumber(at.z) then
+            INHERITANCE.position = Vector3.new(at.x, at.y, at.z)
+        end
+        INHERITANCE.active = true
+        INHERITANCE.state = tostring(payload.state or "empty")
+        INHERITANCE.holder = payload.holder
+        INHERITANCE.progress = tonumber(payload.progress) or 0
+        INHERITANCE.radius = tonumber(payload.radius) or 50
+        INHERITANCE.endsAt = tonumber(payload.endsAt)
+        INHERITANCE.winner = nil
+        INHERITANCE.lastEventKey = tostring(INHERITANCE.endsAt or "") .. "|" .. tostring(INHERITANCE.position)
+        INHERITANCE.setStatus("event available | " .. INHERITANCE.state .. " | " .. tostring(INHERITANCE.radius) .. "-stud radius")
+        DIAG.log("INFO", "INHERITANCE", "event_started", {
+            at = INHERITANCE.position,
+            endsAt = INHERITANCE.endsAt,
+            radius = INHERITANCE.radius,
+            state = INHERITANCE.state,
+        })
+        if INHERITANCE.autoEnabled and INHERITANCE.state == "empty" then
+            INHERITANCE.run()
+        end
+    elseif action == "progress" then
+        INHERITANCE.progress = math.clamp(tonumber(payload.progress) or INHERITANCE.progress or 0, 0, 1)
+        INHERITANCE.holder = payload.holder and tostring(payload.holder) or INHERITANCE.holder
+        INHERITANCE.state = tostring(payload.state or INHERITANCE.state or "unknown")
+        if INHERITANCE.active and not INHERITANCE.busy and INHERITANCE.state == "holding" then
+            INHERITANCE.setStatus("claim already held by " .. tostring(INHERITANCE.holder or "another holder"))
+        elseif INHERITANCE.busy then
+            local ownSect = INHERITANCE.getOwnSectName()
+            if ownSect and INHERITANCE.holder and INHERITANCE.holder ~= ownSect
+                and INHERITANCE.holder ~= LocalPlayer.Name then
+                DIAG.log("WARN", "INHERITANCE", "claim_taken_by_other_sect", {
+                    holder = INHERITANCE.holder, ownSect = ownSect
+                })
+                task.defer(function()
+                    if INHERITANCE.busy then
+                        INHERITANCE.returnToPrevious("claim taken by another sect: " .. INHERITANCE.holder)
+                    end
+                end)
+            else
+                INHERITANCE.setStatus(string.format("claim progress %.1f%% | %s", INHERITANCE.progress * 100, tostring(INHERITANCE.holder or "holding")))
+            end
+        end
+    elseif action == "won" then
+        INHERITANCE.winner = tostring(payload.winner or "unknown")
+        INHERITANCE.active = false
+        INHERITANCE.state = "won"
+        INHERITANCE.progress = 1
+        INHERITANCE.setStatus("won by " .. INHERITANCE.winner)
+        DIAG.log("INFO", "INHERITANCE", "server_won_event", {
+            winner = INHERITANCE.winner,
+            sect = payload.sect,
+            at = payload.at,
+        })
+        if INHERITANCE.busy then
+            task.delay(0.65, function()
+                if running and INHERITANCE.busy then
+                    INHERITANCE.returnToPrevious("server confirmed winner: " .. INHERITANCE.winner)
+                end
+            end)
+        end
+    end
+
+    if updateModeButtons then updateModeButtons() end
+end
+
+INHERITANCE.scanWorld = function()
+    local _, zone = INHERITANCE.getWorldZone()
+    if zone and not INHERITANCE.active then
+        INHERITANCE.active = true
+        INHERITANCE.position = zone.Position
+        INHERITANCE.radius = INHERITANCE.radius or 50
+        if INHERITANCE.state == "won" then INHERITANCE.state = "unknown" end
+        if INHERITANCE.state == "unknown" then
+            INHERITANCE.setStatus("world event marker detected; waiting for server availability state")
+        end
+    elseif not zone and INHERITANCE.active and not INHERITANCE.busy then
+        -- A late join may see the marker disappear without having received the
+        -- original start event. Do not invent a winner or reward in that case.
+        INHERITANCE.active = false
+        INHERITANCE.setStatus("no active world event")
+    end
 end
 
 -- Auto Brew -----------------------------------------------------------------
@@ -4249,8 +4489,8 @@ local function runAutoBrew()
         while running and autoBrewEnabled do
             if paused then
                 task.wait(0.15)
-            elseif UI.heavenly.active or CHEST.busy or SILVER.busy then
-                setStatus("Auto Brew waiting for chest or Silver farming to finish.", COLORS.warning)
+            elseif UI.heavenly.active or INHERITANCE.busy or CHEST.busy or SILVER.busy then
+                setStatus("Auto Brew waiting for tribulation, inheritance, chest, or Silver activity to finish.", COLORS.warning)
                 task.wait(0.2)
             else
                 local cauldronGui, cauldronPanel, body = getCauldronUi()
@@ -4523,19 +4763,23 @@ updateModeButtons = function()
         UI.chestTeleportButton.BackgroundColor3 = CHEST.teleportActive and COLORS.warning or COLORS.accent
     end
     if UI.silverButton then
-        UI.silverButton.Text = SILVER.autoEnabled and "AUTO SILVER: ON" or "AUTO SILVER: OFF"
+        UI.silverButton.Text = SILVER.autoEnabled and "SILVER SCAN: ON" or "SILVER SCAN: OFF"
         UI.silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
+    end
+    if UI.inheritanceButton then
+        UI.inheritanceButton.Text = INHERITANCE.autoEnabled and "AUTO INHERITANCE: ON" or "AUTO INHERITANCE: OFF"
+        UI.inheritanceButton.BackgroundColor3 = INHERITANCE.autoEnabled and COLORS.success or COLORS.panel2
     end
     if UI.quickInteractButton then
         UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
     end
     if UI.silverDrawButton then
-        UI.silverDrawButton.Text = SILVER.autoDrawEnabled and "AUTO DRAW (J): ON" or "AUTO DRAW (J): OFF"
+        UI.silverDrawButton.Text = SILVER.autoDrawEnabled and "AUTO CARRY (T): ON" or "AUTO CARRY (T): OFF"
         UI.silverDrawButton.BackgroundColor3 = SILVER.autoDrawEnabled and COLORS.success or COLORS.panel2
     end
     if UI.silverTargetModeButton then
-        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET MODE: SAFE" or "TARGET MODE: STRONG"
+        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET: SAFE" or "TARGET: STRONG"
         UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
     end
     if UI.remoteAuditButton then
@@ -4592,7 +4836,7 @@ local function createGui()
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v103",
+        Name = "CUAutoCultivation_v105",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4652,7 +4896,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.4",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.5",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4838,13 +5082,19 @@ local function createGui()
     UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 88, 268, 16, 9, COLORS.muted)
     makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 106, 268, 34, 9, COLORS.muted)
 
-    local silverCardFarm = makeCard(farmingPage, 16, 204, 598, 160, "AUTO SILVER - CULTIVATOR CAMPS", COLORS.warning)
-    UI.silverButton = makeButton(silverCardFarm, "AUTO SILVER: OFF", 12, 29, 180, COLORS.panel2, 30)
-    UI.silverInfoLabel = makeLabel(silverCardFarm, "Auto Silver: idle", 204, 29, 370, 28, 10, COLORS.muted)
-    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO DRAW (J): OFF", 12, 65, 180, COLORS.panel2, 25)
-    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 204, 65, 370, 25, 10, COLORS.text)
-    UI.silverTargetModeButton = makeButton(silverCardFarm, "TARGET MODE: SAFE", 12, 98, 180, COLORS.success, 25)
-    makeLabel(silverCardFarm, "SAFE picks the weakest eligible camp first. Draw your sword with J manually; Auto Draw stays OFF because J toggles. M1 interval 0.18s; retreat below 35% HP.", 204, 96, 370, 47, 9, COLORS.muted)
+    local silverCardFarm = makeCard(farmingPage, 16, 204, 292, 160, "SILVER TARGET SCAN", COLORS.warning)
+    UI.silverButton = makeButton(silverCardFarm, "SILVER SCAN: OFF", 12, 29, 268, COLORS.panel2, 28)
+    UI.silverInfoLabel = makeLabel(silverCardFarm, "Target scan: idle", 12, 61, 268, 18, 9, COLORS.muted)
+    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 12, 81, 268, 26, 9, COLORS.text)
+    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO CARRY (T): OFF", 12, 113, 128, COLORS.panel2, 25)
+    UI.silverTargetModeButton = makeButton(silverCardFarm, "TARGET: SAFE", 148, 113, 132, COLORS.success, 25)
+    makeLabel(silverCardFarm, "No camera or mouse input. Scan-only until a non-click attack method is verified.", 12, 140, 268, 17, 8, COLORS.muted)
+
+    local inheritanceCard = makeCard(farmingPage, 322, 204, 292, 160, "IMMORTAL INHERITANCE", COLORS.accent)
+    UI.inheritanceButton = makeButton(inheritanceCard, "AUTO INHERITANCE: OFF", 12, 29, 268, COLORS.panel2, 28)
+    UI.inheritanceInfoLabel = makeLabel(inheritanceCard, "Waiting for event...", 12, 61, 268, 36, 9, COLORS.muted)
+    makeLabel(inheritanceCard, "Detects server start/progress/won. Stages outside the 50-stud zone, walks in, waits for result, then returns.", 12, 101, 268, 49, 8, COLORS.muted)
+
     UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 374, 598, COLORS.panel2, 27)
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
@@ -5210,6 +5460,30 @@ local function createGui()
         end
     end)
 
+    addConnection(UI.inheritanceButton.MouseButton1Click, function()
+        INHERITANCE.autoEnabled = not INHERITANCE.autoEnabled
+        DIAG.log("INFO", "INHERITANCE", "auto_toggle", {enabled = INHERITANCE.autoEnabled})
+        updateModeButtons()
+        if INHERITANCE.autoEnabled then
+            INHERITANCE.scanWorld()
+            if INHERITANCE.active and INHERITANCE.state == "empty" then
+                INHERITANCE.run()
+            else
+                INHERITANCE.setStatus(INHERITANCE.active
+                    and ("event detected but not available: " .. tostring(INHERITANCE.state))
+                    or "armed; waiting for server Inheritance start event")
+            end
+            setStatus("Auto Immortal Inheritance armed. It only travels when the server reports an empty event.", COLORS.success)
+        else
+            if INHERITANCE.busy then
+                INHERITANCE.returnToPrevious("Auto Inheritance disabled")
+            else
+                INHERITANCE.setStatus("OFF; waiting for next event")
+            end
+            setStatus("Auto Immortal Inheritance disabled.", COLORS.warning)
+        end
+    end)
+
     addConnection(UI.chestButton.MouseButton1Click, function()
         if not CHEST.autoEnabled and CHEST.teleportActive then
             CHEST.setStatus("return from manual Chest Teleport before enabling Auto Chest")
@@ -5259,7 +5533,7 @@ local function createGui()
 
     addConnection(UI.silverTargetModeButton.MouseButton1Click, function()
         SILVER.targetMode = SILVER.targetMode == "SAFE" and "STRONG" or "SAFE"
-        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET MODE: SAFE" or "TARGET MODE: STRONG"
+        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET: SAFE" or "TARGET: STRONG"
         UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
         DIAG.log("INFO", "SILVER", "target_mode_changed", {targetMode = SILVER.targetMode})
         setStatus(SILVER.targetMode == "SAFE" and "Safe target mode: weakest eligible cultivator first." or "Strong target mode: highest eligible realm first.", SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning)
@@ -5269,12 +5543,12 @@ local function createGui()
         SILVER.autoDrawEnabled = not SILVER.autoDrawEnabled
         DIAG.log("INFO", "SILVER", "auto_draw_toggled", {enabled = SILVER.autoDrawEnabled})
         updateModeButtons()
-        setStatus(SILVER.autoDrawEnabled and "Auto Draw enabled: may tap J once if weapon state is unknown. Ensure sword is sheathed first." or "Auto Draw disabled: press J manually to draw your sword before enabling Auto Silver.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
+        setStatus(SILVER.autoDrawEnabled and "Auto Carry enabled: may tap T once if sword state is unknown. Ensure sword is currently uncarrried first." or "Auto Draw disabled: press T manually to carry/uncarry your sword.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
     end)
 
     addConnection(UI.silverButton.MouseButton1Click, function()
         if not SILVER.autoEnabled and CHEST.teleportActive then
-            SILVER.setStatus("return from Chest Teleport before enabling Auto Silver")
+            SILVER.setStatus("return from Chest Teleport before enabling Silver Target Scan")
             return
         end
         SILVER.autoEnabled = not SILVER.autoEnabled
@@ -5282,11 +5556,11 @@ local function createGui()
         updateModeButtons()
         if SILVER.autoEnabled then
             SILVER.setStatus("scanning eligible non-boss cultivators")
-            setStatus("Auto Silver enabled. It targets CultivatorCamps NPCs at or below your Qi realm using normal M1 input; no reward remotes are fired.", COLORS.success)
+            setStatus("Silver Target Scan enabled. It will not click, move your camera, or attack; use manual M1 while we verify a non-click combat activation.", COLORS.success)
             SILVER.run()
         else
-            SILVER.setStatus("stopping after current attack")
-            setStatus("Auto Silver disabled; it will stop after the current input and resume selected cultivation.", COLORS.warning)
+            SILVER.setStatus("target scan stopping")
+            setStatus("Silver Target Scan disabled. No mouse or camera input was sent.", COLORS.warning)
         end
     end)
 
@@ -5372,12 +5646,13 @@ do
                     ECONOMY.npcSilverEarned = ECONOMY.npcSilverEarned + amount
                     ECONOMY.npcKillCount = ECONOMY.npcKillCount + 1
                     SILVER.lastReward = amount
-                    if SILVER.busy and SILVER.currentTarget then
+                    if SILVER.autoEnabled and SILVER.currentTarget then
                         SILVER.earned = SILVER.earned + amount
+                        SILVER.kills = SILVER.kills + 1
                     end
                     ECONOMY.updateUI()
                     DIAG.log("INFO", "SILVER", "server_kill_reward", {amount = amount, target = SILVER.currentTarget and SILVER.currentTarget.Name or nil, total = ECONOMY.silver})
-                    if SILVER.busy then SILVER.setStatus("Silver reward +" .. ECONOMY.formatNumber(amount) .. " received") end
+                    if SILVER.autoEnabled then SILVER.setStatus("Silver reward +" .. ECONOMY.formatNumber(amount) .. " received") end
                 end
             end)
         end
@@ -5463,6 +5738,16 @@ do
                 cauldronClaimResult = {success = success, message = message}
                 DIAG.log(success and "INFO" or "WARN", "ALCHEMY", "claim_result", {success = success, message = message})
             end)
+        end
+
+        local inheritanceRemote = eventsFolder:FindFirstChild("Inheritance")
+        if inheritanceRemote and inheritanceRemote:IsA("RemoteEvent") then
+            addConnection(inheritanceRemote.OnClientEvent, function(action, payload)
+                INHERITANCE.handleRemote(action, payload)
+            end)
+            DIAG.log("INFO", "INHERITANCE", "event_listener_ready", {remote = inheritanceRemote:GetFullName()})
+        else
+            DIAG.log("WARN", "INHERITANCE", "event_remote_missing", {})
         end
 
         local chestWorldOpenedRemote = eventsFolder:FindFirstChild("ChestWorldOpened")
@@ -5643,9 +5928,9 @@ end
 
 -- Manual sword/attack input trace for diagnosing Auto Silver.
 addConnection(UserInputService.InputBegan, function(input, gameProcessed)
-    if input.KeyCode == Enum.KeyCode.J then
-        SILVER.jAttemptedCharacter = LocalPlayer.Character
-        DIAG.log("INFO", "SILVER", "manual_sword_toggle_key", {key = "J", gameProcessed = gameProcessed})
+    if input.KeyCode == Enum.KeyCode.T then
+        SILVER.tAttemptedCharacter = LocalPlayer.Character
+        DIAG.log("INFO", "SILVER", "manual_sword_toggle_key", {key = "T", gameProcessed = gameProcessed})
     elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
         if SILVER.autoEnabled and SILVER.busy then
             DIAG.log("INFO", "SILVER", "manual_m1_input", {gameProcessed = gameProcessed, target = SILVER.currentTarget and SILVER.currentTarget.Name or nil})
@@ -5701,7 +5986,8 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 createGui()
 HERB_MONITOR.update(true)
 CHEST.updateMonitor()
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.4", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
+INHERITANCE.scanWorld()
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.5", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
 DIAG.refreshUI(true)
 
 task.spawn(function()
@@ -5722,6 +6008,11 @@ task.spawn(function()
         if running then
             HERB_MONITOR.update(true)
             CHEST.updateMonitor()
+            INHERITANCE.scanWorld()
+            if INHERITANCE.autoEnabled and INHERITANCE.active
+                and INHERITANCE.state == "empty" and not INHERITANCE.busy then
+                INHERITANCE.run()
+            end
         end
     end
 end)
@@ -5810,11 +6101,11 @@ addConnection(RunService.RenderStepped, function()
 end)
 
 print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v1.0.4 loaded. Heavenly Tribulation timing controller + integrated diagnostics are enabled.")
-print("[CU AutoCultivation] v1.0.4: Heavenly Tribulation is detected by its live title; SPACE timing uses matched white/gold ring geometry. Existing chest behavior is unchanged.")
-print("[CU AutoCultivation] Auto Silver uses SAFE weakest-target selection by default, faster bounded M1 input, low-health retreat, and server reward confirmations.")
+print("[CU AutoCultivation] v1.0.5 loaded. Heavenly Tribulation + Immortal Inheritance are integrated.")
+print("[CU AutoCultivation] v1.0.5: Heavenly Tribulation remains integrated; Immortal Inheritance listens for start/progress/won and walks into the claim radius.")
+print("[CU AutoCultivation] Silver Target Scan is non-invasive: no mouse/camera input or attack automation. T is the sword carry/uncarry key.")
 print("[CU AutoCultivation] Herb quick interaction is user-toggleable; chest instant probe is independently enabled with a normal E-hold fallback.")
 print("[CU AutoCultivation] Diagnostics/Experiments do not hook or modify network calls, and never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
 print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.4"})
-setStatus("Loaded v1.0.4. Heavenly Tribulation controller is integrated; waiting for Qi trial.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.5"})
+setStatus("Loaded v1.0.5. Heavenly Tribulation and Immortal Inheritance are integrated; Silver is scan-only until non-click combat activation is verified.", COLORS.success)
