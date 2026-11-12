@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.5
+    Version: 1.0.7
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -23,45 +23,43 @@
       - Temporarily pauses cultivation during a herb sweep, then resumes.
       - Auto Brew: exact recipe validation, oldest available herbs first,
         timed Stoke at the center of the Perfect band, and automatic claiming.
-      - Auto Chest: scans Workspace.ChestSpots, applies tier filters, opens
-        Celestial > Jade > Bronze > Wooden, and verifies ChestWorldOpened.
-      - Chest Teleporter: independent one-shot teleport to the best eligible chest;
-        manual E opening, automatic return after the local chest reward event, or manual return button.
+      - Chest automation and Chest Teleport retired in v1.0.6 after the experience
+        explicitly banned a direct chest teleport. No chest travel or opening runs.
       - Herb age filters: independently select 1/10/100/1000-year herbs, including a 1000-year-only preset;
         when no matching herb exists, cultivation remains active and the scanner watches for respawns.
       - Herb Monitor: live age counts split between normal and SpiritWorld nodes,
         including disabled/locked prompt counts.
       - Economy dashboard: Silver and Primordial Stone balances, NPC Silver rewards,
         session deltas, and Destiny reroll probability/cost estimates.
-      - Silver Target Scan: selects eligible non-boss cultivators without camera or mouse input.
-        Autonomous combat remains disabled until a non-click attack activation is verified.
-      - Auto Immortal Inheritance: observes the Inheritance server event, pauses cultivation,
-        travels to a staging point, walks into the 50-stud claim area, waits for server result,
-        then returns and resumes the prior cultivation mode.
-      - Redesigned tabbed UI with Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics, Experiments.
-      - Integrated bounded diagnostics for module actions, server confirmations, errors, and fast-progress rate sampling.
-      - Manual Destiny reroll audit: records displayed odds, click category/batch, balances, and server result updates.
-      - Optional Quick Interact probe for real herb/chest prompts; requires server/prompt-state confirmation and falls back to configured hold duration.
+      - Silver combat, Auto Silver, and Immortal Inheritance retired in v1.0.6.
+      - Experiments page and chest interaction probes removed; core diagnostics retained.
+      - Redesigned tabs: Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics.
+      - Integrated bounded diagnostics for cultivation progress, server confirmations, and errors.
+      - Persistent settings saved to CU_AutoCultivation_Settings.json and restored on auto-execute.
+      - Private-server rejoin targets the current live JobId; public Server Hop selects another public instance.
+      - Settings are saved before travel; executor Auto Execute must be enabled to reload them after arrival.
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
-      - Chest and Inheritance event confirmation use inbound server events only.
-      - Silver target scanning does not synthesize mouse input or move the camera.
-      - Teleport uses local character CFrame and may be corrected by the server.
+      - No chest or Inheritance automation is present in the active UI or background loops.
+      - No Auto Silver combat or target scan runs in this version.
       - Zone activation is checked against replicated zone multipliers before
         the script starts meditation or push-ups.
       - Qi and Body auto modes are mutually exclusive because one character
         can only run one selected cultivation activity at a time.
+      - Private rejoin can target only the current live private-server JobId. A PrivateServerId is not a join access code and cannot revive a closed VIP instance by itself.
+      - Public Server Hop uses the executor HTTP request API and Roblox's public server listing endpoint.
+      - A disconnected client cannot execute its own reconnect code; Auto Execute only runs after Roblox has successfully joined a server.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ProximityPromptService = game:GetService("ProximityPromptService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -143,16 +141,15 @@ local INHERITANCE = {
     activeName = "waiting for event",
 }
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0, ageOptions = {1000, 100, 10, 1}, ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}}
-local QUICK_INTERACT = {enabled = false, chestEnabled = true, attempts = 0, successes = 0, fallbacks = 0}
+local QUICK_INTERACT = {enabled = false, chestEnabled = false, attempts = 0, successes = 0, fallbacks = 0}
 local EXPERIMENT = {
     remoteAuditEnabled = false,
     remoteAuditInstalled = false,
     remoteAuditStatus = "Not installed",
     remoteAuditCount = 0,
-    progressProbeEnabled = true,
+    progressProbeEnabled = false,
     rerollClickCount = 0,
     rerollResultCount = 0,
-    chestManualHold = nil,
     remoteAuditShared = nil,
 }
 
@@ -173,7 +170,7 @@ local ECONOMY = {
     startedAt = os.clock(),
 }
 local SILVER = {
-    autoEnabled = false,
+    autoEnabled = false, -- retired in v1.0.6; no UI or runner is exposed
     taskRunning = false,
     busy = false,
     activeName = "idle",
@@ -225,7 +222,7 @@ local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
 local herbFilterButton = nil
-local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}}
+local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -278,6 +275,14 @@ UI.heavenly = {
     lastFeedback = nil,
     feedbackValue = nil,
     feedbackScanAt = 0,
+    ratioSamples = {},
+    pulseSerial = 0,
+    lastPulseStartAt = 0,
+    retryNotBefore = 0,
+    timingLead = 0.020,
+    lastInputRatio = nil,
+    awaitingFeedback = false,
+    feedbackHandledPulse = 0,
 }
 
 local lastMode = "Unknown"
@@ -403,7 +408,6 @@ local BREW_RECIPES = {
 }
 local BREW_RECIPE_ORDER = {"QiSpeed", "BodySpeed", "Damage", "HP"}
 local BREW_AGE_ORDER = {1000, 100, 10, 1}
-local CHEST_TIER_ORDER = {"Celestial", "Jade", "Bronze", "Wooden"}
 
 local function addConnection(signal, callback)
     local ok, connection = pcall(function()
@@ -524,6 +528,147 @@ DIAG.log = function(level, moduleName, eventName, data)
     DIAG.refreshUI(false)
 end
 
+local SETTINGS = {file = "CU_AutoCultivation_Settings.json", schema = 1, status = "No saved settings loaded", loaded = false, restoreReady = false}
+local REJOIN = {
+    busy = false,
+    recentServers = {},
+    status = "ready",
+    lastPrivateServerId = nil,
+    lastPrivateJobId = nil,
+}
+
+do
+    local function getExecutorFunction(name)
+        local candidate = nil
+        pcall(function() candidate = Env[name] end)
+        if type(candidate) ~= "function" then
+            pcall(function() candidate = _G[name] end)
+        end
+        return type(candidate) == "function" and candidate or nil
+    end
+
+    local function loadSettings()
+        local read = getExecutorFunction("readfile")
+        if not read then
+            SETTINGS.status = "Executor readfile unavailable; using defaults"
+            return false
+        end
+        local ok, raw = pcall(read, SETTINGS.file)
+        if not ok or type(raw) ~= "string" or raw == "" then
+            SETTINGS.status = "No saved settings file; using defaults"
+            return false
+        end
+        local decodeOk, data = pcall(function() return HttpService:JSONDecode(raw) end)
+        if not decodeOk or type(data) ~= "table" then
+            SETTINGS.status = "Saved settings file is invalid; using defaults"
+            return false
+        end
+        if tonumber(data.placeId) ~= game.PlaceId then
+            SETTINGS.status = "Saved settings belong to another place; using defaults"
+            return false
+        end
+
+        selectedAutoMode = (data.selectedAutoMode == "Qi" or data.selectedAutoMode == "Body") and data.selectedAutoMode or nil
+        if type(data.breakthroughEnabled) == "boolean" then breakthroughEnabled = data.breakthroughEnabled end
+        if type(data.antiAfkEnabled) == "boolean" then antiAfkEnabled = data.antiAfkEnabled end
+        if type(data.autoHerbsEnabled) == "boolean" then autoHerbsEnabled = data.autoHerbsEnabled end
+        if type(data.quickInteractEnabled) == "boolean" then QUICK_INTERACT.enabled = data.quickInteractEnabled end
+        if type(data.autoBrewEnabled) == "boolean" then autoBrewEnabled = data.autoBrewEnabled end
+
+        if type(data.herbAgeSelection) == "table" then
+            for _, age in ipairs({1, 10, 100, 1000}) do
+                local value = data.herbAgeSelection[tostring(age)]
+                if type(value) == "boolean" then HERB_MONITOR.ageSelection[age] = value end
+            end
+        end
+        if type(data.herbSpeciesSelection) == "table" then
+            for _, species in ipairs(HERB_SPECIES) do
+                local value = data.herbSpeciesSelection[species]
+                if type(value) == "boolean" then herbSpeciesSelection[species] = value end
+            end
+        end
+        if type(data.brewRecipeSelection) == "table" then
+            for key in pairs(brewRecipeSelection) do
+                local value = data.brewRecipeSelection[key]
+                if type(value) == "boolean" then brewRecipeSelection[key] = value end
+            end
+        end
+        local cursor = tonumber(data.brewRecipeCursor)
+        if cursor and cursor >= 1 and cursor <= #BREW_RECIPE_ORDER then brewRecipeCursor = math.floor(cursor) end
+        if type(data.recentPublicServers) == "table" then REJOIN.recentServers = data.recentPublicServers end
+
+        SETTINGS.loaded = true
+        SETTINGS.status = "Restored saved settings | " .. os.date("%H:%M:%S")
+        return true
+    end
+
+    SETTINGS.save = function(reason)
+        local write = getExecutorFunction("writefile")
+        if not write then
+            SETTINGS.status = "Executor writefile unavailable; settings not persisted"
+            if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
+            return false, SETTINGS.status
+        end
+        local data = {
+            schema = SETTINGS.schema,
+            version = "1.0.7",
+            placeId = game.PlaceId,
+            savedAt = os.time(),
+            reason = tostring(reason or "setting_changed"),
+            selectedAutoMode = selectedAutoMode,
+            breakthroughEnabled = breakthroughEnabled,
+            antiAfkEnabled = antiAfkEnabled,
+            autoHerbsEnabled = autoHerbsEnabled,
+            herbAgeSelection = {
+                ["1"] = HERB_MONITOR.ageSelection[1] == true,
+                ["10"] = HERB_MONITOR.ageSelection[10] == true,
+                ["100"] = HERB_MONITOR.ageSelection[100] == true,
+                ["1000"] = HERB_MONITOR.ageSelection[1000] == true,
+            },
+            herbSpeciesSelection = {},
+            quickInteractEnabled = QUICK_INTERACT.enabled == true,
+            autoBrewEnabled = autoBrewEnabled == true,
+            brewRecipeSelection = {},
+            brewRecipeCursor = brewRecipeCursor,
+            recentPublicServers = REJOIN.recentServers,
+            privateServerId = game.PrivateServerId,
+            privateServerJobId = game.JobId,
+        }
+        for _, species in ipairs(HERB_SPECIES) do data.herbSpeciesSelection[species] = herbSpeciesSelection[species] == true end
+        for key, enabled in pairs(brewRecipeSelection) do data.brewRecipeSelection[key] = enabled == true end
+
+        local encodedOk, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+        if not encodedOk then
+            SETTINGS.status = "Settings JSON encode failed: " .. tostring(encoded)
+            if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
+            return false, SETTINGS.status
+        end
+        local ok, err = pcall(write, SETTINGS.file, encoded)
+        if not ok then
+            SETTINGS.status = "Settings save failed: " .. tostring(err)
+            if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
+            DIAG.log("WARN", "SETTINGS", "save_failed", {reason = tostring(err)})
+            return false, SETTINGS.status
+        end
+        SETTINGS.status = "Settings saved locally | " .. os.date("%H:%M:%S")
+        if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
+        DIAG.log("INFO", "SETTINGS", "saved", {reason = tostring(reason or "setting_changed"), file = SETTINGS.file})
+        return true, SETTINGS.status
+    end
+
+    SETTINGS.saveBeforeTravel = function(reason)
+        local ok, message = SETTINGS.save(reason)
+        if not ok then
+            setStatus("Travel cancelled: settings could not be saved. " .. tostring(message), COLORS.danger)
+            return false
+        end
+        return true
+    end
+
+    SETTINGS.load = loadSettings
+    SETTINGS.load()
+end
+
 DIAG.refreshUI = function(force)
     if not UI.diagEventLabel then return end
     local now = os.clock()
@@ -606,24 +751,6 @@ DIAG.flush = function()
     return pcall(writefile, DIAG.fileName, table.concat(lines, "\n") .. (#lines > 0 and "\n" or ""))
 end
 
--- Optional passive outbound request audit. It observes normal game-originated
--- FireServer/InvokeServer calls and passes them through unchanged. It never
--- replays, edits, blocks, or fabricates a request. Enable only during a test.
-EXPERIMENT.installRemoteAudit = function()
-    -- Deliberately do not hook __namecall/FireServer. v1.0.2's persistent hook
-    -- may interfere with reroll testing in some executors. Reroll UI clicks,
-    -- currency deltas, and inbound server result/update events are observed by
-    -- the dedicated listeners later in this file without intercepting requests.
-    EXPERIMENT.remoteAuditStatus = "Passive reroll/result monitor ready; no network hook installed"
-    EXPERIMENT.remoteAuditInstalled = true
-    EXPERIMENT.remoteAuditShared = nil
-    DIAG.log("INFO", "EXPERIMENT", "passive_reroll_monitor_ready", {
-        note = "UI clicks, balance changes and inbound result events only; outbound calls are not hooked."
-    })
-    return true, EXPERIMENT.remoteAuditStatus
-end
-
-
 ECONOMY.formatNumber = function(value)
     value = tonumber(value)
     if not value then return "--" end
@@ -660,14 +787,6 @@ end
 
 SILVER.setStatus = function(message)
     SILVER.activeName = tostring(message or "idle")
-    if UI.silverInfoLabel then
-        UI.silverInfoLabel.Text = "Silver Scan: " .. SILVER.activeName
-    end
-    if UI.silverTargetLabel then
-        local targetName = SILVER.currentTarget and SILVER.currentTarget.Name or "none"
-        local realmText = SILVER.currentTargetRealm and (" | Qi Realm " .. tostring(SILVER.currentTargetRealm)) or ""
-        UI.silverTargetLabel.Text = "Target: " .. targetName .. realmText .. " | Kills: " .. tostring(SILVER.kills) .. " | Earned: " .. ECONOMY.formatNumber(SILVER.earned)
-    end
 end
 
 local function setHerbStatus(message)
@@ -683,13 +802,6 @@ end
 
 CHEST.setStatus = function(message)
     CHEST.activeName = tostring(message or "idle")
-    if UI.chestInfoLabel then
-        UI.chestInfoLabel.Text = string.format(
-            "Chests: %d opened | %s",
-            CHEST.openedCount,
-            CHEST.activeName
-        )
-    end
 end
 
 local function stop(reason)
@@ -702,9 +814,12 @@ local function stop(reason)
     autoHerbsEnabled = false
     autoBrewEnabled = false
     autoBrewBusy = false
+    selectedAutoMode = nil
+    breakthroughEnabled = false
+    antiAfkEnabled = false
+    QUICK_INTERACT.enabled = false
+    if SETTINGS.save then SETTINGS.save("stop_all") end
     CHEST.autoEnabled = false
-    if CHEST.returnFromTeleport then pcall(CHEST.returnFromTeleport, "script stopped", true) end
-    if INHERITANCE.returnToPrevious then pcall(INHERITANCE.returnToPrevious, "script stopped", true) end
     INHERITANCE.autoEnabled = false
     SILVER.autoEnabled = false
     SILVER.busy = false
@@ -958,6 +1073,34 @@ local function sendKey(keyCode)
     end
 
     return false, "no supported key-input method"
+end
+
+local function sendTimingKey(keyCode)
+    local vim
+    local okService, service = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    if okService then vim = service end
+
+    if vim then
+        local ok = pcall(function()
+            vim:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.025)
+            vim:SendKeyEvent(false, keyCode, false, game)
+        end)
+        if ok then return true, "VirtualInputManager 25ms pulse" end
+    end
+
+    local vk = keyCode.Value
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        local ok = pcall(function()
+            keypress(vk)
+            task.wait(0.025)
+            keyrelease(vk)
+        end)
+        if ok then return true, "executor keypress 25ms pulse" end
+    end
+    return false, "no supported short key-pulse method"
 end
 
 local function parsePercent(text)
@@ -1409,7 +1552,7 @@ end
 
 UI.heavenly.readFeedback = function()
     local now = os.clock()
-    if now - UI.heavenly.feedbackScanAt < 0.12 then
+    if now - UI.heavenly.feedbackScanAt < 0.04 then
         return UI.heavenly.feedbackValue
     end
     UI.heavenly.feedbackScanAt = now
@@ -1461,6 +1604,13 @@ UI.heavenly.reset = function(reason)
     UI.heavenly.feedbackScanAt = 0
     UI.heavenly.lastNoPairLogAt = 0
     UI.heavenly.pairDetected = false
+    UI.heavenly.ratioSamples = {}
+    UI.heavenly.pulseSerial = 0
+    UI.heavenly.lastPulseStartAt = 0
+    UI.heavenly.retryNotBefore = 0
+    UI.heavenly.awaitingFeedback = false
+    UI.heavenly.feedbackHandledPulse = 0
+    UI.heavenly.lastInputRatio = nil
 end
 
 UI.heavenly.process = function()
@@ -1482,6 +1632,14 @@ UI.heavenly.process = function()
             UI.heavenly.previousRatio = nil
             UI.heavenly.previousSampleAt = 0
             UI.heavenly.pulseConsumed = false
+            UI.heavenly.ratioSamples = {}
+            UI.heavenly.pulseSerial = 1
+            UI.heavenly.lastPulseStartAt = now
+            UI.heavenly.retryNotBefore = 0
+            UI.heavenly.awaitingFeedback = false
+            UI.heavenly.feedbackHandledPulse = 0
+            UI.heavenly.lastInputRatio = nil
+            UI.heavenly.timingLead = 0.020
             UI.heavenly.whiteRing = nil
             UI.heavenly.goldTarget = nil
             breakthroughTrialSeen = true
@@ -1524,17 +1682,34 @@ UI.heavenly.process = function()
         or (not noPair and now - UI.heavenly.scanAt >= 0.90)
     if shouldRescan then
         UI.heavenly.scanAt = now
+        local oldWhite, oldGold = UI.heavenly.whiteRing, UI.heavenly.goldTarget
         local whiteRing, goldTarget, ringSource = UI.heavenly.findRingPair()
         UI.heavenly.whiteRing = whiteRing
         UI.heavenly.goldTarget = goldTarget
         UI.heavenly.ringSource = ringSource or "unavailable"
+        if whiteRing and goldTarget and (whiteRing ~= oldWhite or goldTarget ~= oldGold) then
+            UI.heavenly.previousRatio = nil
+            UI.heavenly.previousSampleAt = 0
+            UI.heavenly.ratioSamples = {}
+            UI.heavenly.pulseConsumed = false
+            UI.heavenly.awaitingFeedback = false
+            UI.heavenly.pulseSerial = UI.heavenly.pulseSerial + 1
+            UI.heavenly.lastPulseStartAt = now
+            UI.heavenly.pairDetected = false
+            DIAG.log("INFO", "HEAVENLY", "timing_pair_reacquired", {
+                white = whiteRing:GetFullName(), gold = goldTarget:GetFullName(),
+                source = ringSource,
+            })
+        end
         if not UI.heavenly.whiteRing or not UI.heavenly.goldTarget then
             if UI.heavenly.ringLostAt == 0 then UI.heavenly.ringLostAt = now end
             UI.heavenly.pairDetected = false
             if now - UI.heavenly.ringLostAt > 0.28 then
                 UI.heavenly.previousRatio = nil
                 UI.heavenly.previousSampleAt = 0
+                UI.heavenly.ratioSamples = {}
                 UI.heavenly.pulseConsumed = false
+                UI.heavenly.awaitingFeedback = false
             end
             lastTrialText = "Heavenly Tribulation: waiting for ring geometry"
             if now - UI.heavenly.lastNoPairLogAt >= 1.0 then
@@ -1568,68 +1743,155 @@ UI.heavenly.process = function()
     local ratio = ((ws.X + ws.Y) * 0.5) / math.max(1, (gs.X + gs.Y) * 0.5)
     local previous = UI.heavenly.previousRatio
     local previousAt = UI.heavenly.previousSampleAt
-    local dt = previousAt > 0 and math.max(0.001, now - previousAt) or 0
-    local shrinking = previous ~= nil and ratio < previous - 0.002
+    local dt = previousAt > 0 and (now - previousAt) or 0
 
-    -- A new pulse begins when the ring resets to a clearly larger diameter.
-    if ratio >= 1.22 and (previous == nil or ratio > previous + 0.08) then
+    -- Continuous tribulations can reset the same UI objects without destroying
+    -- them. Detect a genuine outward reset instead of requiring a large 1.22x
+    -- ring size; the old threshold missed faster/smaller consecutive pulses.
+    local rising = previous ~= nil and ratio > previous + 0.025
+    if rising and ratio >= 1.035 and now - UI.heavenly.lastPulseStartAt >= 0.10 then
         UI.heavenly.pulseConsumed = false
+        UI.heavenly.lastPulseStartAt = now
+        UI.heavenly.pulseSerial = UI.heavenly.pulseSerial + 1
+        UI.heavenly.awaitingFeedback = false
+        UI.heavenly.lastFeedback = nil
+        UI.heavenly.ratioSamples = {}
+        DIAG.log("INFO", "HEAVENLY", "continuous_pulse_rearmed", {
+            pulse = UI.heavenly.pulseSerial,
+            ratio = ratio,
+            previousRatio = previous,
+        })
+    end
+
+    -- Drop stale samples after a frame hitch. A large dt produces a misleading
+    -- velocity estimate and was a common source of late/early SPACE presses.
+    if dt > 0.16 then
+        UI.heavenly.ratioSamples = {}
+        previous = nil
+        dt = 0
+    end
+
+    local samples = UI.heavenly.ratioSamples
+    table.insert(samples, {t = now, r = ratio})
+    while #samples > 4 or (#samples > 1 and now - samples[1].t > 0.14) do
+        table.remove(samples, 1)
+    end
+
+    -- Least-squares slope across the most recent samples is less noisy than a
+    -- single-frame derivative, especially when the game is under load.
+    local rate = nil
+    if #samples >= 3 then
+        local meanT, meanR = 0, 0
+        for _, sample in ipairs(samples) do
+            meanT = meanT + sample.t
+            meanR = meanR + sample.r
+        end
+        meanT = meanT / #samples
+        meanR = meanR / #samples
+        local numerator, denominator = 0, 0
+        for _, sample in ipairs(samples) do
+            numerator = numerator + (sample.t - meanT) * (sample.r - meanR)
+            denominator = denominator + (sample.t - meanT) ^ 2
+        end
+        if denominator > 0.000001 then rate = numerator / denominator end
+    elseif previous ~= nil and dt > 0 then
+        rate = (ratio - previous) / dt
     end
 
     local shouldPress = false
     local timeToAlignment = nil
-    if not UI.heavenly.pulseConsumed and not UI.heavenly.inputBusy and now - UI.heavenly.lastInputAt >= 0.32
-        and shrinking and dt > 0 then
-        local rate = (ratio - previous) / dt
-        if rate < -0.02 then
-            timeToAlignment = (1.0 - ratio) / rate
-            -- Predict a small input lead so the key-down lands near the visual
-            -- crossing. A just-crossed ring is accepted only within a narrow band.
-            shouldPress = (timeToAlignment >= -0.018 and timeToAlignment <= 0.065)
-                or (ratio <= 1.035 and ratio >= 0.88 and previous > 1.035)
-        end
+    local canAttempt = not UI.heavenly.pulseConsumed
+        and not UI.heavenly.inputBusy
+        and now >= UI.heavenly.retryNotBefore
+        and now - UI.heavenly.lastInputAt >= 0.12
+
+    if canAttempt and rate and rate < -0.02 then
+        timeToAlignment = (1.0 - ratio) / rate
+        local lead = math.clamp(UI.heavenly.timingLead, 0, 0.065)
+        shouldPress = timeToAlignment <= lead and timeToAlignment >= -0.025
     end
 
     UI.heavenly.previousRatio = ratio
     UI.heavenly.previousSampleAt = now
+
     local feedback = UI.heavenly.readFeedback()
-    if feedback and feedback ~= UI.heavenly.lastFeedback then
+    if feedback and UI.heavenly.awaitingFeedback
+        and now - UI.heavenly.lastInputAt >= 0.10
+        and UI.heavenly.feedbackHandledPulse ~= UI.heavenly.pulseSerial then
+        UI.heavenly.feedbackHandledPulse = UI.heavenly.pulseSerial
+        UI.heavenly.awaitingFeedback = false
         UI.heavenly.lastFeedback = feedback
-        DIAG.log("INFO", "HEAVENLY", "timing_feedback", {feedback = feedback, ratio = ratio})
+        DIAG.log("INFO", "HEAVENLY", "timing_feedback", {
+            feedback = feedback,
+            ratioAtInput = UI.heavenly.lastInputRatio,
+            timingLead = UI.heavenly.timingLead,
+            pulse = UI.heavenly.pulseSerial,
+        })
         if feedback == "PERFECT" or feedback == "PERFECT!" or feedback == "GOOD" or feedback == "GOOD!" then
             UI.heavenly.successfulInputs = UI.heavenly.successfulInputs + 1
+            -- Preserve a successful lead; only misses move the calibration.
         elseif feedback == "MISS" or feedback == "FAILED" then
-            DIAG.log("WARN", "HEAVENLY", "timing_miss_feedback", {feedback = feedback, ratio = ratio})
+            local ratioAtInput = UI.heavenly.lastInputRatio or 1
+            if ratioAtInput > 1.012 then
+                -- Input landed before the target: shorten the lead.
+                UI.heavenly.timingLead = math.max(0, UI.heavenly.timingLead - 0.006)
+            elseif ratioAtInput < 0.988 then
+                -- Input landed after the target: increase the lead.
+                UI.heavenly.timingLead = math.min(0.065, UI.heavenly.timingLead + 0.006)
+            end
+            DIAG.log("WARN", "HEAVENLY", "timing_miss_feedback", {
+                feedback = feedback,
+                ratioAtInput = ratioAtInput,
+                adjustedLead = UI.heavenly.timingLead,
+            })
         end
     elseif not feedback then
         UI.heavenly.lastFeedback = nil
     end
 
     if shouldPress then
-        UI.heavenly.pulseConsumed = true
         UI.heavenly.inputBusy = true
         UI.heavenly.lastInputAt = now
+        UI.heavenly.lastInputRatio = ratio
+        UI.heavenly.awaitingFeedback = true
         lastTrialText = "Heavenly Tribulation: SPACE timing input"
         DIAG.log("INFO", "HEAVENLY", "space_input_attempt", {
             ringRatio = ratio,
-            previousRatio = previous,
+            rate = rate,
             timeToAlignment = timeToAlignment,
+            timingLead = UI.heavenly.timingLead,
+            pulse = UI.heavenly.pulseSerial,
             ringSource = UI.heavenly.ringSource,
         })
         task.spawn(function()
-            local ok, sent, backend = pcall(sendKey, Enum.KeyCode.Space)
+            local ok, sent, backend = pcall(sendTimingKey, Enum.KeyCode.Space)
             UI.heavenly.inputBusy = false
             if ok and sent then
-                DIAG.log("INFO", "HEAVENLY", "space_input_sent", {backend = backend, ringRatio = ratio})
-                setStatus("Heavenly Tribulation: SPACE sent at predicted ring alignment.", COLORS.success)
+                UI.heavenly.pulseConsumed = true
+                DIAG.log("INFO", "HEAVENLY", "space_input_sent", {
+                    backend = backend,
+                    ringRatio = ratio,
+                    pulse = UI.heavenly.pulseSerial,
+                })
+                setStatus("Heavenly Tribulation: SPACE sent; adaptive timing lead " .. string.format("%.0fms", UI.heavenly.timingLead * 1000) .. ".", COLORS.success)
             else
+                UI.heavenly.awaitingFeedback = false
+                UI.heavenly.retryNotBefore = os.clock() + 0.12
                 UI.heavenly.failedInputs = UI.heavenly.failedInputs + 1
-                DIAG.log("ERROR", "HEAVENLY", "space_input_failed", {error = ok and backend or tostring(sent), ringRatio = ratio})
-                setStatus("Heavenly Tribulation SPACE input failed; waiting for the next ring pulse.", COLORS.danger)
+                DIAG.log("ERROR", "HEAVENLY", "space_input_failed", {
+                    error = ok and backend or tostring(sent),
+                    ringRatio = ratio,
+                    pulse = UI.heavenly.pulseSerial,
+                })
+                setStatus("Heavenly Tribulation SPACE input failed; retrying this pulse if timing remains available.", COLORS.danger)
             end
         end)
     else
-        lastTrialText = string.format("Heavenly Tribulation: ring %.2fx | SPACE inputs %d", ratio, UI.heavenly.successfulInputs)
+        lastTrialText = string.format(
+            "Heavenly Tribulation: ring %.2fx | SPACE %d | lead %.0fms | pulse %d",
+            ratio, UI.heavenly.successfulInputs,
+            UI.heavenly.timingLead * 1000, UI.heavenly.pulseSerial
+        )
     end
     return true
 end
@@ -2126,6 +2388,7 @@ local function stopAutomationOwnedTraining(mode)
 end
 
 local function processAutoCultivation()
+    if SETTINGS.loaded and not SETTINGS.restoreReady then return end
     if UI.heavenly.active or INHERITANCE.busy or herbCollectorBusy or CHEST.busy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or not selectedAutoMode or paused or not running then
         return
     end
@@ -2633,211 +2896,14 @@ local function isBreakthroughPending()
     return percent ~= nil and percent >= 99.95
 end
 
--- Silver target scanning uses visible CultivatorCamps NPCs. It sends no attack input
--- and never fires NpcKillSilver or any reward/update RemoteEvent.
-SILVER.getNpcRoot = function(model)
-    if not model then return nil end
-    return model:FindFirstChild("HumanoidRootPart")
-        or model:FindFirstChild("UpperTorso")
-        or model:FindFirstChild("Torso")
-        or model.PrimaryPart
-end
-
-SILVER.findTarget = function()
-    local playerRoot = getCharacterParts()
-    local playerRealm = getRealmNumber("Qi")
-    if not playerRoot or not playerRealm then return nil, nil, nil, nil end
-    local camps = Workspace:FindFirstChild("CultivatorCamps")
-    if not camps then return nil, nil, nil, nil end
-
-    local bestModel, bestHumanoid, bestRoot, bestRealm = nil, nil, nil, nil
-    local bestDistance = math.huge
-    for _, model in ipairs(camps:GetDescendants()) do
-        if model:IsA("Model") and model:GetAttribute("IsCultivator") == true
-            and model:GetAttribute("IsBoss") ~= true then
-            local realm = tonumber(model:GetAttribute("QiRealm"))
-            local humanoid = model:FindFirstChildOfClass("Humanoid")
-            local npcRoot = SILVER.getNpcRoot(model)
-            local blockedUntil = SILVER.blacklist[model]
-            local blocked = blockedUntil and os.clock() < blockedUntil
-            if realm and realm <= playerRealm and humanoid and humanoid.Health > 0 and npcRoot and not blocked then
-                local distance = (playerRoot.Position - npcRoot.Position).Magnitude
-                -- SAFE mode chooses the weakest eligible realm first so a fresh/low-HP
-                -- character is not sent straight to the strongest NPC it can technically face.
-                -- STRONG mode retains the old highest-realm behavior.
-                local better = false
-                if not bestModel then
-                    better = true
-                elseif SILVER.targetMode == "STRONG" then
-                    better = realm > bestRealm
-                        or (realm == bestRealm and humanoid.MaxHealth < bestHumanoid.MaxHealth)
-                        or (realm == bestRealm and humanoid.MaxHealth == bestHumanoid.MaxHealth and distance < bestDistance)
-                else
-                    better = realm < bestRealm
-                        or (realm == bestRealm and humanoid.MaxHealth < bestHumanoid.MaxHealth)
-                        or (realm == bestRealm and humanoid.MaxHealth == bestHumanoid.MaxHealth and distance < bestDistance)
-                end
-                if better then
-                    bestModel, bestHumanoid, bestRoot, bestRealm, bestDistance = model, humanoid, npcRoot, realm, distance
-                end
-            end
-        end
-    end
-    return bestModel, bestHumanoid, bestRoot, bestRealm
-end
-
-SILVER.wait = function(seconds)
-    local untilTime = os.clock() + seconds
-    while os.clock() < untilTime do
-        if not running or not SILVER.autoEnabled or paused or UI.heavenly.active then return false end
-        task.wait(0.05)
-    end
-    return true
-end
-
-SILVER.detectWeaponState = function()
-    local character = LocalPlayer.Character
-    if not character then return false, "no character", nil end
-    local tool = character:FindFirstChildOfClass("Tool")
-    if tool then return true, "equipped Tool", tool.Name end
-    local drawn = character:FindFirstChild("DrawnSword", true)
-    if drawn then return true, "DrawnSword instance", drawn.Name end
-    local weaponValue = character:FindFirstChild("EquippedWeapon", true)
-    if weaponValue then
-        local value = nil
-        pcall(function() value = weaponValue.Value end)
-        if value ~= nil and tostring(value) ~= "" and tostring(value) ~= "false" then
-            return true, "EquippedWeapon value", tostring(value)
-        end
-    end
-    for _, node in ipairs(character:GetDescendants()) do
-        local lower = string.lower(node.Name)
-        if (node:IsA("Model") or node:IsA("BasePart"))
-            and (string.find(lower, "sword", 1, true) or string.find(lower, "blade", 1, true))
-            and not string.find(lower, "sheathe", 1, true) then
-            return true, "named weapon descendant", node.Name
-        end
-    end
-    return false, "weapon state not exposed", nil
-end
-
-SILVER.ensureWeaponDrawn = function()
-    local character = LocalPlayer.Character
-    if not character then return false, "character unavailable" end
-    local isDrawn, source, name = SILVER.detectWeaponState()
-    if isDrawn then
-        DIAG.log("INFO", "SILVER", "weapon_already_drawn", {source = source, weapon = name})
-        return true, "weapon already drawn"
-    end
-    if not SILVER.autoDrawEnabled then
-        DIAG.log("WARN", "SILVER", "weapon_state_unknown", {autoDraw = false, source = source})
-        return true, "weapon state unknown; scan-only mode will not send an attack input"
-    end
-    if SILVER.tAttemptedCharacter == character then
-        return true, "T was already attempted for this character; no repeated toggle"
-    end
-    SILVER.tAttemptedCharacter = character
-    DIAG.log("INFO", "SILVER", "sword_carry_key_attempt", {key = "T", priorState = source})
-    local sent, backend = sendKey(Enum.KeyCode.T)
-    if not sent then
-        DIAG.log("ERROR", "SILVER", "sword_carry_key_failed", {backend = backend})
-        return false, "could not send T to carry sword: " .. tostring(backend)
-    end
-    task.wait(0.35)
-    local after, afterSource, afterName = SILVER.detectWeaponState()
-    DIAG.log(after and "INFO" or "WARN", "SILVER", "sword_carry_state_after_t", {detected = after, source = afterSource, weapon = afterName, backend = backend})
-    if after then return true, "sword carried with T" end
-    -- Some games render the sword locally without exposing a Tool/Value. Do not
-    -- press T again (it would toggle the sword back); leave attack input to the user.
-    return true, "T sent once; weapon state hidden"
-end
-
--- Combat activation is intentionally scan-only in v1.0.5.
--- Observer v1.3 proves manual M1 -> Action animation -> HitFeedback -> NPC HP change,
--- but does not expose a verified non-mouse activation API. Never hijack the camera
--- or synthesize mouse clicks here. Target selection and reward monitoring remain live.
-SILVER.basicAttack = function(_targetRoot)
-    return false, "scan-only: no verified non-click combat activation is available"
-end
-
-SILVER.run = function()
-    if SILVER.taskRunning then return end
-    SILVER.taskRunning = true
-    DIAG.log("INFO", "SILVER", "target_scan_started", {
-        targetMode = SILVER.targetMode,
-        combatInput = "disabled_no_mouse_or_camera_input",
-        autoCarry = SILVER.autoDrawEnabled,
-    })
-    task.spawn(function()
-        while running and SILVER.autoEnabled do
-            if paused then
-                SILVER.setStatus("paused")
-                task.wait(0.25)
-            elseif INHERITANCE.busy or UI.heavenly.active or herbCollectorBusy or CHEST.busy
-                or CHEST.teleportActive or autoBrewBusy or cauldronPanelIsOpen()
-                or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
-                SILVER.setStatus("target scan paused for another activity")
-                task.wait(0.3)
-            else
-                local playerRoot = getCharacterParts()
-                local playerRealm = getRealmNumber("Qi")
-                if not playerRoot then
-                    SILVER.currentTarget = nil
-                    SILVER.currentTargetRealm = nil
-                    SILVER.setStatus("waiting for character")
-                    task.wait(0.5)
-                elseif not playerRealm then
-                    SILVER.setStatus("waiting for Qi realm data")
-                    task.wait(0.5)
-                else
-                    local target, targetHumanoid, targetRoot, targetRealm = SILVER.findTarget()
-                    if not target then
-                        SILVER.currentTarget = nil
-                        SILVER.currentTargetRealm = nil
-                        SILVER.setStatus("no eligible non-boss CultivatorCamps NPC for Qi Realm " .. tostring(playerRealm))
-                        task.wait(1.0)
-                    else
-                        local changed = SILVER.currentTarget ~= target
-                        SILVER.currentTarget = target
-                        SILVER.currentTargetRealm = targetRealm
-                        if changed then
-                            DIAG.log("INFO", "SILVER", "scan_target_selected", {
-                                target = target.Name,
-                                realm = targetRealm,
-                                hp = targetHumanoid.Health,
-                                maxHp = targetHumanoid.MaxHealth,
-                                distance = (playerRoot.Position - targetRoot.Position).Magnitude,
-                                playerRealm = playerRealm,
-                                targetMode = SILVER.targetMode,
-                            })
-                        end
-                        if SILVER.autoDrawEnabled then
-                            local ready, message = SILVER.ensureWeaponDrawn()
-                            if not ready then
-                                SILVER.setStatus("auto-carry unavailable: " .. tostring(message))
-                            end
-                        end
-                        local distance = (playerRoot.Position - targetRoot.Position).Magnitude
-                        SILVER.setStatus(string.format(
-                            "SCAN ONLY: %s | HP %s/%s | %.1f studs | manual M1 required",
-                            target.Name,
-                            ECONOMY.formatNumber(targetHumanoid.Health),
-                            ECONOMY.formatNumber(targetHumanoid.MaxHealth),
-                            distance
-                        ))
-                        task.wait(0.35)
-                    end
-                end
-            end
-        end
-        SILVER.busy = false
-        SILVER.currentTarget = nil
-        SILVER.currentTargetRealm = nil
-        SILVER.taskRunning = false
-        SILVER.setStatus(SILVER.autoEnabled and "waiting" or "OFF")
-        updateModeButtons()
-    end)
-end
+-- Auto Silver removed in v1.0.6 pending a verified native combat activation path.
+SILVER.getNpcRoot = function() return nil end
+SILVER.findTarget = function() return nil, nil, nil, nil end
+SILVER.wait = function() return false end
+SILVER.detectWeaponState = function() return false, "Auto Silver retired", nil end
+SILVER.ensureWeaponDrawn = function() return false, "Auto Silver retired" end
+SILVER.basicAttack = function() return false, "Auto Silver retired" end
+SILVER.run = function() return false, "Auto Silver retired pending verified attack mechanism" end
 
 local function runHerbCollector()
     if herbCollectorTaskRunning then
@@ -2968,1086 +3034,16 @@ HERB_MONITOR.update = function(force)
     )
 end
 
--- Auto Chest -----------------------------------------------------------------
--- Uses live Workspace.ChestSpots markers and their OpenChestPrompt objects.
--- Tier and HoldDuration are read from the live objects; no tier duration is
--- hardcoded. Opening is performed through the actual ProximityPrompt lifecycle.
-
-CHEST.normalizeTier = function(value)
-    local text = string.lower(tostring(value or ""))
-    for _, tier in ipairs(CHEST_TIER_ORDER) do
-        if string.find(text, string.lower(tier), 1, true) then
-            return tier
-        end
-    end
-    return nil
+-- Auto Chest, Chest Teleport and Immortal Inheritance removed in v1.0.6.
+-- Compatibility stubs keep shared status/stop guards safe; no scanning,
+-- prompt interaction, event listener, travel, or claim logic remains.
+CHEST.setStatus = function(message)
+    CHEST.activeName = tostring(message or "retired")
 end
-
-CHEST.getSpotFromPrompt = function(prompt, folder)
-    local node = prompt
-    while node and node.Parent and node.Parent ~= folder do
-        node = node.Parent
-    end
-    if node and node.Parent == folder then
-        return node
-    end
-    return prompt and prompt.Parent or nil
-end
-
-CHEST.getTier = function(spot, prompt)
-    local node = spot
-    local depth = 0
-    while node and depth < 5 do
-        local ok, value = pcall(function()
-            return node:GetAttribute("Tier")
-        end)
-        if ok and value ~= nil then
-            local tier = CHEST.normalizeTier(value)
-            if tier then
-                return tier
-            end
-        end
-        node = node.Parent
-        depth = depth + 1
-    end
-    return CHEST.normalizeTier(prompt and prompt.ObjectText)
-end
-
-CHEST.isOpened = function(spot)
-    local node = spot
-    local depth = 0
-    while node and depth < 5 do
-        local ok, opened = pcall(function()
-            return node:GetAttribute("Opened")
-        end)
-        if ok and opened == true then
-            return true
-        end
-        node = node.Parent
-        depth = depth + 1
-    end
-    return false
-end
-
-CHEST.getPosition = function(spot, prompt)
-    if spot and spot:IsA("BasePart") then
-        return spot.Position
-    end
-    if spot and spot:IsA("Model") then
-        local ok, pivot = pcall(function()
-            return spot:GetPivot()
-        end)
-        if ok and pivot then
-            return pivot.Position
-        end
-    end
-    local parent = prompt and prompt.Parent
-    if parent and parent:IsA("BasePart") then
-        return parent.Position
-    end
-    if parent and parent:IsA("Model") then
-        local ok, pivot = pcall(function()
-            return parent:GetPivot()
-        end)
-        if ok and pivot then
-            return pivot.Position
-        end
-    end
-    return nil
-end
-
-CHEST.getPromptWorldPosition = function(prompt, fallback)
-    local parent = prompt and prompt.Parent
-    if parent and parent:IsA("Attachment") then
-        return parent.WorldPosition
-    end
-    if parent and parent:IsA("BasePart") then
-        return parent.Position
-    end
-    return fallback
-end
-
-CHEST.getPromptApproach = function(prompt, fallbackPosition)
-    local parent = prompt and prompt.Parent
-    if parent and parent:IsA("Attachment") then
-        local cf = parent.WorldCFrame
-        return cf.Position + cf.LookVector * 3.5 + Vector3.new(0, 1.0, 0), cf.Position
-    end
-    if parent and parent:IsA("BasePart") then
-        local cf = parent.CFrame
-        return cf.Position + cf.LookVector * 3.5 + Vector3.new(0, 1.0, 0), cf.Position
-    end
-    return fallbackPosition + Vector3.new(0, 3.0, 0), fallbackPosition
-end
-
-CHEST.getPromptEntries = function()
-    local entries = {}
-    local folder = Workspace:FindFirstChild("ChestSpots")
-    if not folder then
-        return entries
-    end
-    for _, node in ipairs(folder:GetDescendants()) do
-        if node:IsA("ProximityPrompt") and node.Name == "OpenChestPrompt" then
-            local spot = CHEST.getSpotFromPrompt(node, folder)
-            local tier = CHEST.getTier(spot, node)
-            local position = CHEST.getPosition(spot, node)
-            if spot and tier and position then
-                table.insert(entries, {spot = spot, prompt = node, tier = tier, position = position})
-            end
-        end
-    end
-    return entries
-end
-
-CHEST.getMonitorCounts = function()
-    local counts = {open = {Celestial = 0, Jade = 0, Bronze = 0, Wooden = 0}, opened = 0, unknown = 0}
-    local now = os.clock()
-    for _, entry in ipairs(CHEST.getPromptEntries()) do
-        local openedUntil = CHEST.openedByScript[entry.spot]
-        if openedUntil and now >= openedUntil then
-            CHEST.openedByScript[entry.spot] = nil
-            openedUntil = nil
-        end
-        if CHEST.isOpened(entry.spot) or openedUntil then
-            counts.opened = counts.opened + 1
-        elseif entry.prompt.Enabled then
-            counts.open[entry.tier] = counts.open[entry.tier] + 1
-        else
-            counts.opened = counts.opened + 1
-        end
-    end
-    return counts
-end
-
-CHEST.updateMonitor = function()
-    if not UI.chestInfoLabel then
-        return
-    end
-    local ok, counts = pcall(CHEST.getMonitorCounts)
-    if not ok then
-        UI.chestInfoLabel.Text = "Chests: scan error"
-        return
-    end
-    UI.chestInfoLabel.Text = string.format(
-        "Chests: %d opened | ready C/J/B/W %d/%d/%d/%d | %s",
-        CHEST.openedCount,
-        counts.open.Celestial, counts.open.Jade, counts.open.Bronze, counts.open.Wooden,
-        CHEST.activeName
-    )
-end
-
-CHEST.findBestPrompt = function(ignoreCooldown)
-    local root = getCharacterParts()
-    if not root then
-        return nil, nil, nil, nil, nil
-    end
-    local best = nil
-    local bestRank = -1
-    local bestDistance = math.huge
-    local now = os.clock()
-    for _, entry in ipairs(CHEST.getPromptEntries()) do
-        local spot, prompt, tier = entry.spot, entry.prompt, entry.tier
-        local opened = CHEST.isOpened(spot)
-        local openedUntil = CHEST.openedByScript[spot]
-        if openedUntil and now >= openedUntil then
-            CHEST.openedByScript[spot] = nil
-            openedUntil = nil
-        end
-        local lastAttempt = CHEST.attemptTimes[spot]
-        local coolingDown = lastAttempt and (now - lastAttempt < 12)
-        if not opened and not openedUntil and prompt.Enabled and CHEST.tierSelection[tier] and (ignoreCooldown == true or not coolingDown) then
-            local distance = (root.Position - entry.position).Magnitude
-            local rank = CHEST.tierOrder[tier] or 0
-            if rank > bestRank or (rank == bestRank and distance < bestDistance) then
-                best = entry
-                bestRank = rank
-                bestDistance = distance
-            end
-        end
-    end
-    if not best then
-        return nil, nil, nil, nil, nil
-    end
-    return best.spot, best.prompt, best.position, best.tier, bestDistance
-end
-
-CHEST.returnFromTeleport = function(reason, stopping)
-    if not CHEST.teleportActive then return false end
-    local returnCFrame = CHEST.teleportReturnCFrame
-    local resumeMode = CHEST.teleportResumeMode
-    CHEST.teleportActive = false
-    CHEST.teleportReturnCFrame = nil
-    CHEST.teleportResumeMode = nil
-    CHEST.teleportTargetSpot = nil
-    CHEST.teleportTargetPrompt = nil
-
-    local root = getCharacterParts()
-    if root and returnCFrame then
-        local ok, err = pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = returnCFrame
-        end)
-        DIAG.log(ok and "INFO" or "WARN", "CHEST", "teleport_return", {reason = reason or "manual return", success = ok, error = ok and nil or tostring(err)})
-    else
-        DIAG.log("WARN", "CHEST", "teleport_return_no_character", {reason = reason or "manual return"})
-    end
-
-    if not stopping and running and not paused and not UI.heavenly.active and resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then
-        task.delay(0.65, function()
-            if running and not paused and not CHEST.teleportActive and not isTrainingActive(resumeMode) then
-                activateTraining(resumeMode)
-            end
-        end)
-    end
-    CHEST.setStatus(reason or "returned to previous position")
-    updateModeButtons()
-    return true
-end
-
-CHEST.teleportToBest = function()
-    if CHEST.teleportActive then
-        return CHEST.returnFromTeleport("returned to previous position")
-    end
-    if UI.heavenly.active or INHERITANCE.busy or CHEST.autoEnabled or CHEST.busy or herbCollectorBusy or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() then
-        CHEST.setStatus("turn off Auto Chest / finish current activity before using Chest Teleport")
-        return false
-    end
-    if activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
-        CHEST.setStatus("wait until breakthrough/tribulation finishes before chest teleport")
-        return false
-    end
-
-    local spot, prompt, position, tier, distance = CHEST.findBestPrompt(true)
-    if not spot or not prompt then
-        CHEST.setStatus("no unopened chest matching the selected tier filter")
-        DIAG.log("WARN", "CHEST", "manual_teleport_no_target", {filter = CHEST.getFilterSummary()})
-        return false
-    end
-
-    local root = getCharacterParts()
-    if not root then
-        CHEST.setStatus("character unavailable")
-        return false
-    end
-
-    local returnCFrame = root.CFrame
-    local resumeMode = getHerbResumeMode()
-    CHEST.teleportReturnCFrame = returnCFrame
-    CHEST.teleportResumeMode = resumeMode
-    CHEST.teleportTargetSpot = spot
-    CHEST.teleportTargetPrompt = prompt
-    CHEST.teleportActive = true
-
-    if resumeMode and isTrainingActive(resumeMode) then
-        local key = resumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
-        local sent, backend = sendKey(key)
-        if not sent then
-            CHEST.teleportActive = false
-            CHEST.teleportReturnCFrame = nil
-            CHEST.teleportResumeMode = nil
-            CHEST.teleportTargetSpot = nil
-            CHEST.teleportTargetPrompt = nil
-            CHEST.setStatus("could not pause current cultivation: " .. tostring(backend))
-            updateModeButtons()
-            return false
-        end
-        task.wait(0.3)
-    end
-
-    local promptPosition = CHEST.getPromptWorldPosition(prompt, position)
-    local destination, lookAt = CHEST.getPromptApproach(prompt, position)
-    local moved, moveError = pcall(function()
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = CFrame.lookAt(destination, lookAt)
-    end)
-    if not moved then
-        CHEST.teleportActive = false
-        CHEST.teleportReturnCFrame = nil
-        CHEST.teleportResumeMode = nil
-        CHEST.teleportTargetSpot = nil
-        CHEST.teleportTargetPrompt = nil
-        if resumeMode and not selectedAutoMode and not isTrainingActive(resumeMode) then activateTraining(resumeMode) end
-        CHEST.setStatus("chest teleport failed: " .. tostring(moveError))
-        updateModeButtons()
-        return false
-    end
-
-    task.wait(0.9)
-    root = getCharacterParts()
-    local actualDistance = root and (root.Position - (CHEST.getPromptWorldPosition(prompt, position) or promptPosition)).Magnitude or math.huge
-    local maxDistance = tonumber(prompt.MaxActivationDistance) or 12
-    DIAG.log(actualDistance <= maxDistance and "INFO" or "WARN", "CHEST", "manual_teleport_arrival", {chest = spot.Name, tier = tier, distance = actualDistance, maxDistance = maxDistance, promptKey = tostring(prompt.KeyboardKeyCode), holdDuration = prompt.HoldDuration})
-
-    if actualDistance > maxDistance then
-        CHEST.returnFromTeleport("server did not retain chest teleport; returned to training")
-        return false
-    end
-
-    CHEST.setStatus(string.format("At %s (%s). Hold %s for %.2fs manually; return button restores your position.", spot.Name, tier, tostring(prompt.KeyboardKeyCode), tonumber(prompt.HoldDuration) or 1))
-    updateModeButtons()
-    return true
-end
-
-CHEST.wait = function(seconds)
-    local deadline = os.clock() + seconds
-    while os.clock() < deadline do
-        if not running or not CHEST.autoEnabled or paused or UI.heavenly.active then
-            return false
-        end
-        if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
-            return false
-        end
-        task.wait(0.05)
-    end
-    return true
-end
-
-CHEST.holdPrompt = function(prompt, spot, tier, revisionBefore)
-    local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 1.0, 0.1, 8)
-    local promptKey = prompt.KeyboardKeyCode
-    if promptKey == Enum.KeyCode.Unknown then promptKey = Enum.KeyCode.E end
-
-    local function stateChanged()
-        if not prompt or not prompt.Parent then return true end
-        if spot and CHEST.isOpened(spot) then return true end
-        if not prompt.Enabled then return true end
-        if spot and tier and revisionBefore ~= nil
-            and CHEST.getLocalOpenEvent(spot, tier, revisionBefore) then
-            return true
-        end
-        return false
-    end
-
-    local function waitForState(seconds)
-        local deadline = os.clock() + seconds
-        while os.clock() < deadline do
-            if not CHEST.wait(0.05) then return false, "cancelled" end
-            if stateChanged() then return true, "prompt state changed" end
-        end
-        local changed = stateChanged()
-        return changed, changed and "prompt state changed" or "no trigger/state change"
-    end
-
-    -- Optional instant probe. A successful API call is not considered success
-    -- unless the server's opened event or the actual prompt state changes.
-    if (QUICK_INTERACT.enabled or QUICK_INTERACT.chestEnabled) and type(fireproximityprompt) == "function" then
-        QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
-        DIAG.log("INFO", "CHEST", "quick_interact_attempt", {chest = spot and spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance, key = tostring(promptKey)})
-        local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
-        if quickOk then
-            local confirmed, reason = waitForState(0.65)
-            if confirmed then
-                QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
-                DIAG.log("INFO", "CHEST", "quick_interact_verified", {chest = spot and spot.Name, tier = tier, reason = reason})
-                return true, "quick prompt (verified)"
-            end
-        else
-            DIAG.log("WARN", "CHEST", "quick_interact_api_failed", {chest = spot and spot.Name, tier = tier, reason = tostring(quickErr)})
-        end
-        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
-        DIAG.log("WARN", "CHEST", "quick_interact_not_confirmed_fallback", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration})
-    end
-
-    -- Primary fallback mirrors the confirmed manual method: hold the prompt's
-    -- keyboard key (E in the user's manual test) for its live HoldDuration.
-    local virtualInput
-    local okService, service = pcall(function() return game:GetService("VirtualInputManager") end)
-    if okService then virtualInput = service end
-    if virtualInput then
-        local keyDown = pcall(function() virtualInput:SendKeyEvent(true, promptKey, false, game) end)
-        if keyDown then
-            local startedAt = os.clock()
-            DIAG.log("INFO", "CHEST", "automated_key_hold_begin", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey), holdDuration = holdDuration, maxDistance = prompt.MaxActivationDistance, requiresLineOfSight = prompt.RequiresLineOfSight})
-            local completed = CHEST.wait(holdDuration + 0.12)
-            pcall(function() virtualInput:SendKeyEvent(false, promptKey, false, game) end)
-            DIAG.log(completed and "INFO" or "WARN", "CHEST", "automated_key_hold_end", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey), elapsed = os.clock() - startedAt, completed = completed})
-            if not completed then return false, "cancelled during keyboard hold" end
-            local confirmed, reason = waitForState(1.0)
-            if confirmed then return true, "VirtualInputManager keyboard hold (verified)" end
-        else
-            DIAG.log("WARN", "CHEST", "automated_key_hold_failed", {chest = spot and spot.Name, tier = tier, key = tostring(promptKey)})
-        end
-    end
-
-    -- Roblox ProximityPrompt lifecycle fallback. A non-throwing call is not
-    -- treated as an opened chest; wait for server/prompt confirmation.
-    local began = pcall(function() prompt:InputHoldBegin() end)
-    if began then
-        DIAG.log("INFO", "CHEST", "input_hold_begin_backend", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration})
-        local completed = CHEST.wait(holdDuration + 0.15)
-        pcall(function() prompt:InputHoldEnd() end)
-        if not completed then return false, "cancelled during ProximityPrompt hold" end
-        local confirmed, reason = waitForState(0.8)
-        if confirmed then return true, "ProximityPrompt hold (verified)" end
-    end
-
-    -- Last executor helper fallback uses the real configured duration.
-    if type(fireproximityprompt) == "function" then
-        local ok, err = pcall(fireproximityprompt, prompt, holdDuration)
-        DIAG.log(ok and "INFO" or "WARN", "CHEST", "duration_prompt_helper_attempt", {chest = spot and spot.Name, tier = tier, holdDuration = holdDuration, result = ok, error = ok and nil or tostring(err)})
-        if ok then
-            local confirmed, reason = waitForState(1.0)
-            if confirmed then return true, "fireproximityprompt with configured duration (verified)" end
-        end
-    end
-    return false, "E hold and prompt fallbacks ran but no ChestWorldOpened/prompt-state confirmation"
-end
-
-
--- Manual chest interaction trace. This records the player's real E key-down/up
--- and Roblox prompt lifecycle so future automation can mirror the successful hold.
-local function findNearbyChestPromptForTrace()
-    local root = getCharacterParts()
-    if not root then return nil end
-    local best, bestDistance = nil, math.huge
-    for _, entry in ipairs(CHEST.getPromptEntries()) do
-        local prompt = entry.prompt
-        if prompt and prompt.Parent and prompt.Enabled then
-            local distance = (root.Position - entry.position).Magnitude
-            local range = tonumber(prompt.MaxActivationDistance) or 12
-            if distance <= range + 1.5 and distance < bestDistance then
-                best = {spot = entry.spot, prompt = prompt, tier = entry.tier, distance = distance}
-                bestDistance = distance
-            end
-        end
-    end
-    return best
-end
-
-addConnection(UserInputService.InputBegan, function(input, gameProcessed)
-    if input.KeyCode ~= Enum.KeyCode.E or EXPERIMENT.chestManualHold then return end
-    local entry = findNearbyChestPromptForTrace()
-    if not entry then return end
-    EXPERIMENT.chestManualHold = {entry = entry, startedAt = os.clock()}
-    DIAG.log("INFO", "CHEST", "manual_e_hold_begin", {
-        chest = entry.spot and entry.spot.Name, tier = entry.tier, prompt = entry.prompt:GetFullName(),
-        key = "E", holdDurationRequired = entry.prompt.HoldDuration, maxDistance = entry.prompt.MaxActivationDistance,
-        distance = entry.distance, gameProcessed = gameProcessed, requiresLineOfSight = entry.prompt.RequiresLineOfSight,
-    })
-end)
-
-addConnection(UserInputService.InputEnded, function(input, gameProcessed)
-    if input.KeyCode ~= Enum.KeyCode.E or not EXPERIMENT.chestManualHold then return end
-    local hold = EXPERIMENT.chestManualHold
-    EXPERIMENT.chestManualHold = nil
-    local entry = hold.entry
-    DIAG.log("INFO", "CHEST", "manual_e_hold_end", {
-        chest = entry and entry.spot and entry.spot.Name, tier = entry and entry.tier,
-        prompt = entry and entry.prompt and entry.prompt.Parent and entry.prompt:GetFullName() or nil,
-        key = "E", heldSeconds = os.clock() - hold.startedAt, gameProcessed = gameProcessed,
-        opened = entry and entry.spot and CHEST.isOpened(entry.spot) or false,
-        promptEnabled = entry and entry.prompt and entry.prompt.Parent and entry.prompt.Enabled or false,
-    })
-end)
-
-addConnection(ProximityPromptService.PromptButtonHoldBegan, function(prompt, inputType)
-    if prompt and prompt.Name == "OpenChestPrompt" then
-        DIAG.log("INFO", "CHEST", "prompt_hold_began", {prompt = prompt:GetFullName(), inputType = tostring(inputType), key = tostring(prompt.KeyboardKeyCode), holdDuration = prompt.HoldDuration, maxDistance = prompt.MaxActivationDistance})
-    end
-end)
-addConnection(ProximityPromptService.PromptButtonHoldEnded, function(prompt)
-    if prompt and prompt.Name == "OpenChestPrompt" then
-        DIAG.log("INFO", "CHEST", "prompt_hold_ended", {prompt = prompt:GetFullName(), enabled = prompt.Enabled})
-    end
-end)
-addConnection(ProximityPromptService.PromptTriggered, function(prompt, playerWhoTriggered)
-    if prompt and prompt.Name == "OpenChestPrompt" then
-        DIAG.log(playerWhoTriggered == LocalPlayer and "INFO" or "DEBUG", "CHEST", "prompt_triggered", {prompt = prompt:GetFullName(), player = playerWhoTriggered and playerWhoTriggered.Name, localPlayer = playerWhoTriggered == LocalPlayer})
-    end
-end)
-
-CHEST.getLocalOpenEvent = function(spot, tier, revisionBefore)
-    if CHEST.worldOpenedRevision <= revisionBefore or type(CHEST.lastWorldOpened) ~= "table" then
-        return nil
-    end
-    local event = CHEST.lastWorldOpened
-    if event.playerName ~= LocalPlayer.Name then
-        return nil
-    end
-    if CHEST.normalizeTier(event.tier) ~= tier then
-        return nil
-    end
-    if event.chest == nil or event.chest == spot or event.chestName == spot.Name then
-        return event
-    end
-    return nil
-end
-
-CHEST.beginSweep = function()
-    if CHEST.busy or herbCollectorBusy or autoBrewBusy then
-        return false, "another collection/brewing task is active"
-    end
-    local root = getCharacterParts()
-    if not root then
-        return false, "waiting for character"
-    end
-    CHEST.returnCFrame = root.CFrame
-    CHEST.resumeMode = getHerbResumeMode()
-    CHEST.busy = true
-    if CHEST.resumeMode and isTrainingActive(CHEST.resumeMode) then
-        local key = CHEST.resumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
-        local sent, backend = sendKey(key)
-        if not sent then
-            CHEST.busy = false
-            CHEST.returnCFrame = nil
-            CHEST.resumeMode = nil
-            return false, "could not pause current cultivation: " .. tostring(backend)
-        end
-        task.wait(0.35)
-    end
-    return true, "collection sweep started"
-end
-
-CHEST.finishSweep = function(reason)
-    if not CHEST.busy and not CHEST.returnCFrame then
-        return
-    end
-    CHEST.busy = false
-    if not UI.heavenly.active and not selectedAutoMode and CHEST.returnCFrame then
-        local root = getCharacterParts()
-        if root then
-            pcall(function()
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
-                root.CFrame = CHEST.returnCFrame
-            end)
-            task.wait(0.5)
-        end
-    end
-    local resumeMode = CHEST.resumeMode
-    CHEST.returnCFrame = nil
-    CHEST.resumeMode = nil
-    if not UI.heavenly.active and not selectedAutoMode and resumeMode and running then
-        if paused then
-            CHEST.pendingManualResume = resumeMode
-        elseif not isTrainingActive(resumeMode) then
-            activateTraining(resumeMode)
-        end
-    end
-    CHEST.setStatus(reason or "waiting for chests")
-end
-
-CHEST.describeReward = function(event)
-    if type(event) ~= "table" or type(event.rewards) ~= "table" then
-        return "opened; reward details unavailable"
-    end
-    local rewards = event.rewards
-    local parts = {}
-    if type(rewards.rareLine) == "string" and rewards.rareLine ~= "" then
-        table.insert(parts, rewards.rareLine)
-    elseif rewards.rare == true then
-        table.insert(parts, "rare reward")
-    end
-    if rewards.bonus == true then
-        table.insert(parts, "bonus reward")
-    end
-    if #parts == 0 then
-        return "opened; no rare/bonus flag"
-    end
-    return table.concat(parts, " | ")
-end
-
-CHEST.collect = function(spot, prompt, position, tier)
-    if not spot or not spot.Parent or not prompt or not prompt.Parent or not prompt.Enabled then
-        return false, "chest is no longer available"
-    end
-    if CHEST.isOpened(spot) then
-        return false, "chest was already opened"
-    end
-    local root = getCharacterParts()
-    if not root then
-        return false, "waiting for character"
-    end
-    local maxDistance = tonumber(prompt.MaxActivationDistance) or 12
-    local promptPosition = CHEST.getPromptWorldPosition(prompt, position)
-    local distance = (root.Position - promptPosition).Magnitude
-    -- If the prompt requires line-of-sight, approach the prompt's actual parent
-    -- from its front instead of teleporting to the center/roof of the chest.
-    if distance > math.max(2, maxDistance - 1.0) or prompt.RequiresLineOfSight then
-        local destination, lookAt = CHEST.getPromptApproach(prompt, position)
-        local moved, moveError = pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = CFrame.lookAt(destination, lookAt)
-        end)
-        if not moved then
-            return false, "teleport failed: " .. tostring(moveError)
-        end
-        if not CHEST.wait(0.85) then
-            return false, "cancelled while travelling"
-        end
-        root = getCharacterParts()
-        if not root then
-            return false, "character unavailable after travel"
-        end
-        promptPosition = CHEST.getPromptWorldPosition(prompt, CHEST.getPosition(spot, prompt) or position)
-        distance = (root.Position - promptPosition).Magnitude
-    end
-    if not prompt.Parent or not prompt.Enabled or CHEST.isOpened(spot) then
-        return false, "chest became unavailable before opening"
-    end
-    if distance > maxDistance then
-        return false, string.format("outside prompt range (%.1f/%.1f)", distance, maxDistance)
-    end
-
-    local revisionBefore = CHEST.worldOpenedRevision
-    DIAG.log("INFO", "CHEST", "open_attempt", {chest = spot.Name, tier = tier, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, maxDistance = maxDistance, distance = distance, quickInteract = QUICK_INTERACT.enabled or QUICK_INTERACT.chestEnabled, key = tostring(prompt.KeyboardKeyCode), requiresLineOfSight = prompt.RequiresLineOfSight, style = tostring(prompt.Style)})
-    local sent, backend = CHEST.holdPrompt(prompt, spot, tier, revisionBefore)
-    DIAG.log(sent and "INFO" or "WARN", "CHEST", "prompt_input_result", {chest = spot.Name, tier = tier, sent = sent, backend = backend})
-    if not sent then
-        return false, "chest interaction did not register: " .. tostring(backend)
-    end
-
-    local deadline = os.clock() + 4.5
-    local stateChanged = false
-    while running and CHEST.autoEnabled and os.clock() < deadline do
-        if UI.heavenly.active or paused or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() or cauldronPanelIsOpen() then
-            return false, "cancelled by pause, breakthrough, tribulation, or cauldron"
-        end
-        local event = CHEST.getLocalOpenEvent(spot, tier, revisionBefore)
-        if event then
-            CHEST.openedByScript[spot] = os.clock() + 30
-            CHEST.openedCount = CHEST.openedCount + 1
-            DIAG.log("INFO", "CHEST", "open_verified", {chest = spot.Name, tier = tier, reward = CHEST.describeReward(event), rewards = event.rewards})
-            return true, "opened " .. tier .. " chest | " .. CHEST.describeReward(event)
-        end
-        if CHEST.isOpened(spot) or not prompt.Enabled or not prompt.Parent then
-            stateChanged = true
-        end
-        task.wait(0.05)
-    end
-
-    if stateChanged then
-        CHEST.openedByScript[spot] = os.clock() + 30
-        DIAG.log("WARN", "CHEST", "state_changed_without_reward_event", {chest = spot.Name, tier = tier, promptEnabled = prompt.Enabled})
-        return false, "chest state changed, but no local ChestWorldOpened reward confirmation was received"
-    end
-    DIAG.log("ERROR", "CHEST", "open_not_verified", {chest = spot.Name, tier = tier, promptEnabled = prompt.Enabled, distance = distance, holdDuration = prompt.HoldDuration})
-    return false, "no ChestWorldOpened or opened-state confirmation"
-end
-
-CHEST.run = function()
-    if CHEST.taskRunning then
-        return
-    end
-    CHEST.taskRunning = true
-    task.spawn(function()
-        while running and CHEST.autoEnabled do
-            if paused then
-                CHEST.setStatus("paused")
-                task.wait(0.2)
-            elseif UI.heavenly.active or INHERITANCE.busy or herbCollectorBusy or CHEST.teleportActive or SILVER.busy or autoBrewBusy or cauldronPanelIsOpen() or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen or isBreakthroughPending() then
-                if CHEST.busy then
-                    CHEST.finishSweep("pausing chest sweep for another activity")
-                end
-                CHEST.setStatus("waiting for inheritance/herb/brew/breakthrough")
-                task.wait(0.25)
-            else
-                local spot, prompt, position, tier = CHEST.findBestPrompt()
-                if spot then
-                    if not CHEST.busy then
-                        local started, reason = CHEST.beginSweep()
-                        if not started then
-                            CHEST.setStatus(reason)
-                            task.wait(0.35)
-                        else
-                            CHEST.setStatus("travelling to " .. tier .. " chest")
-                        end
-                    end
-                    if CHEST.busy and running and CHEST.autoEnabled then
-                        CHEST.attemptTimes[spot] = os.clock()
-                        CHEST.setStatus("opening " .. tier .. " chest")
-                        local ok, result = CHEST.collect(spot, prompt, position, tier)
-                        if ok then
-                            CHEST.setStatus(result)
-                            CHEST.updateMonitor()
-                            task.wait(0.25)
-                        else
-                            CHEST.failedCount = CHEST.failedCount + 1
-                            CHEST.setStatus(tier .. " chest: " .. tostring(result))
-                            task.wait(0.35)
-                        end
-                    end
-                else
-                    if CHEST.busy then
-                        CHEST.finishSweep("sweep complete; checking respawns")
-                    else
-                        CHEST.setStatus("no eligible unopened chests")
-                    end
-                    task.wait(3.0)
-                end
-            end
-        end
-        if CHEST.busy then
-            CHEST.finishSweep("Auto Chest stopped")
-        end
-        CHEST.taskRunning = false
-        updateModeButtons()
-    end)
-end
-
--- Immortal Inheritance --------------------------------------------------------
--- Observes ReplicatedStorage.CultivationEvents.Inheritance only. The Observer
--- archive confirms: start {endsAt,radius,progress,state,at}, progress
--- {progress,holder,state}, and won {at,winner,sect}. No remote is fired.
-
-INHERITANCE.setStatus = function(message)
-    INHERITANCE.activeName = tostring(message or "idle")
-    if UI.inheritanceInfoLabel then
-        local percent = math.floor((tonumber(INHERITANCE.progress) or 0) * 100 + 0.5)
-        local holder = INHERITANCE.holder and (" | " .. tostring(INHERITANCE.holder)) or ""
-        UI.inheritanceInfoLabel.Text = string.format(
-            "%s | %d%%%s",
-            INHERITANCE.activeName,
-            percent,
-            holder
-        )
-    end
-end
-
-INHERITANCE.getWorldZone = function()
-    local folder = Workspace:FindFirstChild("Inheritance")
-    local zone = folder and folder:FindFirstChild("InheritanceZone")
-    local pillar = folder and folder:FindFirstChild("InheritancePillar")
-    if zone and zone:IsA("BasePart") then
-        return folder, zone, pillar
-    end
-    return folder, nil, pillar
-end
-
-INHERITANCE.getOwnSectName = function()
-    for _, attributeName in ipairs({"SectName", "Sect", "SectTag", "ClanName"}) do
-        local value = LocalPlayer:GetAttribute(attributeName)
-        if type(value) == "string" and value ~= "" then
-            return value
-        end
-    end
-    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-    if leaderstats then
-        for _, valueName in ipairs({"Sect", "SectName", "Clan"}) do
-            local value = leaderstats:FindFirstChild(valueName)
-            if value and value:IsA("StringValue") and value.Value ~= "" then
-                return value.Value
-            end
-        end
-    end
-    return nil
-end
-
-INHERITANCE.returnToPrevious = function(reason, stopping)
-    if not INHERITANCE.busy and not INHERITANCE.returnCFrame then return false end
-    local returnCFrame = INHERITANCE.returnCFrame
-    local resumeMode = INHERITANCE.resumeMode
-    local resumeWasAuto = INHERITANCE.resumeWasAuto
-    INHERITANCE.busy = false
-    INHERITANCE.taskRunning = false
-    INHERITANCE.returnCFrame = nil
-    INHERITANCE.resumeMode = nil
-    INHERITANCE.resumeWasAuto = false
-    INHERITANCE.claimEnteredAt = nil
-
-    local root = getCharacterParts()
-    if root and returnCFrame then
-        local ok, err = pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = returnCFrame
-        end)
-        DIAG.log(ok and "INFO" or "WARN", "INHERITANCE", "return_to_previous_position", {
-            reason = reason or "event finished", success = ok, error = ok and nil or tostring(err)
-        })
-    end
-
-    if not stopping and running and not paused and resumeMode and not resumeWasAuto then
-        task.delay(0.75, function()
-            if running and not paused and not INHERITANCE.busy and not selectedAutoMode
-                and not isTrainingActive(resumeMode) then
-                activateTraining(resumeMode)
-            end
-        end)
-    end
-    INHERITANCE.setStatus(reason or "returned to previous position")
-    if updateModeButtons then updateModeButtons() end
-    return true
-end
-
-INHERITANCE.run = function()
-    if INHERITANCE.taskRunning or INHERITANCE.busy then return false end
-    if not INHERITANCE.autoEnabled then return false end
-    if not INHERITANCE.active then
-        INHERITANCE.setStatus("waiting for Immortal Inheritance event")
-        return false
-    end
-    if INHERITANCE.state ~= "empty" then
-        INHERITANCE.setStatus("event is not empty; holder: " .. tostring(INHERITANCE.holder or INHERITANCE.state))
-        return false
-    end
-    if UI.heavenly.active or activeTrialGui or getActiveTrialGui() or breakthroughTrialSeen
-        or isBreakthroughPending() or CHEST.busy or CHEST.teleportActive or SILVER.busy
-        or herbCollectorBusy or autoBrewBusy or cauldronPanelIsOpen() then
-        INHERITANCE.setStatus("waiting for current activity to finish")
-        return false
-    end
-
-    local position = INHERITANCE.position
-    local radius = math.clamp(tonumber(INHERITANCE.radius) or 50, 10, 100)
-    local root, humanoid = getCharacterParts()
-    if not position or not root or not humanoid then
-        INHERITANCE.setStatus("event coordinates or character unavailable")
-        return false
-    end
-
-    local eventKey = tostring(INHERITANCE.endsAt or "no-end") .. "|"
-        .. string.format("%.2f|%.2f|%.2f", position.X, position.Y, position.Z)
-    if INHERITANCE.attemptedEventKey == eventKey then
-        INHERITANCE.setStatus("already attempted this event; waiting for result/expiry")
-        return false
-    end
-    INHERITANCE.attemptedEventKey = eventKey
-    INHERITANCE.taskRunning = true
-    INHERITANCE.busy = true
-    INHERITANCE.returnCFrame = root.CFrame
-    INHERITANCE.resumeMode = getHerbResumeMode()
-    INHERITANCE.resumeWasAuto = selectedAutoMode ~= nil
-    INHERITANCE.claimEnteredAt = nil
-
-    DIAG.log("INFO", "INHERITANCE", "travel_started", {
-        position = {x = position.X, y = position.Y, z = position.Z},
-        radius = radius,
-        endsAt = INHERITANCE.endsAt,
-        resumeMode = INHERITANCE.resumeMode,
-        resumeWasAuto = INHERITANCE.resumeWasAuto,
-    })
-
-    task.spawn(function()
-        local resumeMode = INHERITANCE.resumeMode
-        if resumeMode and isTrainingActive(resumeMode) then
-            local key = resumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
-            local sent, backend = sendKey(key)
-            DIAG.log(sent and "INFO" or "WARN", "INHERITANCE", "training_pause_input", {
-                mode = resumeMode, sent = sent, backend = backend
-            })
-            if sent then task.wait(0.35) end
-        end
-
-        if not running or not INHERITANCE.autoEnabled or not INHERITANCE.busy then
-            INHERITANCE.returnToPrevious("cancelled before travel")
-            return
-        end
-
-        root, humanoid = getCharacterParts()
-        if not root or not humanoid then
-            INHERITANCE.returnToPrevious("character unavailable before travel")
-            INHERITANCE.taskRunning = false
-            return
-        end
-
-        -- Teleport to the event vicinity OUTSIDE the 50-stud claim radius,
-        -- settle, then use normal Humanoid:MoveTo to walk into the claim zone.
-        local staging = position + Vector3.new(radius + 12, 3, 0)
-        local moved, moveError = pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = CFrame.lookAt(staging, position)
-        end)
-        if not moved then
-            INHERITANCE.returnToPrevious("staging teleport failed: " .. tostring(moveError))
-            INHERITANCE.taskRunning = false
-            return
-        end
-        task.wait(0.85)
-
-        root, humanoid = getCharacterParts()
-        if not root or not humanoid then
-            INHERITANCE.returnToPrevious("character unavailable after staging")
-            INHERITANCE.taskRunning = false
-            return
-        end
-
-        local walkTarget = position + Vector3.new(0, 3, 0)
-        humanoid:MoveTo(walkTarget)
-        INHERITANCE.setStatus("walking into Immortal Inheritance claim area")
-        local walkDeadline = os.clock() + 22
-        local lastMoveAt = os.clock()
-        local entered = false
-
-        while running and INHERITANCE.autoEnabled and INHERITANCE.busy
-            and os.clock() < walkDeadline do
-            if paused or not INHERITANCE.active
-                or (INHERITANCE.endsAt and os.time() >= INHERITANCE.endsAt) then break end
-            root, humanoid = getCharacterParts()
-            if not root or not humanoid then break end
-            local distance = (root.Position - position).Magnitude
-            if distance <= math.max(5, radius - 5) then
-                entered = true
-                INHERITANCE.claimEnteredAt = os.clock()
-                DIAG.log("INFO", "INHERITANCE", "claim_radius_entered", {
-                    distance = distance, radius = radius
-                })
-                break
-            end
-            if INHERITANCE.state == "holding" then
-                -- Another holder began the claim before we entered the zone.
-                INHERITANCE.setStatus("another holder started claiming; aborting approach")
-                break
-            end
-            if os.clock() - lastMoveAt >= 2.0 then
-                humanoid:MoveTo(walkTarget)
-                lastMoveAt = os.clock()
-            end
-            task.wait(0.15)
-        end
-
-        if not entered then
-            INHERITANCE.returnToPrevious("could not enter claim radius; no claim attempted")
-            INHERITANCE.taskRunning = false
-            return
-        end
-
-        INHERITANCE.setStatus("inside claim radius; waiting for server progress and winner")
-        local lastZoneSeenAt = os.clock()
-        while running and INHERITANCE.autoEnabled and INHERITANCE.busy do
-            if paused then
-                INHERITANCE.setStatus("paused inside event area")
-                task.wait(0.25)
-            elseif INHERITANCE.endsAt and os.time() >= INHERITANCE.endsAt then
-                INHERITANCE.returnToPrevious("event expired")
-                break
-            elseif not INHERITANCE.active then
-                INHERITANCE.returnToPrevious("event finished: " .. tostring(INHERITANCE.winner or "winner confirmed"))
-                break
-            else
-                local _, zone = INHERITANCE.getWorldZone()
-                if zone then
-                    lastZoneSeenAt = os.clock()
-                elseif os.clock() - lastZoneSeenAt > 2.0 then
-                    INHERITANCE.returnToPrevious("inheritance zone disappeared")
-                    break
-                end
-                local currentRoot = getCharacterParts()
-                if not currentRoot then
-                    INHERITANCE.returnToPrevious("character lost during claim")
-                    break
-                end
-                local distance = (currentRoot.Position - position).Magnitude
-                if distance > radius then
-                    local currentHumanoid = select(2, getCharacterParts())
-                    if currentHumanoid then currentHumanoid:MoveTo(position + Vector3.new(0, 3, 0)) end
-                    INHERITANCE.setStatus(string.format("returning inside claim radius | %.1f/%.1f", distance, radius))
-                else
-                    INHERITANCE.setStatus(string.format(
-                        "claim area active | server progress %.1f%% | %s",
-                        (tonumber(INHERITANCE.progress) or 0) * 100,
-                        tostring(INHERITANCE.holder or "waiting for holder")
-                    ))
-                end
-                task.wait(0.25)
-            end
-        end
-
-        if INHERITANCE.busy then
-            INHERITANCE.returnToPrevious("event travel ended")
-        end
-        INHERITANCE.taskRunning = false
-    end)
-    if updateModeButtons then updateModeButtons() end
-    return true
-end
-
-INHERITANCE.handleRemote = function(action, payload)
-    action = tostring(action or "")
-    payload = type(payload) == "table" and payload or {}
-
-    if action == "start" then
-        local at = payload.at
-        if typeof(at) == "Vector3" then
-            INHERITANCE.position = at
-        elseif type(at) == "table" and tonumber(at.x) and tonumber(at.y) and tonumber(at.z) then
-            INHERITANCE.position = Vector3.new(at.x, at.y, at.z)
-        end
-        INHERITANCE.active = true
-        INHERITANCE.state = tostring(payload.state or "empty")
-        INHERITANCE.holder = payload.holder
-        INHERITANCE.progress = tonumber(payload.progress) or 0
-        INHERITANCE.radius = tonumber(payload.radius) or 50
-        INHERITANCE.endsAt = tonumber(payload.endsAt)
-        INHERITANCE.winner = nil
-        INHERITANCE.lastEventKey = tostring(INHERITANCE.endsAt or "") .. "|" .. tostring(INHERITANCE.position)
-        INHERITANCE.setStatus("event available | " .. INHERITANCE.state .. " | " .. tostring(INHERITANCE.radius) .. "-stud radius")
-        DIAG.log("INFO", "INHERITANCE", "event_started", {
-            at = INHERITANCE.position,
-            endsAt = INHERITANCE.endsAt,
-            radius = INHERITANCE.radius,
-            state = INHERITANCE.state,
-        })
-        if INHERITANCE.autoEnabled and INHERITANCE.state == "empty" then
-            INHERITANCE.run()
-        end
-    elseif action == "progress" then
-        INHERITANCE.progress = math.clamp(tonumber(payload.progress) or INHERITANCE.progress or 0, 0, 1)
-        INHERITANCE.holder = payload.holder and tostring(payload.holder) or INHERITANCE.holder
-        INHERITANCE.state = tostring(payload.state or INHERITANCE.state or "unknown")
-        if INHERITANCE.active and not INHERITANCE.busy and INHERITANCE.state == "holding" then
-            INHERITANCE.setStatus("claim already held by " .. tostring(INHERITANCE.holder or "another holder"))
-        elseif INHERITANCE.busy then
-            local ownSect = INHERITANCE.getOwnSectName()
-            if ownSect and INHERITANCE.holder and INHERITANCE.holder ~= ownSect
-                and INHERITANCE.holder ~= LocalPlayer.Name then
-                DIAG.log("WARN", "INHERITANCE", "claim_taken_by_other_sect", {
-                    holder = INHERITANCE.holder, ownSect = ownSect
-                })
-                task.defer(function()
-                    if INHERITANCE.busy then
-                        INHERITANCE.returnToPrevious("claim taken by another sect: " .. INHERITANCE.holder)
-                    end
-                end)
-            else
-                INHERITANCE.setStatus(string.format("claim progress %.1f%% | %s", INHERITANCE.progress * 100, tostring(INHERITANCE.holder or "holding")))
-            end
-        end
-    elseif action == "won" then
-        INHERITANCE.winner = tostring(payload.winner or "unknown")
-        INHERITANCE.active = false
-        INHERITANCE.state = "won"
-        INHERITANCE.progress = 1
-        INHERITANCE.setStatus("won by " .. INHERITANCE.winner)
-        DIAG.log("INFO", "INHERITANCE", "server_won_event", {
-            winner = INHERITANCE.winner,
-            sect = payload.sect,
-            at = payload.at,
-        })
-        if INHERITANCE.busy then
-            task.delay(0.65, function()
-                if running and INHERITANCE.busy then
-                    INHERITANCE.returnToPrevious("server confirmed winner: " .. INHERITANCE.winner)
-                end
-            end)
-        end
-    end
-
-    if updateModeButtons then updateModeButtons() end
-end
-
-INHERITANCE.scanWorld = function()
-    local _, zone = INHERITANCE.getWorldZone()
-    if zone and not INHERITANCE.active then
-        INHERITANCE.active = true
-        INHERITANCE.position = zone.Position
-        INHERITANCE.radius = INHERITANCE.radius or 50
-        if INHERITANCE.state == "won" then INHERITANCE.state = "unknown" end
-        if INHERITANCE.state == "unknown" then
-            INHERITANCE.setStatus("world event marker detected; waiting for server availability state")
-        end
-    elseif not zone and INHERITANCE.active and not INHERITANCE.busy then
-        -- A late join may see the marker disappear without having received the
-        -- original start event. Do not invent a winner or reward in that case.
-        INHERITANCE.active = false
-        INHERITANCE.setStatus("no active world event")
-    end
-end
-
+CHEST.updateMonitor = function() end
+CHEST.updateFilterPicker = function() end
+local BREW = {}
+do
 -- Auto Brew -----------------------------------------------------------------
 -- Uses only the real CauldronGui buttons. It never fires game remotes.
 
@@ -4080,6 +3076,7 @@ local function advanceBrewRecipeCursor(recipeKey)
     for index, key in ipairs(BREW_RECIPE_ORDER) do
         if key == recipeKey then
             brewRecipeCursor = (index % #BREW_RECIPE_ORDER) + 1
+            if SETTINGS and SETTINGS.save then SETTINGS.save("brew_recipe_cursor_advanced") end
             return
         end
     end
@@ -4633,7 +3630,14 @@ local function updateBrewRecipePicker()
     end
 end
 
-local function getHerbFilterSummary()
+
+
+    BREW.run = runAutoBrew
+    BREW.getSummary = getBrewRecipeSummary
+    BREW.updatePicker = updateBrewRecipePicker
+end
+
+HERB_MONITOR.getSpeciesFilterSummary = function()
     local count = 0
     for _, species in ipairs(HERB_SPECIES) do
         if herbSpeciesSelection[species] then
@@ -4648,39 +3652,6 @@ local function getHerbFilterSummary()
     return "HERB FILTER: " .. tostring(count) .. "/" .. tostring(#HERB_SPECIES)
 end
 
-CHEST.getFilterSummary = function()
-    local count = 0
-    for _, tier in ipairs(CHEST_TIER_ORDER) do
-        if CHEST.tierSelection[tier] then
-            count = count + 1
-        end
-    end
-    if count == #CHEST_TIER_ORDER then
-        return "CHEST FILTER: ALL"
-    elseif count == 0 then
-        return "CHEST FILTER: NONE"
-    end
-    return "CHEST FILTER: " .. tostring(count) .. "/" .. tostring(#CHEST_TIER_ORDER)
-end
-
-CHEST.updateFilterPicker = function()
-    for tier, button in pairs(UI.chestFilterToggleButtons) do
-        if button then
-            local selected = CHEST.tierSelection[tier] == true
-            button.Text = (selected and "[ON] " or "[  ] ") .. tier
-            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
-        end
-    end
-    if UI.chestFilterButton then
-        UI.chestFilterButton.Text = CHEST.getFilterSummary()
-        local count = 0
-        for _, tier in ipairs(CHEST_TIER_ORDER) do
-            if CHEST.tierSelection[tier] then count = count + 1 end
-        end
-        UI.chestFilterButton.BackgroundColor3 = count == #CHEST_TIER_ORDER and COLORS.panel2 or (count == 0 and COLORS.danger or COLORS.accent)
-    end
-end
-
 local function updateHerbFilterPicker()
     for species, button in pairs(herbFilterToggleButtons) do
         if button then
@@ -4690,7 +3661,7 @@ local function updateHerbFilterPicker()
         end
     end
     if herbFilterButton then
-        herbFilterButton.Text = getHerbFilterSummary()
+        herbFilterButton.Text = HERB_MONITOR.getSpeciesFilterSummary()
         local count = 0
         for _, species in ipairs(HERB_SPECIES) do
             if herbSpeciesSelection[species] then count = count + 1 end
@@ -4754,51 +3725,9 @@ updateModeButtons = function()
         brewButton.Text = autoBrewEnabled and "BREW: ON" or "BREW: OFF"
         brewButton.BackgroundColor3 = autoBrewEnabled and COLORS.success or COLORS.panel2
     end
-    if UI.chestButton then
-        UI.chestButton.Text = CHEST.autoEnabled and "CHESTS: ON" or "CHESTS: OFF"
-        UI.chestButton.BackgroundColor3 = CHEST.autoEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.chestTeleportButton then
-        UI.chestTeleportButton.Text = CHEST.teleportActive and "RETURN TO TRAINING" or "CHEST TP: NEXT"
-        UI.chestTeleportButton.BackgroundColor3 = CHEST.teleportActive and COLORS.warning or COLORS.accent
-    end
-    if UI.silverButton then
-        UI.silverButton.Text = SILVER.autoEnabled and "SILVER SCAN: ON" or "SILVER SCAN: OFF"
-        UI.silverButton.BackgroundColor3 = SILVER.autoEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.inheritanceButton then
-        UI.inheritanceButton.Text = INHERITANCE.autoEnabled and "AUTO INHERITANCE: ON" or "AUTO INHERITANCE: OFF"
-        UI.inheritanceButton.BackgroundColor3 = INHERITANCE.autoEnabled and COLORS.success or COLORS.panel2
-    end
     if UI.quickInteractButton then
         UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
-    end
-    if UI.silverDrawButton then
-        UI.silverDrawButton.Text = SILVER.autoDrawEnabled and "AUTO CARRY (T): ON" or "AUTO CARRY (T): OFF"
-        UI.silverDrawButton.BackgroundColor3 = SILVER.autoDrawEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.silverTargetModeButton then
-        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET: SAFE" or "TARGET: STRONG"
-        UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
-    end
-    if UI.remoteAuditButton then
-        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REROLL MONITOR: ON" or "REROLL MONITOR: OFF"
-        UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.remoteAuditStatusLabel then
-        UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount)
-    end
-    if UI.progressProbeButton then
-        UI.progressProbeButton.Text = EXPERIMENT.progressProbeEnabled and "PROGRESS PROBE: ON" or "PROGRESS PROBE: OFF"
-        UI.progressProbeButton.BackgroundColor3 = EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.chestProbeButton then
-        UI.chestProbeButton.Text = QUICK_INTERACT.chestEnabled and "INSTANT CHEST PROBE: ON" or "INSTANT CHEST PROBE: OFF"
-        UI.chestProbeButton.BackgroundColor3 = QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.panel2
-    end
-    if UI.rngSampleLabel then
-        UI.rngSampleLabel.Text = "Manual reroll clicks: " .. tostring(EXPERIMENT.rerollClickCount) .. "\nServer results: " .. tostring(EXPERIMENT.rerollResultCount)
     end
     if brewRecipeButton then
         local selectedCount = 0
@@ -4807,22 +3736,159 @@ updateModeButtons = function()
                 selectedCount = selectedCount + 1
             end
         end
-        brewRecipeButton.Text = getBrewRecipeSummary()
+        brewRecipeButton.Text = BREW.getSummary()
         brewRecipeButton.BackgroundColor3 = selectedCount > 0 and COLORS.panel2 or COLORS.danger
     end
-    updateBrewRecipePicker()
+    BREW.updatePicker()
     updateHerbFilterPicker()
     HERB_MONITOR.updateAgeFilterPicker()
-    CHEST.updateFilterPicker()
     if herbInfoLabel then
         herbInfoLabel.Text = string.format("Herbs: %d collected | %s", herbCollectedCount, herbActiveName)
-    end
-    if UI.chestInfoLabel then
-        UI.chestInfoLabel.Text = string.format("Chests: %d opened | %s", CHEST.openedCount, CHEST.activeName)
     end
     HERB_MONITOR.update(false)
     ECONOMY.updateUI()
     if SILVER.setStatus then SILVER.setStatus(SILVER.activeName) end
+end
+
+REJOIN.requestHttp = function()
+    local candidates = {}
+    local ok, value = pcall(function() return Env.request end)
+    if ok and type(value) == "function" then table.insert(candidates, value) end
+    ok, value = pcall(function() return Env.http_request end)
+    if ok and type(value) == "function" then table.insert(candidates, value) end
+    ok, value = pcall(function() return Env.syn and Env.syn.request end)
+    if ok and type(value) == "function" then table.insert(candidates, value) end
+    ok, value = pcall(function() return _G.request end)
+    if ok and type(value) == "function" then table.insert(candidates, value) end
+    ok, value = pcall(function() return _G.http_request end)
+    if ok and type(value) == "function" then table.insert(candidates, value) end
+    return candidates[1]
+end
+
+REJOIN.setStatus = function(message, color)
+    REJOIN.status = tostring(message or "ready")
+    if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = REJOIN.status end
+    setStatus(REJOIN.status, color or COLORS.warning)
+end
+
+REJOIN.rejoinPrivateServer = function()
+    if REJOIN.busy then return false end
+    if game.PrivateServerId == nil or game.PrivateServerId == "" then
+        REJOIN.setStatus("This is not a private server. Use Server Hop instead.", COLORS.danger)
+        return false
+    end
+    if game.JobId == nil or game.JobId == "" then
+        REJOIN.setStatus("Current server JobId is unavailable; cannot target this instance.", COLORS.danger)
+        return false
+    end
+    if not SETTINGS.saveBeforeTravel("private_server_rejoin") then return false end
+
+    REJOIN.busy = true
+    REJOIN.lastPrivateServerId = game.PrivateServerId
+    REJOIN.lastPrivateJobId = game.JobId
+    DIAG.log("INFO", "REJOIN", "private_rejoin_requested", {
+        placeId = game.PlaceId, privateServerId = game.PrivateServerId,
+        jobId = game.JobId, ownerId = game.PrivateServerOwnerId
+    })
+    REJOIN.setStatus("Requesting rejoin to the same live private-server instance...", COLORS.warning)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end)
+    if not ok then
+        REJOIN.busy = false
+        DIAG.log("ERROR", "REJOIN", "private_rejoin_failed", {reason = tostring(err), jobId = game.JobId})
+        REJOIN.setStatus("Private rejoin failed: " .. tostring(err) .. ". If that instance closed, rejoin through the private-server page/link.", COLORS.danger)
+        return false
+    end
+    REJOIN.setStatus("Private rejoin requested. Auto Execute should reload saved settings after arrival.", COLORS.success)
+    return true
+end
+
+REJOIN.serverHop = function()
+    if REJOIN.busy then return false end
+    if not SETTINGS.saveBeforeTravel("public_server_hop") then return false end
+    local requestFn = REJOIN.requestHttp()
+    if not requestFn then
+        REJOIN.setStatus("Server Hop needs an executor HTTP request function (request/http_request).", COLORS.danger)
+        return false
+    end
+
+    REJOIN.busy = true
+    REJOIN.setStatus("Fetching public server list...", COLORS.warning)
+    task.spawn(function()
+        local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId)
+            .. "/servers/Public?sortOrder=Asc&limit=100"
+        local requestOk, response = pcall(function()
+            return requestFn({Url = url, Method = "GET", Headers = {Accept = "application/json"}})
+        end)
+        if not requestOk or type(response) ~= "table" then
+            REJOIN.busy = false
+            DIAG.log("ERROR", "REJOIN", "server_list_request_failed", {reason = tostring(response)})
+            REJOIN.setStatus("Server list request failed: " .. tostring(response), COLORS.danger)
+            return
+        end
+        local statusCode = tonumber(response.StatusCode or response.Status or response.status_code)
+        local body = response.Body or response.body
+        if (statusCode and (statusCode < 200 or statusCode >= 300)) or type(body) ~= "string" then
+            REJOIN.busy = false
+            DIAG.log("ERROR", "REJOIN", "server_list_bad_response", {status = statusCode, bodyType = type(body)})
+            REJOIN.setStatus("Server list returned an invalid response (" .. tostring(statusCode) .. ").", COLORS.danger)
+            return
+        end
+        local decodeOk, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+        if not decodeOk or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+            REJOIN.busy = false
+            REJOIN.setStatus("Could not decode public server list.", COLORS.danger)
+            return
+        end
+
+        local recent = {}
+        for _, id in ipairs(REJOIN.recentServers) do recent[tostring(id)] = true end
+        local candidates, fallback = {}, {}
+        for _, server in ipairs(decoded.data) do
+            local id = tostring(server.id or "")
+            local playing = tonumber(server.playing) or 0
+            local maxPlayers = tonumber(server.maxPlayers) or 0
+            if id ~= "" and id ~= game.JobId and maxPlayers > 0 and playing < maxPlayers then
+                local entry = {id = id, playing = playing, maxPlayers = maxPlayers}
+                table.insert(fallback, entry)
+                if not recent[id] then table.insert(candidates, entry) end
+            end
+        end
+        if #candidates == 0 then candidates = fallback end
+        if #candidates == 0 then
+            REJOIN.busy = false
+            REJOIN.setStatus("No other joinable public servers found on this page.", COLORS.warning)
+            return
+        end
+
+        table.sort(candidates, function(a,b)
+            if a.playing == b.playing then return a.id < b.id end
+            return a.playing < b.playing
+        end)
+        local shortlist = {}
+        for i = 1, math.min(12, #candidates) do shortlist[i] = candidates[i] end
+        local chosen = shortlist[math.random(1, #shortlist)]
+        table.insert(REJOIN.recentServers, chosen.id)
+        while #REJOIN.recentServers > 12 do table.remove(REJOIN.recentServers, 1) end
+        SETTINGS.save("server_hop_target_saved")
+        DIAG.log("INFO", "REJOIN", "public_server_selected", {
+            targetJobId = chosen.id, playing = chosen.playing,
+            maxPlayers = chosen.maxPlayers, candidateCount = #candidates
+        })
+        REJOIN.setStatus(string.format("Joining another public server (%d/%d players)...", chosen.playing, chosen.maxPlayers), COLORS.success)
+        local teleportOk, teleportErr = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen.id, LocalPlayer)
+        end)
+        if not teleportOk then
+            REJOIN.busy = false
+            DIAG.log("ERROR", "REJOIN", "server_hop_teleport_failed", {targetJobId = chosen.id, reason = tostring(teleportErr)})
+            REJOIN.setStatus("Server hop failed: " .. tostring(teleportErr), COLORS.danger)
+            return
+        end
+        REJOIN.setStatus("Server hop requested. Auto Execute should reload saved settings after arrival.", COLORS.success)
+    end)
+    return true
 end
 
 local function createGui()
@@ -4833,10 +3899,11 @@ local function createGui()
         or parent:FindFirstChild("CUAutoCultivation_v10")
         or parent:FindFirstChild("CUAutoCultivation_v101")
         or parent:FindFirstChild("CUAutoCultivation_v102")
+        or parent:FindFirstChild("CUAutoCultivation_v105")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v105",
+        Name = "CUAutoCultivation_v107",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4896,7 +3963,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.5",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.7",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4931,7 +3998,7 @@ local function createGui()
         UI.setPanelVisible(false)
     end)
 
-    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings", "Diagnostics", "Experiments"}
+    local pageNames = {"Overview", "Cultivation", "Farming", "Alchemy", "Economy", "Settings", "Diagnostics"}
     local pageFrames = {}
     for _, name in ipairs(pageNames) do
         local page = make("Frame", {
@@ -4980,7 +4047,6 @@ local function createGui()
             if herbFilterPicker then herbFilterPicker.Visible = false end
             if UI.herbAgeFilterPicker then UI.herbAgeFilterPicker.Visible = false end
             if brewRecipePicker then brewRecipePicker.Visible = false end
-            if UI.chestFilterPicker then UI.chestFilterPicker.Visible = false end
         end)
     end
 
@@ -5048,9 +4114,9 @@ local function createGui()
     UI.overviewStoneLabel = makeLabel(stoneCard, ECONOMY.formatNumber(ECONOMY.stones), 11, 26, 260, 28, 20, COLORS.text, Enum.Font.GothamBold)
 
     local overviewHint = makeCard(overview, 16, 184, 596, 150, "AUTOMATION STATUS", COLORS.accent)
-    makeLabel(overviewHint, "Cultivation, herbs, chests, brewing and Silver farming each have independent controls in their tabs.", 12, 30, 568, 34, 11, COLORS.text)
-    makeLabel(overviewHint, "Reroll odds are displayed in Economy. Primordial Stone farming remains unassigned until a repeatable reward source is verified.", 12, 70, 568, 42, 10, COLORS.muted)
-    makeLabel(overviewHint, "No client-forged currency or reward events are sent by this script.", 12, 116, 568, 20, 9, COLORS.warning)
+    makeLabel(overviewHint, "Active modules: Qi cultivation, Body cultivation, breakthrough, herbs and brewing.", 12, 30, 568, 34, 11, COLORS.text)
+    makeLabel(overviewHint, "Chest automation, Immortal Inheritance, Auto Silver and Experiments are removed from this release.", 12, 70, 568, 42, 10, COLORS.muted)
+    makeLabel(overviewHint, "Heavenly Tribulation now uses continuous-pulse detection and feedback-based timing calibration.", 12, 116, 568, 20, 9, COLORS.warning)
 
     -- CULTIVATION PAGE
     local cultivationPage = pageFrames.Cultivation
@@ -5065,43 +4131,23 @@ local function createGui()
     makeLabel(breakCard, "Shared Qi + Body per-layer breakthrough and tribulation timing. Uses the actual Breakthrough and Tap buttons.", 12, 30, 570, 38, 10, COLORS.text)
     breakthroughButton = makeButton(breakCard, "BREAKTHROUGH: ON", 12, 72, 570, COLORS.success, 28)
 
-    -- FARMING PAGE
+    -- FARMING PAGE: Chest, Inheritance and Auto Silver controls retired.
     local farmingPage = pageFrames.Farming
-    makeLabel(farmingPage, "WORLD COLLECTION AND NPC SILVER FARMING", 16, 10, 600, 20, 11, COLORS.success, Enum.Font.GothamBold)
-    local herbCard = makeCard(farmingPage, 16, 38, 292, 152, "HERB COLLECTION", COLORS.success)
-    herbButton = makeButton(herbCard, "HERBS: OFF", 12, 28, 128, COLORS.panel2, 27)
-    herbFilterButton = makeButton(herbCard, "HERB FILTER: ALL", 148, 28, 132, COLORS.panel2, 27)
-    UI.herbAgeFilterButton = makeButton(herbCard, "HERB AGE: ALL", 12, 59, 268, COLORS.panel2, 25)
-    herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 88, 268, 16, 9, COLORS.muted)
-    UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 106, 268, 39, 9, COLORS.muted, Enum.Font.Code)
-
-    local chestCard = makeCard(farmingPage, 322, 38, 292, 152, "WORLD CHESTS", COLORS.warning)
-    UI.chestButton = makeButton(chestCard, "CHESTS: OFF", 12, 28, 128, COLORS.panel2, 27)
-    UI.chestFilterButton = makeButton(chestCard, "CHEST FILTER: ALL", 148, 28, 132, COLORS.panel2, 27)
-    UI.chestTeleportButton = makeButton(chestCard, "CHEST TP: NEXT", 12, 59, 268, COLORS.accent, 25)
-    UI.chestInfoLabel = makeLabel(chestCard, "Chests: 0 opened | idle", 12, 88, 268, 16, 9, COLORS.muted)
-    makeLabel(chestCard, "Priority: Celestial > Jade > Bronze > Wooden", 12, 106, 268, 34, 9, COLORS.muted)
-
-    local silverCardFarm = makeCard(farmingPage, 16, 204, 292, 160, "SILVER TARGET SCAN", COLORS.warning)
-    UI.silverButton = makeButton(silverCardFarm, "SILVER SCAN: OFF", 12, 29, 268, COLORS.panel2, 28)
-    UI.silverInfoLabel = makeLabel(silverCardFarm, "Target scan: idle", 12, 61, 268, 18, 9, COLORS.muted)
-    UI.silverTargetLabel = makeLabel(silverCardFarm, "Target: none | Kills: 0 | Earned: 0", 12, 81, 268, 26, 9, COLORS.text)
-    UI.silverDrawButton = makeButton(silverCardFarm, "AUTO CARRY (T): OFF", 12, 113, 128, COLORS.panel2, 25)
-    UI.silverTargetModeButton = makeButton(silverCardFarm, "TARGET: SAFE", 148, 113, 132, COLORS.success, 25)
-    makeLabel(silverCardFarm, "No camera or mouse input. Scan-only until a non-click attack method is verified.", 12, 140, 268, 17, 8, COLORS.muted)
-
-    local inheritanceCard = makeCard(farmingPage, 322, 204, 292, 160, "IMMORTAL INHERITANCE", COLORS.accent)
-    UI.inheritanceButton = makeButton(inheritanceCard, "AUTO INHERITANCE: OFF", 12, 29, 268, COLORS.panel2, 28)
-    UI.inheritanceInfoLabel = makeLabel(inheritanceCard, "Waiting for event...", 12, 61, 268, 36, 9, COLORS.muted)
-    makeLabel(inheritanceCard, "Detects server start/progress/won. Stages outside the 50-stud zone, walks in, waits for result, then returns.", 12, 101, 268, 49, 8, COLORS.muted)
-
-    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 374, 598, COLORS.panel2, 27)
+    makeLabel(farmingPage, "HERB COLLECTION", 16, 10, 600, 20, 11, COLORS.success, Enum.Font.GothamBold)
+    local herbCard = makeCard(farmingPage, 16, 38, 598, 190, "HERB COLLECTION", COLORS.success)
+    herbButton = makeButton(herbCard, "HERBS: OFF", 12, 28, 150, COLORS.panel2, 27)
+    herbFilterButton = makeButton(herbCard, "HERB FILTER: ALL", 174, 28, 180, COLORS.panel2, 27)
+    UI.herbAgeFilterButton = makeButton(herbCard, "HERB AGE: ALL", 12, 59, 342, COLORS.panel2, 25)
+    herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 92, 560, 16, 9, COLORS.muted)
+    UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 113, 560, 45, 9, COLORS.muted, Enum.Font.Code)
+    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 246, 598, COLORS.panel2, 27)
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
+        if SETTINGS.save then SETTINGS.save("quick_interact_toggled") end
         UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
         DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
-        setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use configured hold duration. Chest probe has its own toggle.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
+        setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use the configured hold duration.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
     end)
 
     -- ALCHEMY PAGE
@@ -5109,7 +4155,7 @@ local function createGui()
     makeLabel(alchemyPage, "ALCHEMY QUEUE", 16, 12, 600, 20, 11, COLORS.warning, Enum.Font.GothamBold)
     local brewCard = makeCard(alchemyPage, 16, 44, 598, 220, "AUTO BREW", COLORS.warning)
     brewButton = makeButton(brewCard, "BREW: OFF", 12, 31, 170, COLORS.panel2, 32)
-    brewRecipeButton = makeButton(brewCard, getBrewRecipeSummary(), 194, 31, 380, COLORS.panel2, 32)
+    brewRecipeButton = makeButton(brewCard, BREW.getSummary(), 194, 31, 380, COLORS.panel2, 32)
     makeLabel(brewCard, "Select multiple recipes. The queue checks ingredients, uses the oldest available herbs, Stoke timing, and verifies Claim before moving to the next pill.", 12, 82, 570, 55, 10, COLORS.text)
     makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 146, 570, 42, 9, COLORS.muted)
 
@@ -5138,6 +4184,12 @@ local function createGui()
     local stopButton = makeButton(safetyCard, "STOP ALL", 12, 76, 562, COLORS.danger, 32)
     makeLabel(safetyCard, "Ctrl + Home: show/hide   |   Ctrl + P: pause/resume   |   Ctrl + End: stop   |   Floating CU icon restores the panel", 12, 128, 570, 35, 9, COLORS.muted)
     makeLabel(safetyCard, "Anti-AFK handles Roblox's normal Idled event only. Game-specific server AFK checks may still apply.", 12, 169, 570, 28, 9, COLORS.muted)
+
+    local travelCard = makeCard(settingsPage, 16, 268, 598, 124, "REJOIN / SERVER HOP", COLORS.warning)
+    UI.privateRejoinButton = makeButton(travelCard, "REJOIN PRIVATE SERVER", 12, 30, 276, COLORS.accent, 30)
+    UI.serverHopButton = makeButton(travelCard, "SERVER HOP", 300, 30, 274, COLORS.warning, 30)
+    UI.settingsStatusLabel = makeLabel(travelCard, SETTINGS.status, 12, 70, 570, 18, 9, COLORS.muted)
+    makeLabel(travelCard, "Private rejoin targets this live private-server instance. Server Hop searches public servers. Auto Execute restores saved settings after arrival.", 12, 91, 570, 25, 8, COLORS.muted)
 
     -- DIAGNOSTICS PAGE: only logs actions and server confirmations related to this suite.
     local diagnosticsPage = pageFrames.Diagnostics
@@ -5176,64 +4228,7 @@ local function createGui()
         DIAG.refreshUI(true)
     end)
 
-    -- EXPERIMENTS PAGE: controlled, evidence-first probes. No forged reward calls.
-    local experimentsPage = pageFrames.Experiments
-    makeLabel(experimentsPage, "EXPERIMENTAL LAB | HYPOTHESIS TESTS, NOT FAKE REWARD REQUESTS", 16, 10, 600, 20, 10, COLORS.warning, Enum.Font.GothamBold)
-    local remoteCard = makeCard(experimentsPage, 16, 38, 598, 104, "PASSIVE REROLL / RESULT MONITOR", COLORS.accent)
-    UI.remoteAuditButton = makeButton(remoteCard, "REROLL MONITOR: OFF", 12, 29, 190, COLORS.panel2, 28)
-    UI.remoteAuditStatusLabel = makeLabel(remoteCard, "Logs reroll clicks, currency deltas and inbound server results. No network hooks.", 214, 28, 360, 38, 9, COLORS.muted)
-    makeLabel(remoteCard, "Non-invasive: observes UI actions and server results without intercepting reroll requests.", 12, 67, 570, 25, 9, COLORS.text)
-
-    local progressCard = makeCard(experimentsPage, 16, 152, 292, 104, "FAST PROGRESS EXPERIMENT", COLORS.qi)
-    UI.progressProbeButton = makeButton(progressCard, "PROGRESS PROBE: ON", 12, 29, 268, COLORS.success, 27)
-    UI.progressProbeStatusLabel = makeLabel(progressCard, "Compares UI progress with replicated Qi/Body values and multiplier changes.", 12, 62, 268, 30, 9, COLORS.muted)
-
-    local rngCard = makeCard(experimentsPage, 322, 152, 292, 104, "DESTINY RNG SAMPLE AUDIT", COLORS.body)
-    UI.rngSampleLabel = makeLabel(rngCard, "Manual reroll clicks: 0\nServer results: 0", 12, 29, 268, 42, 11, COLORS.text, Enum.Font.Code)
-    makeLabel(rngCard, "Records category, x1/x10/x100 selection, displayed odds, currency changes and server result. No forced rolls.", 12, 70, 268, 25, 8, COLORS.muted)
-
-    local interactionCard = makeCard(experimentsPage, 16, 266, 598, 94, "INTERACTION EXPERIMENTS", COLORS.success)
-    UI.chestProbeButton = makeButton(interactionCard, "INSTANT CHEST PROBE: ON", 12, 29, 190, COLORS.success, 27)
-    makeLabel(interactionCard, "Tries the quick prompt once, then mirrors the confirmed manual E hold for the live duration. Every attempt requires a real opened-state/reward confirmation.", 214, 27, 360, 48, 9, COLORS.text)
-
-    addConnection(UI.remoteAuditButton.MouseButton1Click, function()
-        if not EXPERIMENT.remoteAuditEnabled then
-            local ok, message = EXPERIMENT.installRemoteAudit()
-            if not ok then
-                EXPERIMENT.remoteAuditEnabled = false
-                setStatus("Reroll monitor unavailable: " .. tostring(message), COLORS.warning)
-            else
-                EXPERIMENT.remoteAuditEnabled = true
-                if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = true end
-                setStatus("Passive reroll/result monitor ON. Rerolls remain on the normal game path.", COLORS.success)
-            end
-        else
-            EXPERIMENT.remoteAuditEnabled = false
-            if EXPERIMENT.remoteAuditShared then EXPERIMENT.remoteAuditShared.enabled = false end
-            EXPERIMENT.remoteAuditStatus = "Passive reroll/result monitoring OFF; no network hook installed"
-            setStatus("Reroll/result monitoring OFF. No network hook remains installed by this version.", COLORS.warning)
-        end
-        UI.remoteAuditButton.Text = EXPERIMENT.remoteAuditEnabled and "REROLL MONITOR: ON" or "REROLL MONITOR: OFF"
-        UI.remoteAuditButton.BackgroundColor3 = EXPERIMENT.remoteAuditEnabled and COLORS.success or COLORS.panel2
-        if UI.remoteAuditStatusLabel then UI.remoteAuditStatusLabel.Text = EXPERIMENT.remoteAuditStatus .. " | Captured: " .. tostring(EXPERIMENT.remoteAuditCount) end
-        DIAG.log("INFO", "EXPERIMENT", "remote_audit_toggled", {enabled = EXPERIMENT.remoteAuditEnabled, status = EXPERIMENT.remoteAuditStatus})
-    end)
-
-    addConnection(UI.progressProbeButton.MouseButton1Click, function()
-        EXPERIMENT.progressProbeEnabled = not EXPERIMENT.progressProbeEnabled
-        UI.progressProbeButton.Text = EXPERIMENT.progressProbeEnabled and "PROGRESS PROBE: ON" or "PROGRESS PROBE: OFF"
-        UI.progressProbeButton.BackgroundColor3 = EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.panel2
-        DIAG.log("INFO", "EXPERIMENT", "progress_probe_toggled", {enabled = EXPERIMENT.progressProbeEnabled})
-        setStatus(EXPERIMENT.progressProbeEnabled and "Fast progress evidence sampling enabled." or "Fast progress evidence sampling paused.", EXPERIMENT.progressProbeEnabled and COLORS.success or COLORS.warning)
-    end)
-
-    addConnection(UI.chestProbeButton.MouseButton1Click, function()
-        QUICK_INTERACT.chestEnabled = not QUICK_INTERACT.chestEnabled
-        UI.chestProbeButton.Text = QUICK_INTERACT.chestEnabled and "INSTANT CHEST PROBE: ON" or "INSTANT CHEST PROBE: OFF"
-        UI.chestProbeButton.BackgroundColor3 = QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.panel2
-        DIAG.log("INFO", "EXPERIMENT", "instant_chest_probe_toggled", {enabled = QUICK_INTERACT.chestEnabled})
-        setStatus(QUICK_INTERACT.chestEnabled and "Instant chest probe enabled; normal E hold remains fallback." or "Instant chest probe disabled; chest uses normal configured E hold.", QUICK_INTERACT.chestEnabled and COLORS.success or COLORS.warning)
-    end)
+    -- Experiments page and controls removed in v1.0.6.
 
     -- FILTER PICKERS: placed inside their relevant tabs so they never spill
     -- outside the redesigned panel.
@@ -5253,6 +4248,7 @@ local function createGui()
     local allHerbsButton = makeButton(herbFilterPicker, "SELECT ALL", 8, 27, 194, COLORS.accent, 22)
     addConnection(allHerbsButton.MouseButton1Click, function()
         for _, species in ipairs(HERB_SPECIES) do herbSpeciesSelection[species] = true end
+        if SETTINGS.save then SETTINGS.save("herb_species_all") end
         updateModeButtons()
         setStatus("All five normal herb species enabled. Oldest available herbs are prioritized.", COLORS.success)
     end)
@@ -5261,6 +4257,7 @@ local function createGui()
         herbFilterToggleButtons[species] = toggle
         addConnection(toggle.MouseButton1Click, function()
             herbSpeciesSelection[species] = not herbSpeciesSelection[species]
+            if SETTINGS.save then SETTINGS.save("herb_species_changed") end
             updateModeButtons()
             setStatus(species .. (herbSpeciesSelection[species] and " enabled for collection." or " excluded from collection."), COLORS.success)
         end)
@@ -5283,12 +4280,14 @@ local function createGui()
     makeLabel(UI.herbAgeFilterPicker, "SELECT HERB AGE", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
     addConnection(makeButton(UI.herbAgeFilterPicker, "SELECT ALL AGES", 8, 27, 194, COLORS.accent, 22).MouseButton1Click, function()
         for _, age in ipairs(HERB_MONITOR.ageOptions) do HERB_MONITOR.ageSelection[age] = true end
+        if SETTINGS.save then SETTINGS.save("herb_age_all") end
         updateModeButtons()
         DIAG.log("INFO", "HERBS", "age_filter_preset", {preset = "ALL"})
         setStatus("All herb ages enabled; oldest available age is prioritized.", COLORS.success)
     end)
     addConnection(makeButton(UI.herbAgeFilterPicker, "1,000 YEARS ONLY", 8, 52, 194, COLORS.warning, 22).MouseButton1Click, function()
         for _, age in ipairs(HERB_MONITOR.ageOptions) do HERB_MONITOR.ageSelection[age] = (age == 1000) end
+        if SETTINGS.save then SETTINGS.save("herb_age_1000_only") end
         updateModeButtons()
         DIAG.log("INFO", "HERBS", "age_filter_preset", {preset = "1000_ONLY"})
         setStatus("Strict 1,000-year-only collection enabled. Lower and unknown ages will be ignored.", COLORS.success)
@@ -5297,6 +4296,7 @@ local function createGui()
         UI.herbAgeFilterToggleButtons[age] = makeButton(UI.herbAgeFilterPicker, age == 1000 and "1,000 years" or (tostring(age) .. " years"), 8, 77 + (index - 1) * 25, 194, COLORS.success, 22)
         addConnection(UI.herbAgeFilterToggleButtons[age].MouseButton1Click, function()
             HERB_MONITOR.ageSelection[age] = not HERB_MONITOR.ageSelection[age]
+            if SETTINGS.save then SETTINGS.save("herb_age_changed") end
             updateModeButtons()
             DIAG.log("INFO", "HERBS", "age_filter_changed", {age = age, enabled = HERB_MONITOR.ageSelection[age]})
             setStatus((age == 1000 and "1,000 years" or (tostring(age) .. " years")) .. (HERB_MONITOR.ageSelection[age] and " enabled." or " excluded."), COLORS.success)
@@ -5329,44 +4329,14 @@ local function createGui()
         brewRecipeToggleButtons[row.key] = toggle
         addConnection(toggle.MouseButton1Click, function()
             brewRecipeSelection[row.key] = not brewRecipeSelection[row.key]
+            if SETTINGS.save then SETTINGS.save("brew_recipe_changed") end
             updateModeButtons()
         end)
     end
     local recipeDone = makeButton(brewRecipePicker, "DONE", 8, 145, 194, COLORS.accent, 22)
     addConnection(recipeDone.MouseButton1Click, function() brewRecipePicker.Visible = false end)
 
-    UI.chestFilterPicker = make("Frame", {
-        Name = "ChestFilterPicker",
-        Position = UDim2.fromOffset(390, 220),
-        Size = UDim2.fromOffset(210, 174),
-        BackgroundColor3 = COLORS.bg,
-        BackgroundTransparency = 0.02,
-        BorderSizePixel = 0,
-        Visible = false,
-        ZIndex = 22,
-    }, farmingPage)
-    round(UI.chestFilterPicker, 8)
-    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, UI.chestFilterPicker)
-    makeLabel(UI.chestFilterPicker, "SELECT CHEST TIERS", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
-    local allChestButton = makeButton(UI.chestFilterPicker, "SELECT ALL", 8, 27, 194, COLORS.accent, 22)
-    addConnection(allChestButton.MouseButton1Click, function()
-        for _, tier in ipairs(CHEST_TIER_ORDER) do CHEST.tierSelection[tier] = true end
-        updateModeButtons()
-        CHEST.setStatus("all chest tiers enabled; highest tier first")
-    end)
-    for index, tier in ipairs(CHEST_TIER_ORDER) do
-        local toggle = makeButton(UI.chestFilterPicker, tier, 8, 53 + (index - 1) * 25, 194, COLORS.success, 22)
-        UI.chestFilterToggleButtons[tier] = toggle
-        addConnection(toggle.MouseButton1Click, function()
-            CHEST.tierSelection[tier] = not CHEST.tierSelection[tier]
-            updateModeButtons()
-            CHEST.setStatus(tier .. (CHEST.tierSelection[tier] and " enabled" or " excluded"))
-        end)
-    end
-    local chestDone = makeButton(UI.chestFilterPicker, "DONE", 8, 157, 194, COLORS.accent, 22)
-    addConnection(chestDone.MouseButton1Click, function() UI.chestFilterPicker.Visible = false end)
-
-    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker, UI.chestFilterPicker}) do
+    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker}) do
         for _, descendant in ipairs(picker:GetDescendants()) do
             if descendant:IsA("GuiObject") then descendant.ZIndex = 23 end
         end
@@ -5379,6 +4349,7 @@ local function createGui()
     addConnection(qiButton.MouseButton1Click, function()
         if selectedAutoMode == "Qi" then
             selectedAutoMode = nil
+            if SETTINGS.save then SETTINGS.save("qi_auto_toggled") end
             local ok, stopped, backend = stopAutomationOwnedTraining("Qi")
             if not ok then setStatus("Qi Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
             elseif stopped then setStatus("Qi Auto OFF; script-started meditation stopped.", COLORS.warning)
@@ -5389,6 +4360,7 @@ local function createGui()
                 if not ok then setStatus("Could not stop script-started Body training; Qi was not enabled: " .. tostring(backend), COLORS.danger); return end
             end
             selectedAutoMode = "Qi"
+            if SETTINGS.save then SETTINGS.save("qi_auto_toggled") end
             DIAG.log("INFO", "CULTIVATION", "qi_auto_enabled", {})
             setStatus("Qi Auto Cultivation ON. Selecting the best unlocked Qi zone.", COLORS.success)
         end
@@ -5401,6 +4373,7 @@ local function createGui()
     addConnection(bodyButton.MouseButton1Click, function()
         if selectedAutoMode == "Body" then
             selectedAutoMode = nil
+            if SETTINGS.save then SETTINGS.save("body_auto_toggled") end
             local ok, stopped, backend = stopAutomationOwnedTraining("Body")
             if not ok then setStatus("Body Auto is OFF, but its training input could not be stopped: " .. tostring(backend), COLORS.danger)
             elseif stopped then setStatus("Body Auto OFF; script-started push-ups stopped.", COLORS.warning)
@@ -5411,6 +4384,7 @@ local function createGui()
                 if not ok then setStatus("Could not stop script-started Qi meditation; Body was not enabled: " .. tostring(backend), COLORS.danger); return end
             end
             selectedAutoMode = "Body"
+            if SETTINGS.save then SETTINGS.save("body_auto_toggled") end
             DIAG.log("INFO", "CULTIVATION", "body_auto_enabled", {})
             setStatus("Body Auto Cultivation ON. Selecting the best unlocked Body zone.", COLORS.success)
         end
@@ -5422,6 +4396,7 @@ local function createGui()
 
     addConnection(herbButton.MouseButton1Click, function()
         autoHerbsEnabled = not autoHerbsEnabled
+        if SETTINGS.save then SETTINGS.save("auto_herbs_toggled") end
         DIAG.log("INFO", "HERBS", "auto_toggle", {enabled = autoHerbsEnabled})
         updateModeButtons()
         if autoHerbsEnabled then
@@ -5438,7 +4413,6 @@ local function createGui()
         herbFilterPicker.Visible = not herbFilterPicker.Visible
         UI.herbAgeFilterPicker.Visible = false
         brewRecipePicker.Visible = false
-        UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Choose which herb species Auto Herbs may collect. Oldest HerbYear is prioritized.", COLORS.success)
     end)
@@ -5447,76 +4421,19 @@ local function createGui()
         UI.herbAgeFilterPicker.Visible = not UI.herbAgeFilterPicker.Visible
         herbFilterPicker.Visible = false
         brewRecipePicker.Visible = false
-        UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Choose herb ages. Use 1,000 YEARS ONLY to ignore every lower or unknown age and resume cultivation between spawns.", COLORS.success)
     end)
 
-    addConnection(UI.chestTeleportButton.MouseButton1Click, function()
-        if CHEST.teleportActive then
-            CHEST.returnFromTeleport("manual return to previous position")
-        else
-            CHEST.teleportToBest()
-        end
-    end)
-
-    addConnection(UI.inheritanceButton.MouseButton1Click, function()
-        INHERITANCE.autoEnabled = not INHERITANCE.autoEnabled
-        DIAG.log("INFO", "INHERITANCE", "auto_toggle", {enabled = INHERITANCE.autoEnabled})
-        updateModeButtons()
-        if INHERITANCE.autoEnabled then
-            INHERITANCE.scanWorld()
-            if INHERITANCE.active and INHERITANCE.state == "empty" then
-                INHERITANCE.run()
-            else
-                INHERITANCE.setStatus(INHERITANCE.active
-                    and ("event detected but not available: " .. tostring(INHERITANCE.state))
-                    or "armed; waiting for server Inheritance start event")
-            end
-            setStatus("Auto Immortal Inheritance armed. It only travels when the server reports an empty event.", COLORS.success)
-        else
-            if INHERITANCE.busy then
-                INHERITANCE.returnToPrevious("Auto Inheritance disabled")
-            else
-                INHERITANCE.setStatus("OFF; waiting for next event")
-            end
-            setStatus("Auto Immortal Inheritance disabled.", COLORS.warning)
-        end
-    end)
-
-    addConnection(UI.chestButton.MouseButton1Click, function()
-        if not CHEST.autoEnabled and CHEST.teleportActive then
-            CHEST.setStatus("return from manual Chest Teleport before enabling Auto Chest")
-            return
-        end
-        CHEST.autoEnabled = not CHEST.autoEnabled
-        DIAG.log("INFO", "CHEST", "auto_toggle", {enabled = CHEST.autoEnabled})
-        updateModeButtons()
-        if CHEST.autoEnabled then
-            CHEST.setStatus("scanning; Celestial > Jade > Bronze > Wooden")
-            setStatus("Auto Chest enabled. It pauses other farming activities, opens the highest selected tier, and verifies ChestWorldOpened.", COLORS.success)
-            CHEST.run()
-        else
-            CHEST.setStatus("turning off after current prompt hold")
-            setStatus("Auto Chest disabled; releasing any active prompt hold and restoring activity.", COLORS.warning)
-        end
-    end)
-
-    addConnection(UI.chestFilterButton.MouseButton1Click, function()
-        UI.chestFilterPicker.Visible = not UI.chestFilterPicker.Visible
-        herbFilterPicker.Visible = false
-        UI.herbAgeFilterPicker.Visible = false
-        brewRecipePicker.Visible = false
-        updateModeButtons()
-        CHEST.setStatus("select allowed tiers; highest enabled tier is opened first; Chest TP uses the same filter")
-    end)
+    -- Auto Chest, Immortal Inheritance and Auto Silver callbacks removed in v1.0.6.
 
     addConnection(brewButton.MouseButton1Click, function()
         autoBrewEnabled = not autoBrewEnabled
+        if SETTINGS.save then SETTINGS.save("auto_brew_toggled") end
         updateModeButtons()
         if autoBrewEnabled then
             setStatus("Auto Brew enabled. Open the Alchemy Cauldron; oldest available herbs will be selected.", COLORS.success)
-            runAutoBrew()
+            BREW.run()
         else
             setStatus("Auto Brew disabled. Current in-progress brew will be left untouched.", COLORS.warning)
         end
@@ -5526,55 +4443,28 @@ local function createGui()
         brewRecipePicker.Visible = not brewRecipePicker.Visible
         herbFilterPicker.Visible = false
         UI.herbAgeFilterPicker.Visible = false
-        UI.chestFilterPicker.Visible = false
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
     end)
 
-    addConnection(UI.silverTargetModeButton.MouseButton1Click, function()
-        SILVER.targetMode = SILVER.targetMode == "SAFE" and "STRONG" or "SAFE"
-        UI.silverTargetModeButton.Text = SILVER.targetMode == "SAFE" and "TARGET: SAFE" or "TARGET: STRONG"
-        UI.silverTargetModeButton.BackgroundColor3 = SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning
-        DIAG.log("INFO", "SILVER", "target_mode_changed", {targetMode = SILVER.targetMode})
-        setStatus(SILVER.targetMode == "SAFE" and "Safe target mode: weakest eligible cultivator first." or "Strong target mode: highest eligible realm first.", SILVER.targetMode == "SAFE" and COLORS.success or COLORS.warning)
-    end)
-
-    addConnection(UI.silverDrawButton.MouseButton1Click, function()
-        SILVER.autoDrawEnabled = not SILVER.autoDrawEnabled
-        DIAG.log("INFO", "SILVER", "auto_draw_toggled", {enabled = SILVER.autoDrawEnabled})
-        updateModeButtons()
-        setStatus(SILVER.autoDrawEnabled and "Auto Carry enabled: may tap T once if sword state is unknown. Ensure sword is currently uncarrried first." or "Auto Draw disabled: press T manually to carry/uncarry your sword.", SILVER.autoDrawEnabled and COLORS.success or COLORS.warning)
-    end)
-
-    addConnection(UI.silverButton.MouseButton1Click, function()
-        if not SILVER.autoEnabled and CHEST.teleportActive then
-            SILVER.setStatus("return from Chest Teleport before enabling Silver Target Scan")
-            return
-        end
-        SILVER.autoEnabled = not SILVER.autoEnabled
-        DIAG.log("INFO", "SILVER", "auto_toggle", {enabled = SILVER.autoEnabled})
-        updateModeButtons()
-        if SILVER.autoEnabled then
-            SILVER.setStatus("scanning eligible non-boss cultivators")
-            setStatus("Silver Target Scan enabled. It will not click, move your camera, or attack; use manual M1 while we verify a non-click combat activation.", COLORS.success)
-            SILVER.run()
-        else
-            SILVER.setStatus("target scan stopping")
-            setStatus("Silver Target Scan disabled. No mouse or camera input was sent.", COLORS.warning)
-        end
-    end)
+    -- No Auto Silver or sword auto-carry controls in v1.0.6.
 
     addConnection(breakthroughButton.MouseButton1Click, function()
         breakthroughEnabled = not breakthroughEnabled
+        if SETTINGS.save then SETTINGS.save("breakthrough_toggled") end
         updateModeButtons()
         setStatus(breakthroughEnabled and "Auto Breakthrough enabled." or "Auto Breakthrough disabled.", breakthroughEnabled and COLORS.success or COLORS.warning)
     end)
 
     addConnection(antiAfkButton.MouseButton1Click, function()
         antiAfkEnabled = not antiAfkEnabled
+        if SETTINGS.save then SETTINGS.save("anti_afk_toggled") end
         updateModeButtons()
         setStatus(antiAfkEnabled and "Anti-AFK enabled." or "Anti-AFK disabled.", antiAfkEnabled and COLORS.success or COLORS.warning)
     end)
+
+    addConnection(UI.privateRejoinButton.MouseButton1Click, REJOIN.rejoinPrivateServer)
+    addConnection(UI.serverHopButton.MouseButton1Click, REJOIN.serverHop)
 
     addConnection(pauseButton.MouseButton1Click, function()
         paused = not paused
@@ -5740,56 +4630,7 @@ do
             end)
         end
 
-        local inheritanceRemote = eventsFolder:FindFirstChild("Inheritance")
-        if inheritanceRemote and inheritanceRemote:IsA("RemoteEvent") then
-            addConnection(inheritanceRemote.OnClientEvent, function(action, payload)
-                INHERITANCE.handleRemote(action, payload)
-            end)
-            DIAG.log("INFO", "INHERITANCE", "event_listener_ready", {remote = inheritanceRemote:GetFullName()})
-        else
-            DIAG.log("WARN", "INHERITANCE", "event_remote_missing", {})
-        end
-
-        local chestWorldOpenedRemote = eventsFolder:FindFirstChild("ChestWorldOpened")
-        if chestWorldOpenedRemote and chestWorldOpenedRemote:IsA("RemoteEvent") then
-            addConnection(chestWorldOpenedRemote.OnClientEvent, function(chest, tier, opener, rewards)
-                CHEST.worldOpenedRevision = CHEST.worldOpenedRevision + 1
-                local chestName = typeof(chest) == "Instance" and chest.Name or nil
-                local playerName = typeof(opener) == "Instance" and opener.Name or tostring(opener or "")
-                CHEST.lastWorldOpened = {
-                    revision = CHEST.worldOpenedRevision,
-                    chest = typeof(chest) == "Instance" and chest or nil,
-                    chestName = chestName,
-                    tier = tostring(tier or ""),
-                    playerName = playerName,
-                    rewards = type(rewards) == "table" and rewards or nil,
-                }
-                DIAG.log("INFO", "CHEST", "server_world_opened_event", {chest = chestName, tier = tier, player = playerName, rewards = rewards})
-                if playerName == LocalPlayer.Name then
-                    local fingerprint = tostring(chestName) .. "|" .. tostring(tier)
-                        .. "|" .. tostring(type(rewards) == "table" and rewards.rare or false)
-                        .. "|" .. tostring(type(rewards) == "table" and rewards.bonus or false)
-                        .. "|" .. tostring(type(rewards) == "table" and rewards.rareLine or "")
-                    local priorAt = DIAG.rewardFingerprints[fingerprint]
-                    if priorAt and os.clock() - priorAt < 2 then
-                        DIAG.log("WARN", "ECONOMY_AUDIT", "duplicate_chest_reward_event_candidate", {chest = chestName, tier = tier, secondsSincePrevious = os.clock() - priorAt})
-                    end
-                    DIAG.rewardFingerprints[fingerprint] = os.clock()
-                    CHEST.activeName = "reward event received: " .. tostring(tier or "chest")
-                    if CHEST.teleportActive then
-                        local targetName = CHEST.teleportTargetSpot and CHEST.teleportTargetSpot.Name or nil
-                        if targetName and (chestName == targetName or chest == CHEST.teleportTargetSpot) then
-                            DIAG.log("INFO", "CHEST", "manual_teleport_chest_open_confirmed", {chest = chestName, tier = tier, rewards = rewards})
-                            task.delay(0.8, function()
-                                if running and CHEST.teleportActive then
-                                    CHEST.returnFromTeleport("manual chest opening confirmed; returning to cultivation")
-                                end
-                            end)
-                        end
-                    end
-                end
-            end)
-        end
+        -- Inheritance and ChestWorldOpened listeners removed in v1.0.6.
 
         local pillInventoryRemote = eventsFolder:FindFirstChild("PillInventoryUpdate")
         if pillInventoryRemote and pillInventoryRemote:IsA("RemoteEvent") then
@@ -5926,17 +4767,7 @@ if eventsFolderForAudit then
     end
 end
 
--- Manual sword/attack input trace for diagnosing Auto Silver.
-addConnection(UserInputService.InputBegan, function(input, gameProcessed)
-    if input.KeyCode == Enum.KeyCode.T then
-        SILVER.tAttemptedCharacter = LocalPlayer.Character
-        DIAG.log("INFO", "SILVER", "manual_sword_toggle_key", {key = "T", gameProcessed = gameProcessed})
-    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-        if SILVER.autoEnabled and SILVER.busy then
-            DIAG.log("INFO", "SILVER", "manual_m1_input", {gameProcessed = gameProcessed, target = SILVER.currentTarget and SILVER.currentTarget.Name or nil})
-        end
-    end
-end)
+-- Manual sword input trace removed with Auto Silver in v1.0.6.
 
 -- Standard Roblox idle notification. This only addresses the normal Idled event;
 -- game-specific server AFK systems may still disconnect the player.
@@ -5985,10 +4816,39 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-CHEST.updateMonitor()
-INHERITANCE.scanWorld()
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.5", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, quickChestProbe = QUICK_INTERACT.chestEnabled, experimentalLab = true})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.7", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
+if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
+
+addConnection(TeleportService.TeleportInitFailed, function(player, result, message, placeId)
+    if player ~= LocalPlayer then return end
+    REJOIN.busy = false
+    DIAG.log("ERROR", "REJOIN", "teleport_init_failed", {result = tostring(result), message = tostring(message), placeId = placeId})
+    REJOIN.setStatus("Teleport failed: " .. tostring(message or result), COLORS.danger)
+end)
+
+-- Restore saved automation only after the client and character are ready.
+-- This is intentionally delayed so replicated Qi/Body state and trial UI can initialize first.
+task.spawn(function()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    if not LocalPlayer.Character then LocalPlayer.CharacterAdded:Wait() end
+    task.wait(5)
+    if not running then return end
+    SETTINGS.restoreReady = true
+    updateModeButtons()
+    if selectedAutoMode then
+        DIAG.log("INFO", "SETTINGS", "auto_mode_restored", {mode = selectedAutoMode})
+        setStatus("Restored " .. selectedAutoMode .. " Auto Cultivation from saved settings; waiting for replicated state before acting.", COLORS.success)
+    end
+    if autoHerbsEnabled then
+        DIAG.log("INFO", "SETTINGS", "auto_herbs_restored", {ageSelection = HERB_MONITOR.ageSelection})
+        runHerbCollector()
+    end
+    if autoBrewEnabled then
+        DIAG.log("INFO", "SETTINGS", "auto_brew_restored", {})
+        BREW.run()
+    end
+end)
 
 task.spawn(function()
     while running do
@@ -6007,12 +4867,6 @@ task.spawn(function()
         task.wait(2)
         if running then
             HERB_MONITOR.update(true)
-            CHEST.updateMonitor()
-            INHERITANCE.scanWorld()
-            if INHERITANCE.autoEnabled and INHERITANCE.active
-                and INHERITANCE.state == "empty" and not INHERITANCE.busy then
-                INHERITANCE.run()
-            end
         end
     end
 end)
@@ -6057,6 +4911,9 @@ addConnection(RunService.RenderStepped, function()
     if not running or paused then
         return
     end
+    if SETTINGS.loaded and not SETTINGS.restoreReady then
+        return
+    end
 
     frameCounter = frameCounter + 1
 
@@ -6072,14 +4929,6 @@ addConnection(RunService.RenderStepped, function()
         if not okBreak then
             lastError = tostring(breakError)
             setStatus("Breakthrough monitor error: " .. lastError, COLORS.danger)
-        end
-    end
-
-    if CHEST.pendingManualResume and not UI.heavenly.active and not paused and not CHEST.busy and not SILVER.busy and not herbCollectorBusy and not autoBrewBusy then
-        local resumeMode = CHEST.pendingManualResume
-        CHEST.pendingManualResume = nil
-        if running and not isTrainingActive(resumeMode) then
-            activateTraining(resumeMode)
         end
     end
 
@@ -6100,12 +4949,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] Qi and Body auto modes are OFF until selected.")
-print("[CU AutoCultivation] v1.0.5 loaded. Heavenly Tribulation + Immortal Inheritance are integrated.")
-print("[CU AutoCultivation] v1.0.5: Heavenly Tribulation remains integrated; Immortal Inheritance listens for start/progress/won and walks into the claim radius.")
-print("[CU AutoCultivation] Silver Target Scan is non-invasive: no mouse/camera input or attack automation. T is the sword carry/uncarry key.")
-print("[CU AutoCultivation] Herb quick interaction is user-toggleable; chest instant probe is independently enabled with a normal E-hold fallback.")
-print("[CU AutoCultivation] Diagnostics/Experiments do not hook or modify network calls, and never forge or replay reward, reroll, chest, herb, combat, or progression remotes.")
-print("[CU AutoCultivation] Herb monitor shows live Normal/Spirit age counts; Auto Herbs still prioritizes oldest HerbYear.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.5"})
-setStatus("Loaded v1.0.5. Heavenly Tribulation and Immortal Inheritance are integrated; Silver is scan-only until non-click combat activation is verified.", COLORS.success)
+print("[CU AutoCultivation] v1.0.7 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
+print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
+print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
+print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.7"})
+setStatus("Loaded v1.0.7. Retired modules removed; settings persistence and private rejoin/public server hop added.", COLORS.success)
