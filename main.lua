@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.7
+    Version: 1.0.8
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -36,6 +36,9 @@
       - Redesigned tabs: Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics.
       - Integrated bounded diagnostics for cultivation progress, server confirmations, and errors.
       - Persistent settings saved to CU_AutoCultivation_Settings.json and restored on auto-execute.
+      - Auto Hop when no 1,000-year herbs remain: requires strict 1k-only filter,
+        confirms no eligible 1k prompt is currently available, waits a grace period,
+        then uses the existing public Server Hop and restores saved settings after arrival.
       - Private-server rejoin targets the current live JobId; public Server Hop selects another public instance.
       - Settings are saved before travel; executor Auto Execute must be enabled to reload them after arrival.
 
@@ -141,6 +144,15 @@ local INHERITANCE = {
     activeName = "waiting for event",
 }
 local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0, ageOptions = {1000, 100, 10, 1}, ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}}
+local HERB_HOP = {
+    enabled = false,
+    graceSeconds = 60,
+    emptySince = nil,
+    lastCountAt = 0,
+    lastAvailableCount = nil,
+    nextAttemptAt = 0,
+    status = "OFF",
+}
 local QUICK_INTERACT = {enabled = false, chestEnabled = false, attempts = 0, successes = 0, fallbacks = 0}
 local EXPERIMENT = {
     remoteAuditEnabled = false,
@@ -222,7 +234,7 @@ local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
 local herbFilterButton = nil
-local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil}
+local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil, autoHopNo1kButton = nil}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -574,6 +586,9 @@ do
         if type(data.autoHerbsEnabled) == "boolean" then autoHerbsEnabled = data.autoHerbsEnabled end
         if type(data.quickInteractEnabled) == "boolean" then QUICK_INTERACT.enabled = data.quickInteractEnabled end
         if type(data.autoBrewEnabled) == "boolean" then autoBrewEnabled = data.autoBrewEnabled end
+        if type(data.autoHopNo1kHerbs) == "boolean" then HERB_HOP.enabled = data.autoHopNo1kHerbs end
+        local hopGrace = tonumber(data.autoHopGraceSeconds)
+        if hopGrace then HERB_HOP.graceSeconds = math.clamp(math.floor(hopGrace), 30, 300) end
 
         if type(data.herbAgeSelection) == "table" then
             for _, age in ipairs({1, 10, 100, 1000}) do
@@ -611,7 +626,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.7",
+            version = "1.0.8",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -628,6 +643,8 @@ do
             herbSpeciesSelection = {},
             quickInteractEnabled = QUICK_INTERACT.enabled == true,
             autoBrewEnabled = autoBrewEnabled == true,
+            autoHopNo1kHerbs = HERB_HOP.enabled == true,
+            autoHopGraceSeconds = HERB_HOP.graceSeconds,
             brewRecipeSelection = {},
             brewRecipeCursor = brewRecipeCursor,
             recentPublicServers = REJOIN.recentServers,
@@ -2604,6 +2621,122 @@ local function getHerbFolders()
     return folders
 end
 
+HERB_HOP.isStrict1000Only = function()
+    return HERB_MONITOR.ageSelection[1000] == true
+        and HERB_MONITOR.ageSelection[100] ~= true
+        and HERB_MONITOR.ageSelection[10] ~= true
+        and HERB_MONITOR.ageSelection[1] ~= true
+end
+
+-- Count only live, enabled, unpicked prompts whose replicated HerbYear is exactly 1000.
+-- This scan is deliberately separate from the nearest-prompt picker so a 12-second
+-- retry cooldown on one failed prompt cannot falsely make the server look empty.
+HERB_HOP.countAvailable1000 = function()
+    local count = 0
+    local scanned = 0
+    local folders = getHerbFolders()
+    for _, folder in ipairs(folders) do
+        for _, node in ipairs(folder:GetDescendants()) do
+            if node:IsA("ProximityPrompt") and node.Name == "CollectHerbPrompt" and node.Parent then
+                scanned = scanned + 1
+                if node.Enabled then
+                    local picked = false
+                    local parent = node.Parent
+                    local depth = 0
+                    while parent and depth < 6 do
+                        local ok, value = pcall(function() return parent:GetAttribute("Picked") end)
+                        if ok and value == true then picked = true break end
+                        parent = parent.Parent
+                        depth = depth + 1
+                    end
+                    if not picked and not herbCollectedPrompts[node] then
+                        local species, age = getHerbMetadata(node)
+                        if age == 1000 and isHerbSpeciesAllowed(species) then
+                            count = count + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return count, scanned, #folders
+end
+
+HERB_HOP.resetEmptyTimer = function(reason)
+    HERB_HOP.emptySince = nil
+    HERB_HOP.lastAvailableCount = nil
+    if reason then HERB_HOP.status = reason end
+end
+
+HERB_HOP.update = function()
+    if not HERB_HOP.enabled then
+        HERB_HOP.resetEmptyTimer("OFF")
+        return false
+    end
+    if not autoHerbsEnabled then
+        HERB_HOP.resetEmptyTimer("waiting for Auto Herbs")
+        return false
+    end
+    if not HERB_HOP.isStrict1000Only() then
+        HERB_HOP.resetEmptyTimer("requires 1,000 YEARS ONLY filter")
+        return false
+    end
+    if paused or not running or not SETTINGS.restoreReady or not getCharacterParts()
+        or herbCollectorBusy or UI.heavenly.active or activeTrialGui or getActiveTrialGui()
+        or breakthroughTrialSeen or isBreakthroughPending() or autoBrewBusy
+        or cauldronPanelIsOpen() or REJOIN.busy then
+        HERB_HOP.resetEmptyTimer("waiting for farming activity to become idle")
+        return false
+    end
+
+    local now = os.clock()
+    if now < HERB_HOP.nextAttemptAt then return false end
+    if now - HERB_HOP.lastCountAt < 3 then return false end
+    HERB_HOP.lastCountAt = now
+
+    local count, scanned, folderCount = HERB_HOP.countAvailable1000()
+    HERB_HOP.lastAvailableCount = count
+    if folderCount == 0 then
+        HERB_HOP.resetEmptyTimer("waiting for herb folders to replicate")
+        setHerbStatus("waiting for herb folders; server-hop timer not started")
+        return false
+    end
+    if count > 0 then
+        if HERB_HOP.emptySince then
+            DIAG.log("INFO", "HERB_HOP", "matching_herbs_found", {available = count, graceReset = true})
+        end
+        HERB_HOP.resetEmptyTimer("1k herbs available: " .. tostring(count))
+        return false
+    end
+
+    if not HERB_HOP.emptySince then
+        HERB_HOP.emptySince = now
+        HERB_HOP.status = "no eligible 1k herbs; grace period started"
+        DIAG.log("INFO", "HERB_HOP", "empty_server_confirmed", {available = count, scannedPrompts = scanned, graceSeconds = HERB_HOP.graceSeconds})
+        setHerbStatus("no 1k herbs visible; waiting " .. tostring(HERB_HOP.graceSeconds) .. "s before server hop")
+        return false
+    end
+
+    local elapsed = now - HERB_HOP.emptySince
+    local remaining = math.max(0, HERB_HOP.graceSeconds - elapsed)
+    HERB_HOP.status = string.format("no 1k herbs; hopping in %ds", math.ceil(remaining))
+    setHerbStatus(HERB_HOP.status)
+    if elapsed >= HERB_HOP.graceSeconds then
+        if herbCollectorBusy or REJOIN.busy or not HERB_HOP.enabled or not autoHerbsEnabled then return false end
+        HERB_HOP.nextAttemptAt = now + 90
+        DIAG.log("INFO", "HERB_HOP", "grace_period_elapsed", {graceSeconds = HERB_HOP.graceSeconds, available = count, scannedPrompts = scanned})
+        setHerbStatus("no eligible 1k herbs after " .. tostring(HERB_HOP.graceSeconds) .. "s; requesting public server hop")
+        local requested = REJOIN.serverHop()
+        if requested then
+            HERB_HOP.status = "server hop requested"
+            return true
+        end
+        HERB_HOP.status = "server hop request failed; retry cooldown 90s"
+        DIAG.log("WARN", "HERB_HOP", "server_hop_request_not_started", {retryAfterSeconds = 90})
+    end
+    return false
+end
+
 local function findNearestHerbPrompt()
     local root = getCharacterParts()
     if not root then
@@ -2927,6 +3060,9 @@ local function runHerbCollector()
                 else
                     local prompt, position, herbName, herbDistance, herbAge = findNearestHerbPrompt()
                     if prompt then
+                        if herbAge == 1000 then
+                            HERB_HOP.resetEmptyTimer("1k herb found; empty timer reset")
+                        end
                         if not herbCollectorBusy then
                             beginHerbSweep()
                         end
@@ -2948,6 +3084,7 @@ local function runHerbCollector()
                             finishHerbSweep("sweep complete; checking respawns")
                         else
                             setHerbStatus("scanning enabled prompts")
+                            HERB_HOP.update()
                         end
                         task.wait(HERB_MONITOR.getAgeScanInterval())
                     end
@@ -3729,6 +3866,10 @@ updateModeButtons = function()
         UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
         UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
     end
+    if UI.autoHopNo1kButton then
+        UI.autoHopNo1kButton.Text = HERB_HOP.enabled and "AUTO HOP: NO 1K HERBS ON" or "AUTO HOP: NO 1K HERBS OFF"
+        UI.autoHopNo1kButton.BackgroundColor3 = HERB_HOP.enabled and COLORS.success or COLORS.panel2
+    end
     if brewRecipeButton then
         local selectedCount = 0
         for _, key in ipairs(BREW_RECIPE_ORDER) do
@@ -3963,7 +4104,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.7",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4141,6 +4282,15 @@ local function createGui()
     herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 92, 560, 16, 9, COLORS.muted)
     UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 113, 560, 45, 9, COLORS.muted, Enum.Font.Code)
     UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 246, 598, COLORS.panel2, 27)
+    UI.autoHopNo1kButton = makeButton(farmingPage, "AUTO HOP: NO 1K HERBS OFF", 16, 280, 598, COLORS.panel2, 27)
+    addConnection(UI.autoHopNo1kButton.MouseButton1Click, function()
+        HERB_HOP.enabled = not HERB_HOP.enabled
+        HERB_HOP.resetEmptyTimer(HERB_HOP.enabled and "enabled; waiting for empty-server scan" or "OFF")
+        if SETTINGS.save then SETTINGS.save("auto_hop_no_1k_toggled") end
+        updateModeButtons()
+        DIAG.log("INFO", "HERB_HOP", "toggle_changed", {enabled = HERB_HOP.enabled, graceSeconds = HERB_HOP.graceSeconds})
+        setStatus(HERB_HOP.enabled and "Auto Hop enabled. It only works with Auto Herbs ON and 1,000 YEARS ONLY selected; waits 60 seconds after a confirmed empty scan." or "Auto Hop disabled.", HERB_HOP.enabled and COLORS.success or COLORS.warning)
+    end)
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
         if SETTINGS.save then SETTINGS.save("quick_interact_toggled") end
@@ -4816,7 +4966,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.7", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -4949,10 +5099,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.7 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.8 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.7"})
-setStatus("Loaded v1.0.7. Retired modules removed; settings persistence and private rejoin/public server hop added.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8"})
+setStatus("Loaded v1.0.8. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
