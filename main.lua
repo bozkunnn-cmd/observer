@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.8.1
+    Version: 1.0.8
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -637,7 +637,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.8.1",
+            version = "1.0.9",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -3783,9 +3783,9 @@ local function getBrewAgeFilterSummary()
             table.insert(selected, age == 1000 and "1K" or tostring(age))
         end
     end
-    if #selected == 0 then return "BREW AGE FILTER: NONE" end
-    if #selected == #BREW_AGE_OPTIONS then return "BREW AGE FILTER: ALL" end
-    return "BREW AGE FILTER: " .. table.concat(selected, "/")
+    if #selected == 0 then return "BREW AGE: NONE" end
+    if #selected == #BREW_AGE_OPTIONS then return "BREW AGE: ALL" end
+    return "BREW AGE: " .. table.concat(selected, "/")
 end
 
 local function updateBrewAgeFilterPicker()
@@ -4109,12 +4109,10 @@ local function createGui()
         or parent:FindFirstChild("CUAutoCultivation_v101")
         or parent:FindFirstChild("CUAutoCultivation_v102")
         or parent:FindFirstChild("CUAutoCultivation_v105")
-        or parent:FindFirstChild("CUAutoCultivation_v107")
-        or parent:FindFirstChild("CUAutoCultivation_v1081")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v1081",
+        Name = "CUAutoCultivation_v107",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4174,7 +4172,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.1",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.9",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4258,7 +4256,6 @@ local function createGui()
             if herbFilterPicker then herbFilterPicker.Visible = false end
             if UI.herbAgeFilterPicker then UI.herbAgeFilterPicker.Visible = false end
             if brewRecipePicker then brewRecipePicker.Visible = false end
-            if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         end)
     end
 
@@ -4377,14 +4374,9 @@ local function createGui()
     local brewCard = makeCard(alchemyPage, 16, 44, 598, 220, "AUTO BREW", COLORS.warning)
     brewButton = makeButton(brewCard, "BREW: OFF", 12, 31, 170, COLORS.panel2, 32)
     brewRecipeButton = makeButton(brewCard, BREW.getSummary(), 194, 31, 380, COLORS.panel2, 32)
-    makeLabel(brewCard, "Auto Brew checks the selected recipes and ingredient ages before choosing anything.", 12, 82, 570, 30, 10, COLORS.text)
-    makeLabel(brewCard, "If selected-age ingredients are unavailable, brewing waits. Disabled ages are never substituted. The Robux Finish Now option is never used.", 12, 126, 570, 42, 9, COLORS.muted)
-
-    -- Dedicated Alchemy age-filter card. Keeping it outside the Auto Brew card
-    -- prevents the recipe popup from covering the control on smaller screens.
-    local brewAgeCard = makeCard(alchemyPage, 16, 278, 598, 88, "BREW INGREDIENT AGE FILTER", COLORS.accent)
-    UI.brewAgeFilterButton = makeButton(brewAgeCard, getBrewAgeFilterSummary(), 12, 29, 574, COLORS.panel2, 28)
-    makeLabel(brewAgeCard, "Only checked ages can be consumed. Choose 1, 10, 100 and/or 1,000 years.", 12, 60, 570, 18, 9, COLORS.muted)
+    UI.brewAgeFilterButton = makeButton(brewCard, getBrewAgeFilterSummary(), 12, 72, 562, COLORS.panel2, 27)
+    makeLabel(brewCard, "Only selected herb ages may be used. If the chosen ages cannot fill every ingredient, Auto Brew waits and does not substitute disabled ages.", 12, 108, 570, 43, 10, COLORS.text)
+    makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 158, 570, 35, 9, COLORS.muted)
 
     -- ECONOMY PAGE
     local economyPage = pageFrames.Economy
@@ -4565,7 +4557,7 @@ local function createGui()
 
     UI.brewAgeFilterPicker = make("Frame", {
         Name = "BrewAgeFilterPicker",
-        Position = UDim2.fromOffset(390, 12),
+        Position = UDim2.fromOffset(390, 205),
         Size = UDim2.fromOffset(210, 166),
         BackgroundColor3 = COLORS.bg,
         BackgroundTransparency = 0.02,
@@ -4754,11 +4746,6 @@ local function createGui()
     addConnection(stopButton.MouseButton1Click, function() stop("stop button") end)
 
     updateModeButtons()
-    DIAG.log("INFO", "ALCHEMY", "brew_age_filter_ui_created", {
-        button = UI.brewAgeFilterButton and UI.brewAgeFilterButton:GetFullName() or "missing",
-        picker = UI.brewAgeFilterPicker and UI.brewAgeFilterPicker:GetFullName() or "missing",
-        layout = "dedicated card below Auto Brew"
-    })
     ECONOMY.updateUI()
     SILVER.setStatus("idle")
 end
@@ -5094,7 +5081,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.1", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.9", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -5227,10 +5214,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.8.1 loaded. Alchemy age-filter UI fix; Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.9 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.1"})
-setStatus("Loaded v1.0.8.1. Alchemy ingredient-age filter is available on its own card.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.9"})
+setStatus("Loaded v1.0.9. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
