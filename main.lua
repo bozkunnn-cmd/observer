@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.1.0
+    Version: 1.0.8
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -41,10 +41,6 @@
         then uses the existing public Server Hop and restores saved settings after arrival.
       - Private-server rejoin targets the current live JobId; public Server Hop selects another public instance.
       - Settings are saved before travel; executor Auto Execute must be enabled to reload them after arrival.
-      - Map Waypoints: save Side A / Side B positions, select/swap the active target,
-        and display distance + XYZ offset for normal Sword Flight navigation.
-      - Waypoints persist in the settings JSON. This is a bookmark/navigation aid;
-        it does not force CFrame teleports or automate quest-distance movement.
 
     IMPORTANT
       - No RemoteEvent:FireServer calls.
@@ -241,7 +237,6 @@ local herbResumeMode = nil
 local herbActiveName = "idle"
 local herbFilterButton = nil
 local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil, autoHopNo1kButton = nil}
-local MAP_WAYPOINTS = {sideA = nil, sideB = nil, target = "A", lastUiAt = 0}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -627,18 +622,6 @@ do
         local cursor = tonumber(data.brewRecipeCursor)
         if cursor and cursor >= 1 and cursor <= #BREW_RECIPE_ORDER then brewRecipeCursor = math.floor(cursor) end
         if type(data.recentPublicServers) == "table" then REJOIN.recentServers = data.recentPublicServers end
-        if type(data.mapWaypoints) == "table" then
-            local function decodeWaypoint(value)
-                if type(value) ~= "table" then return nil end
-                local x, y, z = tonumber(value.x), tonumber(value.y), tonumber(value.z)
-                if not x or not y or not z then return nil end
-                if x ~= x or y ~= y or z ~= z or math.abs(x) > 100000 or math.abs(y) > 100000 or math.abs(z) > 100000 then return nil end
-                return Vector3.new(x, y, z)
-            end
-            MAP_WAYPOINTS.sideA = decodeWaypoint(data.mapWaypoints.sideA)
-            MAP_WAYPOINTS.sideB = decodeWaypoint(data.mapWaypoints.sideB)
-            MAP_WAYPOINTS.target = data.mapWaypoints.target == "B" and "B" or "A"
-        end
 
         SETTINGS.loaded = true
         SETTINGS.status = "Restored saved settings | " .. os.date("%H:%M:%S")
@@ -654,7 +637,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.1.0",
+            version = "1.0.9",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -684,11 +667,6 @@ do
             recentPublicServers = REJOIN.recentServers,
             privateServerId = game.PrivateServerId,
             privateServerJobId = game.JobId,
-            mapWaypoints = {
-                sideA = MAP_WAYPOINTS.sideA and {x = MAP_WAYPOINTS.sideA.X, y = MAP_WAYPOINTS.sideA.Y, z = MAP_WAYPOINTS.sideA.Z} or nil,
-                sideB = MAP_WAYPOINTS.sideB and {x = MAP_WAYPOINTS.sideB.X, y = MAP_WAYPOINTS.sideB.Y, z = MAP_WAYPOINTS.sideB.Z} or nil,
-                target = MAP_WAYPOINTS.target,
-            },
         }
         for _, species in ipairs(HERB_SPECIES) do data.herbSpeciesSelection[species] = herbSpeciesSelection[species] == true end
         for key, enabled in pairs(brewRecipeSelection) do data.brewRecipeSelection[key] = enabled == true end
@@ -966,7 +944,6 @@ Env.__CUAutoCultivationState = {
                 VioletSage = herbSpeciesSelection["Violet Sage"],
             },
             autoStartedTrainingMode = autoStartedTrainingMode,
-            mapWaypoints = {sideA = MAP_WAYPOINTS.sideA, sideB = MAP_WAYPOINTS.sideB, target = MAP_WAYPOINTS.target},
             mode = lastMode,
             percent = lastPercent,
             action = lastAction,
@@ -2222,70 +2199,6 @@ local function getCharacterParts()
         return nil, humanoid
     end
     return root, humanoid
-end
-
--- Map Waypoints: persistent bookmarks for manual Sword Flight navigation.
--- Deliberately does not write HumanoidRootPart.CFrame or automate movement.
-local function waypointText(position)
-    if not position then return "NOT SET" end
-    return string.format("X %.0f  Y %.0f  Z %.0f", position.X, position.Y, position.Z)
-end
-
-MAP_WAYPOINTS.refreshUI = function(force)
-    if not UI.mapWaypointStatusLabel then return end
-    local now = os.clock()
-    if not force and now - MAP_WAYPOINTS.lastUiAt < 0.35 then return end
-    MAP_WAYPOINTS.lastUiAt = now
-    local root = getCharacterParts()
-    local target = MAP_WAYPOINTS.target == "B" and MAP_WAYPOINTS.sideB or MAP_WAYPOINTS.sideA
-    local sideA = waypointText(MAP_WAYPOINTS.sideA)
-    local sideB = waypointText(MAP_WAYPOINTS.sideB)
-    local detail = "Target " .. MAP_WAYPOINTS.target .. " | set both sides to show distance"
-    if target and root then
-        local delta = target - root.Position
-        detail = string.format("Target %s | %.0f studs | ΔX %.0f  ΔY %.0f  ΔZ %.0f", MAP_WAYPOINTS.target, delta.Magnitude, delta.X, delta.Y, delta.Z)
-    elseif not target then
-        detail = "Set the selected side to create a navigation target"
-    else
-        detail = "Waiting for character position"
-    end
-    UI.mapWaypointStatusLabel.Text = "A: " .. sideA .. "\nB: " .. sideB .. "\n" .. detail
-    if UI.mapTargetButton then UI.mapTargetButton.Text = MAP_WAYPOINTS.target == "A" and "SWAP TO B" or "SWAP TO A" end
-end
-
-MAP_WAYPOINTS.set = function(side)
-    local root = getCharacterParts()
-    if not root then
-        setStatus("Cannot save Side " .. side .. ": character is unavailable.", COLORS.warning)
-        return false
-    end
-    local position = root.Position
-    if side == "A" then MAP_WAYPOINTS.sideA = position else MAP_WAYPOINTS.sideB = position end
-    MAP_WAYPOINTS.target = side
-    local saved, reason = SETTINGS.save("map_waypoint_side_" .. string.lower(side))
-    DIAG.log("INFO", "MAP_WAYPOINTS", "waypoint_saved", {side = side, position = position, settingsSaved = saved, reason = reason})
-    MAP_WAYPOINTS.refreshUI(true)
-    setStatus("Side " .. side .. " saved at " .. waypointText(position) .. ". Use Sword Flight to navigate; no forced teleport is performed.", saved and COLORS.success or COLORS.warning)
-    return true
-end
-
-MAP_WAYPOINTS.select = function(side)
-    if side ~= "A" and side ~= "B" then return false end
-    local position = side == "A" and MAP_WAYPOINTS.sideA or MAP_WAYPOINTS.sideB
-    if not position then
-        setStatus("Side " .. side .. " is not set yet.", COLORS.warning)
-        return false
-    end
-    MAP_WAYPOINTS.target = side
-    if SETTINGS.save then SETTINGS.save("map_waypoint_target_" .. string.lower(side)) end
-    MAP_WAYPOINTS.refreshUI(true)
-    setStatus("Navigation target set to Side " .. side .. ". Follow the displayed distance and XYZ offset using Sword Flight.", COLORS.success)
-    return true
-end
-
-MAP_WAYPOINTS.swap = function()
-    local nextSide = MAP_WAYPOINTS.target == "A" and "B" or "A"
-    return MAP_WAYPOINTS.select(nextSide)
 end
 
 local function getZoneCoordinates(mode, zone)
@@ -4196,12 +4109,10 @@ local function createGui()
         or parent:FindFirstChild("CUAutoCultivation_v101")
         or parent:FindFirstChild("CUAutoCultivation_v102")
         or parent:FindFirstChild("CUAutoCultivation_v105")
-        or parent:FindFirstChild("CUAutoCultivation_v107")
-        or parent:FindFirstChild("CUAutoCultivation_v109")
     if old then pcall(function() old:Destroy() end) end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v110",
+        Name = "CUAutoCultivation_v107",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4261,7 +4172,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.1.0",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.9",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4456,20 +4367,6 @@ local function createGui()
         DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
         setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use the configured hold duration.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
     end)
-
-    local waypointCard = makeCard(farmingPage, 16, 316, 598, 82, "MAP WAYPOINTS | SWORD FLIGHT NAVIGATION", COLORS.qi)
-    UI.mapWaypointStatusLabel = makeLabel(waypointCard, "A: NOT SET\nB: NOT SET\nTarget A | set both sides to show distance", 12, 48, 570, 29, 8, COLORS.text, Enum.Font.Code)
-    UI.mapSetAButton = makeButton(waypointCard, "SET A", 12, 26, 82, COLORS.panel2, 19)
-    UI.mapSetBButton = makeButton(waypointCard, "SET B", 100, 26, 82, COLORS.panel2, 19)
-    UI.mapTargetAButton = makeButton(waypointCard, "TARGET A", 188, 26, 92, COLORS.accent, 19)
-    UI.mapTargetBButton = makeButton(waypointCard, "TARGET B", 286, 26, 92, COLORS.accent, 19)
-    UI.mapTargetButton = makeButton(waypointCard, "SWAP TARGET", 384, 26, 190, COLORS.warning, 19)
-    addConnection(UI.mapSetAButton.MouseButton1Click, function() MAP_WAYPOINTS.set("A") end)
-    addConnection(UI.mapSetBButton.MouseButton1Click, function() MAP_WAYPOINTS.set("B") end)
-    addConnection(UI.mapTargetAButton.MouseButton1Click, function() MAP_WAYPOINTS.select("A") end)
-    addConnection(UI.mapTargetBButton.MouseButton1Click, function() MAP_WAYPOINTS.select("B") end)
-    addConnection(UI.mapTargetButton.MouseButton1Click, function() MAP_WAYPOINTS.swap() end)
-    MAP_WAYPOINTS.refreshUI(true)
 
     -- ALCHEMY PAGE
     local alchemyPage = pageFrames.Alchemy
@@ -5184,7 +5081,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.1.0", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.9", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -5301,7 +5198,6 @@ addConnection(RunService.RenderStepped, function()
     end
 
     if frameCounter % 30 == 0 then
-        MAP_WAYPOINTS.refreshUI(false)
         local now = os.clock()
         if now - lastAutoCheckAt >= 0.8 then
             lastAutoCheckAt = now
@@ -5318,11 +5214,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.1.0 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.9 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-print("[CU AutoCultivation] Map Waypoints: save Side A/B and use Sword Flight navigation; no forced CFrame teleport is performed.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.1.0"})
-setStatus("Loaded v1.1.0. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.9"})
+setStatus("Loaded v1.0.9. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
