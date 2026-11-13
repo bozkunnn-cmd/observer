@@ -21,8 +21,8 @@
         prioritizes oldest age first, with optional species filters.
       - Holds the real 2.5-second collection prompt and verifies the result.
       - Temporarily pauses cultivation during a herb sweep, then resumes.
-      - Auto Brew: exact recipe validation, independently selectable 1/10/100/1000-year ingredient ages,
-        no fallback to disabled ages, timed Stoke, and verified automatic claiming.
+      - Auto Brew: exact recipe validation, oldest available herbs first,
+        timed Stoke at the center of the Perfect band, and automatic claiming.
       - Chest automation and Chest Teleport retired in v1.0.6 after the experience
         explicitly banned a direct chest teleport. No chest travel or opening runs.
       - Herb age filters: independently select 1/10/100/1000-year herbs, including a 1000-year-only preset;
@@ -210,8 +210,6 @@ local brewRecipeSelection = {
     HP = false,
 }
 local brewRecipeCursor = 1
-local brewAgeSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}
-local BREW_AGE_OPTIONS = {1, 10, 100, 1000}
 local cauldronState = nil
 local cauldronStartResult = nil
 local cauldronStartZone = nil
@@ -336,9 +334,6 @@ local brewButton = nil
 local brewRecipeButton = nil
 local brewRecipePicker = nil
 local brewRecipeToggleButtons = {}
-UI.brewAgeFilterButton = nil
-UI.brewAgeFilterPicker = nil
-UI.brewAgeFilterToggleButtons = {}
 local pauseButton = nil
 local updateModeButtons = nil
 local footerStatusLabel = nil
@@ -613,12 +608,6 @@ do
                 if type(value) == "boolean" then brewRecipeSelection[key] = value end
             end
         end
-        if type(data.brewAgeSelection) == "table" then
-            for _, age in ipairs(BREW_AGE_OPTIONS) do
-                local value = data.brewAgeSelection[tostring(age)]
-                if type(value) == "boolean" then brewAgeSelection[age] = value end
-            end
-        end
         local cursor = tonumber(data.brewRecipeCursor)
         if cursor and cursor >= 1 and cursor <= #BREW_RECIPE_ORDER then brewRecipeCursor = math.floor(cursor) end
         if type(data.recentPublicServers) == "table" then REJOIN.recentServers = data.recentPublicServers end
@@ -637,7 +626,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.9",
+            version = "1.0.8",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -657,12 +646,6 @@ do
             autoHopNo1kHerbs = HERB_HOP.enabled == true,
             autoHopGraceSeconds = HERB_HOP.graceSeconds,
             brewRecipeSelection = {},
-            brewAgeSelection = {
-                ["1"] = brewAgeSelection[1] == true,
-                ["10"] = brewAgeSelection[10] == true,
-                ["100"] = brewAgeSelection[100] == true,
-                ["1000"] = brewAgeSelection[1000] == true,
-            },
             brewRecipeCursor = brewRecipeCursor,
             recentPublicServers = REJOIN.recentServers,
             privateServerId = game.PrivateServerId,
@@ -900,7 +883,6 @@ Env.__CUAutoCultivationState = {
             chestTeleportActive = CHEST.teleportActive,
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
-            brewAgeSelection = { [1] = brewAgeSelection[1], [10] = brewAgeSelection[10], [100] = brewAgeSelection[100], [1000] = brewAgeSelection[1000] },
             autoChestEnabled = CHEST.autoEnabled,
             autoSilverEnabled = SILVER.autoEnabled,
             silverMode = "scan_only_no_mouse_input",
@@ -3269,25 +3251,12 @@ local function buildBrewPlan(scroll, recipe)
         return nil, "Herb picker or recipe unavailable."
     end
 
-    local allowedAges = {}
-    local selectedAgeCount = 0
-    for _, age in ipairs(BREW_AGE_OPTIONS) do
-        if brewAgeSelection[age] == true then
-            allowedAges[age] = true
-            selectedAgeCount = selectedAgeCount + 1
-        end
-    end
-    if selectedAgeCount == 0 then
-        return nil, "No brewing herb ages selected. Choose at least one age; Brew will remain idle."
-    end
-
     local reserved = {}
     local plan = {}
     for _, ingredient in ipairs(recipe.ingredients) do
         for _ = 1, ingredient.count do
             local chosen = nil
             for _, age in ipairs(BREW_AGE_ORDER) do
-                if allowedAges[age] then
                 local key = "Herb_" .. tostring(ingredient.id) .. "_" .. tostring(age)
                 local entry = scroll:FindFirstChild(key)
                 local content = entry and entry:FindFirstChild("Content")
@@ -3305,14 +3274,9 @@ local function buildBrewPlan(scroll, recipe)
                     reserved[key] = alreadyReserved + 1
                     break
                 end
-                end -- allowed age only; disabled ages are never fallback candidates
             end
             if not chosen then
-                local ageNames = {}
-                for _, age in ipairs(BREW_AGE_ORDER) do
-                    if allowedAges[age] then table.insert(ageNames, tostring(age) .. "y") end
-                end
-                return nil, "Not enough " .. ingredient.name .. " at selected age(s) [" .. table.concat(ageNames, ", ") .. "] to make " .. recipe.name .. ". Brew will wait; disabled ages will not be substituted."
+                return nil, "Not enough " .. ingredient.name .. " to make " .. recipe.name .. "."
             end
             table.insert(plan, chosen)
         end
@@ -3727,7 +3691,6 @@ local function runAutoBrew()
                                 local recipe = recipeKey and BREW_RECIPES[recipeKey] or nil
                                 if not recipe then
                                     setStatus(tostring(fillResult), COLORS.warning)
-                                    DIAG.log("INFO", "ALCHEMY", "waiting_for_selected_age_ingredients", {reason = tostring(fillResult), ageSelection = brewAgeSelection})
                                     task.wait(0.7)
                                 else
                                     -- Exact recipe and each selected herb age were verified before the irreversible Brew click.
@@ -3742,7 +3705,7 @@ local function runAutoBrew()
                                         setStatus("Brew button activation failed: " .. tostring(backend), COLORS.danger)
                                         task.wait(0.4)
                                     else
-                                        setStatus("Started " .. recipe.name .. " using selected-age ingredients. Waiting for game validation.", COLORS.success)
+                                        setStatus("Started " .. recipe.name .. " using the oldest available herbs. Waiting for game validation.", COLORS.success)
                                         local gotRecord = brewWaitFor(function()
                                             return type(cauldronState) == "table" and type(cauldronState.record) == "table"
                                         end, 3)
@@ -3774,36 +3737,6 @@ local function runAutoBrew()
         autoBrewBusy = false
         autoBrewTaskRunning = false
     end)
-end
-
-local function getBrewAgeFilterSummary()
-    local selected = {}
-    for _, age in ipairs(BREW_AGE_OPTIONS) do
-        if brewAgeSelection[age] then
-            table.insert(selected, age == 1000 and "1K" or tostring(age))
-        end
-    end
-    if #selected == 0 then return "BREW AGE: NONE" end
-    if #selected == #BREW_AGE_OPTIONS then return "BREW AGE: ALL" end
-    return "BREW AGE: " .. table.concat(selected, "/")
-end
-
-local function updateBrewAgeFilterPicker()
-    for age, button in pairs(UI.brewAgeFilterToggleButtons) do
-        if button then
-            local selected = brewAgeSelection[age] == true
-            button.Text = (selected and "[ON] " or "[  ] ") .. (age == 1000 and "1,000 years" or (tostring(age) .. " years"))
-            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
-        end
-    end
-    if UI.brewAgeFilterButton then
-        UI.brewAgeFilterButton.Text = getBrewAgeFilterSummary()
-        local count = 0
-        for _, age in ipairs(BREW_AGE_OPTIONS) do
-            if brewAgeSelection[age] then count = count + 1 end
-        end
-        UI.brewAgeFilterButton.BackgroundColor3 = count == #BREW_AGE_OPTIONS and COLORS.panel2 or (count == 0 and COLORS.danger or COLORS.accent)
-    end
 end
 
 local function getBrewRecipeSummary()
@@ -3948,7 +3881,6 @@ updateModeButtons = function()
         brewRecipeButton.BackgroundColor3 = selectedCount > 0 and COLORS.panel2 or COLORS.danger
     end
     BREW.updatePicker()
-    updateBrewAgeFilterPicker()
     updateHerbFilterPicker()
     HERB_MONITOR.updateAgeFilterPicker()
     if herbInfoLabel then
@@ -4172,7 +4104,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.9",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4374,9 +4306,8 @@ local function createGui()
     local brewCard = makeCard(alchemyPage, 16, 44, 598, 220, "AUTO BREW", COLORS.warning)
     brewButton = makeButton(brewCard, "BREW: OFF", 12, 31, 170, COLORS.panel2, 32)
     brewRecipeButton = makeButton(brewCard, BREW.getSummary(), 194, 31, 380, COLORS.panel2, 32)
-    UI.brewAgeFilterButton = makeButton(brewCard, getBrewAgeFilterSummary(), 12, 72, 562, COLORS.panel2, 27)
-    makeLabel(brewCard, "Only selected herb ages may be used. If the chosen ages cannot fill every ingredient, Auto Brew waits and does not substitute disabled ages.", 12, 108, 570, 43, 10, COLORS.text)
-    makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 158, 570, 35, 9, COLORS.muted)
+    makeLabel(brewCard, "Select multiple recipes. The queue checks ingredients, uses the oldest available herbs, Stoke timing, and verifies Claim before moving to the next pill.", 12, 82, 570, 55, 10, COLORS.text)
+    makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 146, 570, 42, 9, COLORS.muted)
 
     -- ECONOMY PAGE
     local economyPage = pageFrames.Economy
@@ -4555,42 +4486,7 @@ local function createGui()
     local recipeDone = makeButton(brewRecipePicker, "DONE", 8, 145, 194, COLORS.accent, 22)
     addConnection(recipeDone.MouseButton1Click, function() brewRecipePicker.Visible = false end)
 
-    UI.brewAgeFilterPicker = make("Frame", {
-        Name = "BrewAgeFilterPicker",
-        Position = UDim2.fromOffset(390, 205),
-        Size = UDim2.fromOffset(210, 166),
-        BackgroundColor3 = COLORS.bg,
-        BackgroundTransparency = 0.02,
-        BorderSizePixel = 0,
-        Visible = false,
-        ZIndex = 22,
-    }, alchemyPage)
-    round(UI.brewAgeFilterPicker, 8)
-    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, UI.brewAgeFilterPicker)
-    makeLabel(UI.brewAgeFilterPicker, "ALLOWED BREW HERB AGES", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
-    addConnection(makeButton(UI.brewAgeFilterPicker, "SELECT ALL AGES", 8, 27, 194, COLORS.accent, 22).MouseButton1Click, function()
-        for _, age in ipairs(BREW_AGE_OPTIONS) do brewAgeSelection[age] = true end
-        if SETTINGS.save then SETTINGS.save("brew_age_select_all") end
-        updateModeButtons()
-        setStatus("Alchemy may use all four selected herb ages, preferring the oldest available selected age.", COLORS.success)
-    end)
-    for index, age in ipairs(BREW_AGE_OPTIONS) do
-        local ageText = age == 1000 and "1,000 years" or (tostring(age) .. " years")
-        local toggle = makeButton(UI.brewAgeFilterPicker, ageText, 8, 53 + (index - 1) * 24, 194, COLORS.success, 21)
-        UI.brewAgeFilterToggleButtons[age] = toggle
-        addConnection(toggle.MouseButton1Click, function()
-            brewAgeSelection[age] = not brewAgeSelection[age]
-            if SETTINGS.save then SETTINGS.save("brew_age_filter_changed") end
-            updateModeButtons()
-            DIAG.log("INFO", "ALCHEMY", "brew_age_filter_changed", {age = age, enabled = brewAgeSelection[age]})
-            setStatus("Brew age " .. tostring(age) .. " years " .. (brewAgeSelection[age] and "enabled." or "disabled. Disabled ages will never be substituted."), COLORS.success)
-        end)
-    end
-    addConnection(makeButton(UI.brewAgeFilterPicker, "DONE", 8, 151, 194, COLORS.accent, 18).MouseButton1Click, function()
-        UI.brewAgeFilterPicker.Visible = false
-    end)
-
-    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker, UI.brewAgeFilterPicker}) do
+    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker}) do
         for _, descendant in ipairs(picker:GetDescendants()) do
             if descendant:IsA("GuiObject") then descendant.ZIndex = 23 end
         end
@@ -4667,7 +4563,6 @@ local function createGui()
         herbFilterPicker.Visible = not herbFilterPicker.Visible
         UI.herbAgeFilterPicker.Visible = false
         brewRecipePicker.Visible = false
-        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Choose which herb species Auto Herbs may collect. Oldest HerbYear is prioritized.", COLORS.success)
     end)
@@ -4676,7 +4571,6 @@ local function createGui()
         UI.herbAgeFilterPicker.Visible = not UI.herbAgeFilterPicker.Visible
         herbFilterPicker.Visible = false
         brewRecipePicker.Visible = false
-        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Choose herb ages. Use 1,000 YEARS ONLY to ignore every lower or unknown age and resume cultivation between spawns.", COLORS.success)
     end)
@@ -4688,7 +4582,7 @@ local function createGui()
         if SETTINGS.save then SETTINGS.save("auto_brew_toggled") end
         updateModeButtons()
         if autoBrewEnabled then
-            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; only selected herb ages are eligible, preferring the oldest selected age.", COLORS.success)
+            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; oldest available herbs will be selected.", COLORS.success)
             BREW.run()
         else
             setStatus("Auto Brew disabled. Current in-progress brew will be left untouched.", COLORS.warning)
@@ -4699,17 +4593,8 @@ local function createGui()
         brewRecipePicker.Visible = not brewRecipePicker.Visible
         herbFilterPicker.Visible = false
         UI.herbAgeFilterPicker.Visible = false
-        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
-    end)
-    addConnection(UI.brewAgeFilterButton.MouseButton1Click, function()
-        UI.brewAgeFilterPicker.Visible = not UI.brewAgeFilterPicker.Visible
-        herbFilterPicker.Visible = false
-        UI.herbAgeFilterPicker.Visible = false
-        brewRecipePicker.Visible = false
-        updateModeButtons()
-        setStatus("Choose exactly which herb ages Alchemy may consume. If ingredients at selected ages are unavailable, brewing waits without using other ages.", COLORS.success)
     end)
 
     -- No Auto Silver or sword auto-carry controls in v1.0.6.
@@ -5081,7 +4966,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.9", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -5214,10 +5099,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.9 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.8 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.9"})
-setStatus("Loaded v1.0.9. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8"})
+setStatus("Loaded v1.0.8. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
