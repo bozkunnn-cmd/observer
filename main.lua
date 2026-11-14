@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.8
+    Version: 1.0.8.3.1
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -21,8 +21,8 @@
         prioritizes oldest age first, with optional species filters.
       - Holds the real 2.5-second collection prompt and verifies the result.
       - Temporarily pauses cultivation during a herb sweep, then resumes.
-      - Auto Brew: exact recipe validation, oldest available herbs first,
-        timed Stoke at the center of the Perfect band, and automatic claiming.
+      - Auto Brew: exact recipe validation, independently selectable 1/10/100/1000-year ingredient ages,
+        no fallback to disabled ages, timed Stoke, and verified automatic claiming.
       - Chest automation and Chest Teleport retired in v1.0.6 after the experience
         explicitly banned a direct chest teleport. No chest travel or opening runs.
       - Herb age filters: independently select 1/10/100/1000-year herbs, including a 1000-year-only preset;
@@ -31,6 +31,9 @@
         including disabled/locked prompt counts.
       - Economy dashboard: Silver and Primordial Stone balances, NPC Silver rewards,
         session deltas, and Destiny reroll probability/cost estimates.
+      - Auto Sell at Merchant Gao: per-species/per-age ALL or exact quantity,
+        SELL ALL EXCEPT 1,000-year preset, Alchemy reserve protection, and
+        inventory + Silver confirmation after every transaction.
       - Silver combat, Auto Silver, and Immortal Inheritance retired in v1.0.6.
       - Experiments page and chest interaction probes removed; core diagnostics retained.
       - Redesigned tabs: Overview, Cultivation, Farming, Alchemy, Economy, Settings, Diagnostics.
@@ -210,6 +213,8 @@ local brewRecipeSelection = {
     HP = false,
 }
 local brewRecipeCursor = 1
+local brewAgeSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}
+local BREW_AGE_OPTIONS = {1, 10, 100, 1000}
 local cauldronState = nil
 local cauldronStartResult = nil
 local cauldronStartZone = nil
@@ -233,8 +238,25 @@ local herbCounts = nil
 local herbReturnCFrame = nil
 local herbResumeMode = nil
 local herbActiveName = "idle"
+local AUTO_SELL = {
+    enabled = false,
+    busy = false,
+    sellNowRequested = false,
+    status = "OFF",
+    soldCount = 0,
+    silverEarned = 0,
+    lastSilver = tonumber(LocalPlayer:GetAttribute("Silver")),
+    config = {},
+}
+for herbId = 1, 5 do
+    for _, age in ipairs({1, 10, 100, 1000}) do
+        AUTO_SELL.config[tostring(herbId) .. "_" .. tostring(age)] = {
+            enabled = false, mode = "ALL", amount = 0,
+        }
+    end
+end
 local herbFilterButton = nil
-local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil, autoHopNo1kButton = nil}
+local UI = {chestFilterToggleButtons = {}, pages = {}, tabs = {}, herbAgeFilterToggleButtons = {}, settingsStatusLabel = nil, privateRejoinButton = nil, serverHopButton = nil, autoHopNo1kButton = nil, autoSellButton = nil, autoSellNowButton = nil, autoSellConfigButton = nil, autoSellStatusLabel = nil, autoSellPicker = nil, autoSellRows = {}}
 local herbFilterPicker = nil
 local herbFilterToggleButtons = {}
 local HERB_SPECIES = {"Ginseng", "Azure Lotus", "Verdant Moss", "Golden Fern", "Violet Sage"}
@@ -334,6 +356,9 @@ local brewButton = nil
 local brewRecipeButton = nil
 local brewRecipePicker = nil
 local brewRecipeToggleButtons = {}
+UI.brewAgeFilterButton = nil
+UI.brewAgeFilterPicker = nil
+UI.brewAgeFilterToggleButtons = {}
 local pauseButton = nil
 local updateModeButtons = nil
 local footerStatusLabel = nil
@@ -608,6 +633,22 @@ do
                 if type(value) == "boolean" then brewRecipeSelection[key] = value end
             end
         end
+        if type(data.brewAgeSelection) == "table" then
+            for _, age in ipairs(BREW_AGE_OPTIONS) do
+                local value = data.brewAgeSelection[tostring(age)]
+                if type(value) == "boolean" then brewAgeSelection[age] = value end
+            end
+        end
+        if type(data.autoSellEnabled) == "boolean" then AUTO_SELL.enabled = data.autoSellEnabled end
+        if type(data.autoSellConfig) == "table" then
+            for key, saved in pairs(data.autoSellConfig) do
+                if type(saved) == "table" and AUTO_SELL.config[key] then
+                    AUTO_SELL.config[key].enabled = saved.enabled == true
+                    AUTO_SELL.config[key].mode = saved.mode == "COUNT" and "COUNT" or "ALL"
+                    AUTO_SELL.config[key].amount = math.max(0, math.floor(tonumber(saved.amount) or 0))
+                end
+            end
+        end
         local cursor = tonumber(data.brewRecipeCursor)
         if cursor and cursor >= 1 and cursor <= #BREW_RECIPE_ORDER then brewRecipeCursor = math.floor(cursor) end
         if type(data.recentPublicServers) == "table" then REJOIN.recentServers = data.recentPublicServers end
@@ -626,7 +667,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.8",
+            version = "1.0.8.3.1",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -643,9 +684,17 @@ do
             herbSpeciesSelection = {},
             quickInteractEnabled = QUICK_INTERACT.enabled == true,
             autoBrewEnabled = autoBrewEnabled == true,
+            autoSellEnabled = AUTO_SELL.enabled == true,
+            autoSellConfig = AUTO_SELL.config,
             autoHopNo1kHerbs = HERB_HOP.enabled == true,
             autoHopGraceSeconds = HERB_HOP.graceSeconds,
             brewRecipeSelection = {},
+            brewAgeSelection = {
+                ["1"] = brewAgeSelection[1] == true,
+                ["10"] = brewAgeSelection[10] == true,
+                ["100"] = brewAgeSelection[100] == true,
+                ["1000"] = brewAgeSelection[1000] == true,
+            },
             brewRecipeCursor = brewRecipeCursor,
             recentPublicServers = REJOIN.recentServers,
             privateServerId = game.PrivateServerId,
@@ -831,6 +880,9 @@ local function stop(reason)
     autoHerbsEnabled = false
     autoBrewEnabled = false
     autoBrewBusy = false
+    AUTO_SELL.enabled = false
+    AUTO_SELL.sellNowRequested = false
+    AUTO_SELL.status = "Stopped"
     selectedAutoMode = nil
     breakthroughEnabled = false
     antiAfkEnabled = false
@@ -883,6 +935,7 @@ Env.__CUAutoCultivationState = {
             chestTeleportActive = CHEST.teleportActive,
             autoBrewEnabled = autoBrewEnabled,
             autoBrewBusy = autoBrewBusy,
+            brewAgeSelection = { [1] = brewAgeSelection[1], [10] = brewAgeSelection[10], [100] = brewAgeSelection[100], [1000] = brewAgeSelection[1000] },
             autoChestEnabled = CHEST.autoEnabled,
             autoSilverEnabled = SILVER.autoEnabled,
             silverMode = "scan_only_no_mouse_input",
@@ -3251,12 +3304,25 @@ local function buildBrewPlan(scroll, recipe)
         return nil, "Herb picker or recipe unavailable."
     end
 
+    local allowedAges = {}
+    local selectedAgeCount = 0
+    for _, age in ipairs(BREW_AGE_OPTIONS) do
+        if brewAgeSelection[age] == true then
+            allowedAges[age] = true
+            selectedAgeCount = selectedAgeCount + 1
+        end
+    end
+    if selectedAgeCount == 0 then
+        return nil, "No brewing herb ages selected. Choose at least one age; Brew will remain idle."
+    end
+
     local reserved = {}
     local plan = {}
     for _, ingredient in ipairs(recipe.ingredients) do
         for _ = 1, ingredient.count do
             local chosen = nil
             for _, age in ipairs(BREW_AGE_ORDER) do
+                if allowedAges[age] then
                 local key = "Herb_" .. tostring(ingredient.id) .. "_" .. tostring(age)
                 local entry = scroll:FindFirstChild(key)
                 local content = entry and entry:FindFirstChild("Content")
@@ -3274,9 +3340,14 @@ local function buildBrewPlan(scroll, recipe)
                     reserved[key] = alreadyReserved + 1
                     break
                 end
+                end -- allowed age only; disabled ages are never fallback candidates
             end
             if not chosen then
-                return nil, "Not enough " .. ingredient.name .. " to make " .. recipe.name .. "."
+                local ageNames = {}
+                for _, age in ipairs(BREW_AGE_ORDER) do
+                    if allowedAges[age] then table.insert(ageNames, tostring(age) .. "y") end
+                end
+                return nil, "Not enough " .. ingredient.name .. " at selected age(s) [" .. table.concat(ageNames, ", ") .. "] to make " .. recipe.name .. ". Brew will wait; disabled ages will not be substituted."
             end
             table.insert(plan, chosen)
         end
@@ -3691,6 +3762,7 @@ local function runAutoBrew()
                                 local recipe = recipeKey and BREW_RECIPES[recipeKey] or nil
                                 if not recipe then
                                     setStatus(tostring(fillResult), COLORS.warning)
+                                    DIAG.log("INFO", "ALCHEMY", "waiting_for_selected_age_ingredients", {reason = tostring(fillResult), ageSelection = brewAgeSelection})
                                     task.wait(0.7)
                                 else
                                     -- Exact recipe and each selected herb age were verified before the irreversible Brew click.
@@ -3705,7 +3777,7 @@ local function runAutoBrew()
                                         setStatus("Brew button activation failed: " .. tostring(backend), COLORS.danger)
                                         task.wait(0.4)
                                     else
-                                        setStatus("Started " .. recipe.name .. " using the oldest available herbs. Waiting for game validation.", COLORS.success)
+                                        setStatus("Started " .. recipe.name .. " using selected-age ingredients. Waiting for game validation.", COLORS.success)
                                         local gotRecord = brewWaitFor(function()
                                             return type(cauldronState) == "table" and type(cauldronState.record) == "table"
                                         end, 3)
@@ -3737,6 +3809,36 @@ local function runAutoBrew()
         autoBrewBusy = false
         autoBrewTaskRunning = false
     end)
+end
+
+local function getBrewAgeFilterSummary()
+    local selected = {}
+    for _, age in ipairs(BREW_AGE_OPTIONS) do
+        if brewAgeSelection[age] then
+            table.insert(selected, age == 1000 and "1K" or tostring(age))
+        end
+    end
+    if #selected == 0 then return "BREW AGE: NONE" end
+    if #selected == #BREW_AGE_OPTIONS then return "BREW AGE: ALL" end
+    return "BREW AGE: " .. table.concat(selected, "/")
+end
+
+local function updateBrewAgeFilterPicker()
+    for age, button in pairs(UI.brewAgeFilterToggleButtons) do
+        if button then
+            local selected = brewAgeSelection[age] == true
+            button.Text = (selected and "[ON] " or "[  ] ") .. (age == 1000 and "1,000 years" or (tostring(age) .. " years"))
+            button.BackgroundColor3 = selected and COLORS.success or COLORS.panel2
+        end
+    end
+    if UI.brewAgeFilterButton then
+        UI.brewAgeFilterButton.Text = getBrewAgeFilterSummary()
+        local count = 0
+        for _, age in ipairs(BREW_AGE_OPTIONS) do
+            if brewAgeSelection[age] then count = count + 1 end
+        end
+        UI.brewAgeFilterButton.BackgroundColor3 = count == #BREW_AGE_OPTIONS and COLORS.panel2 or (count == 0 and COLORS.danger or COLORS.accent)
+    end
 end
 
 local function getBrewRecipeSummary()
@@ -3772,6 +3874,11 @@ end
     BREW.run = runAutoBrew
     BREW.getSummary = getBrewRecipeSummary
     BREW.updatePicker = updateBrewRecipePicker
+    -- These helpers live inside this do-scope but are called by GUI code
+    -- outside it. Export them explicitly so createGui/updateModeButtons
+    -- never resolve them as nil globals.
+    BREW.getAgeFilterSummary = getBrewAgeFilterSummary
+    BREW.updateAgeFilterPicker = updateBrewAgeFilterPicker
 end
 
 HERB_MONITOR.getSpeciesFilterSummary = function()
@@ -3881,6 +3988,7 @@ updateModeButtons = function()
         brewRecipeButton.BackgroundColor3 = selectedCount > 0 and COLORS.panel2 or COLORS.danger
     end
     BREW.updatePicker()
+    BREW.updateAgeFilterPicker()
     updateHerbFilterPicker()
     HERB_MONITOR.updateAgeFilterPicker()
     if herbInfoLabel then
@@ -4032,19 +4140,286 @@ REJOIN.serverHop = function()
     return true
 end
 
+-- Auto Sell: uses Merchant Gao's visible Sell all / Sell 1 GUI buttons only.
+-- No selling remotes are invoked. Every transaction must be confirmed by both
+-- HerbInventoryUpdate and a positive Silver balance change before continuing.
+local AUTO_SELL_SPECIES = {
+    [1] = "Ginseng", [2] = "Azure Lotus", [3] = "Verdant Moss",
+    [4] = "Golden Fern", [5] = "Violet Sage",
+}
+
+local function autoSellInventoryCount(key)
+    if type(herbCounts) ~= "table" then return nil end
+    return math.max(0, math.floor(tonumber(herbCounts[key]) or 0))
+end
+
+local function autoSellReservedCount(herbId, age)
+    local key = tostring(herbId) .. "_" .. tostring(age)
+    local availableAge = brewAgeSelection[age] == true
+    if not availableAge then return 0 end
+    local reserve = 0
+    for recipeKey, recipe in pairs(BREW_RECIPES) do
+        if brewRecipeSelection[recipeKey] == true then
+            for _, ingredient in ipairs(recipe.ingredients) do
+                if ingredient.id == herbId then
+                    reserve = reserve + ingredient.count
+                end
+            end
+        end
+    end
+    return reserve
+end
+
+local function autoSellFindMerchantRoot()
+    local roots = {PlayerGui}
+    for _, root in ipairs(roots) do
+        for _, node in ipairs(root:GetDescendants()) do
+            if (node:IsA("TextLabel") or node:IsA("TextButton"))
+                and string.find(string.upper(tostring(node.Text or "")), "MERCHANT GAO", 1, true)
+                and isVisibleInTree(node) then
+                local ancestor = node
+                for _ = 1, 8 do
+                    if not ancestor or ancestor == root then break end
+                    if ancestor:IsA("Frame") or ancestor:IsA("ScreenGui") then
+                        local hasSell = false
+                        for _, child in ipairs(ancestor:GetDescendants()) do
+                            if child:IsA("TextButton") then
+                                local label = string.lower(tostring(child.Text or ""))
+                                if label == "sell all" or label == "sell 1" then hasSell = true break end
+                            end
+                        end
+                        if hasSell then return ancestor end
+                    end
+                    ancestor = ancestor.Parent
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function autoSellFindRowButtons(merchantRoot, herbId, age)
+    if not merchantRoot then return nil, nil end
+    local species = AUTO_SELL_SPECIES[herbId]
+    if not species then return nil, nil end
+    local wantedAge = tostring(age) .. "-year herb"
+    local bestRow, bestDepth = nil, math.huge
+    local sellAllButton, sellOneButton = nil, nil
+    for _, button in ipairs(merchantRoot:GetDescendants()) do
+        if button:IsA("TextButton") and isVisibleInTree(button) then
+            local text = string.lower((tostring(button.Text or ""):gsub("%s+", " ")))
+            if text == "sell all" or text == "sell 1" then
+                local ancestor = button.Parent
+                local depth = 0
+                while ancestor and ancestor ~= merchantRoot and depth < 8 do
+                    local labels = {}
+                    for _, child in ipairs(ancestor:GetDescendants()) do
+                        if child:IsA("TextLabel") or child:IsA("TextButton") then
+                            table.insert(labels, string.lower(tostring(child.Text or "")))
+                        end
+                    end
+                    local combined = table.concat(labels, " | ")
+                    if string.find(combined, string.lower(species), 1, true)
+                        and string.find(combined, wantedAge, 1, true) then
+                        if depth < bestDepth then
+                            bestDepth = depth
+                            bestRow = ancestor
+                            sellAllButton, sellOneButton = nil, nil
+                        end
+                        if ancestor == bestRow then
+                            if text == "sell all" then sellAllButton = button else sellOneButton = button end
+                        end
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                    depth = depth + 1
+                end
+            end
+        end
+    end
+    return sellAllButton, sellOneButton
+end
+
+local function autoSellWaitForConfirmation(key, beforeCount, beforeSilver, timeout)
+    local startRevision = herbInventoryRevision
+    local deadline = os.clock() + (timeout or 3.0)
+    local inventoryConfirmed, silverConfirmed = false, false
+    while running and os.clock() < deadline do
+        local current = autoSellInventoryCount(key)
+        local silver = tonumber(LocalPlayer:GetAttribute("Silver")) or ECONOMY.silver
+        if current ~= nil and current < beforeCount and herbInventoryRevision > startRevision then
+            inventoryConfirmed = true
+        end
+        if silver and beforeSilver and silver > beforeSilver then
+            silverConfirmed = true
+        end
+        if inventoryConfirmed and silverConfirmed then
+            local delta = silver - beforeSilver
+            AUTO_SELL.soldCount = AUTO_SELL.soldCount + (beforeCount - current)
+            AUTO_SELL.silverEarned = AUTO_SELL.silverEarned + delta
+            ECONOMY.updateUI()
+            DIAG.log("INFO", "AUTO_SELL", "sale_verified", {
+                inventoryKey = key, before = beforeCount, after = current,
+                quantity = beforeCount - current, silverBefore = beforeSilver,
+                silverAfter = silver, silverEarned = delta,
+            })
+            return true, beforeCount - current, delta
+        end
+        task.wait(0.05)
+    end
+    return false, nil, nil
+end
+
+local function autoSellOneStack(herbId, age, config, merchantRoot)
+    local key = tostring(herbId) .. "_" .. tostring(age)
+    local count = autoSellInventoryCount(key)
+    if count == nil or count <= 0 then return true, "empty" end
+    local reserve = autoSellReservedCount(herbId, age)
+    local sellable = math.max(0, count - reserve)
+    if sellable <= 0 then return true, "reserved for Alchemy" end
+    local requested = config.mode == "COUNT" and math.min(sellable, config.amount) or sellable
+    if requested <= 0 then return true, "quantity is zero" end
+
+    local sellAll, sellOne = autoSellFindRowButtons(merchantRoot, herbId, age)
+    if not sellOne then return false, "Sell 1 button not found for " .. AUTO_SELL_SPECIES[herbId] .. " " .. tostring(age) .. "y" end
+
+    -- Sell All is only safe when the entire stack is sellable and requested.
+    if requested == count and reserve == 0 and config.mode ~= "COUNT" and sellAll then
+        local beforeSilver = tonumber(LocalPlayer:GetAttribute("Silver")) or ECONOMY.silver
+        local clicked, reason = clickGuiButton(sellAll)
+        if not clicked then return false, "Sell all click failed: " .. tostring(reason) end
+        local ok = autoSellWaitForConfirmation(key, count, beforeSilver, 4.0)
+        if not ok then return false, "Sell all was not confirmed by inventory and Silver updates" end
+        return true, "sold all"
+    end
+
+    for index = 1, requested do
+        if not running or (not AUTO_SELL.enabled and not AUTO_SELL.sellNowRequested) then
+            return false, "Auto Sell stopped"
+        end
+        if not merchantRoot.Parent or not isVisibleInTree(merchantRoot) then
+            return false, "Merchant Gao window closed"
+        end
+        local current = autoSellInventoryCount(key)
+        if current == nil or current <= reserve then return true, "inventory reserve reached" end
+        local beforeSilver = tonumber(LocalPlayer:GetAttribute("Silver")) or ECONOMY.silver
+        local before = current
+        local _, currentSellOne = autoSellFindRowButtons(merchantRoot, herbId, age)
+        if not currentSellOne then return false, "Sell 1 button disappeared" end
+        local clicked, reason = clickGuiButton(currentSellOne)
+        if not clicked then return false, "Sell 1 click failed: " .. tostring(reason) end
+        local ok = autoSellWaitForConfirmation(key, before, beforeSilver, 3.0)
+        if not ok then
+            DIAG.log("WARN", "AUTO_SELL", "sale_unconfirmed_stop", {inventoryKey = key, attempt = index, before = before})
+            return false, "Sale was not confirmed; stopped to prevent duplicate selling"
+        end
+        task.wait(0.08)
+    end
+    return true, "sold configured quantity"
+end
+
+local function autoSellRun()
+    if AUTO_SELL.busy then return end
+    AUTO_SELL.busy = true
+    task.spawn(function()
+        local manual = AUTO_SELL.sellNowRequested
+        local merchantRoot = autoSellFindMerchantRoot()
+        if not merchantRoot then
+            AUTO_SELL.status = "Open Merchant Gao's Herbs window first"
+            if UI.autoSellStatusLabel then UI.autoSellStatusLabel.Text = AUTO_SELL.status end
+            DIAG.log("INFO", "AUTO_SELL", "merchant_not_open", {manual = manual})
+            AUTO_SELL.busy = false
+            AUTO_SELL.sellNowRequested = false
+            return
+        end
+        AUTO_SELL.status = "Selling selected herb stacks..."
+        if UI.autoSellStatusLabel then UI.autoSellStatusLabel.Text = AUTO_SELL.status end
+        DIAG.log("INFO", "AUTO_SELL", "sale_run_started", {manual = manual})
+        local stoppedReason = nil
+        for herbId = 1, 5 do
+            for _, age in ipairs({1, 10, 100, 1000}) do
+                local key = tostring(herbId) .. "_" .. tostring(age)
+                local config = AUTO_SELL.config[key]
+                if config and config.enabled then
+                    local ok, result = autoSellOneStack(herbId, age, config, merchantRoot)
+                    if not ok then stoppedReason = result break end
+                end
+                if not AUTO_SELL.enabled and not AUTO_SELL.sellNowRequested then stoppedReason = "stopped" break end
+            end
+            if stoppedReason then break end
+        end
+        AUTO_SELL.status = stoppedReason and ("Stopped: " .. stoppedReason) or "Sale pass complete"
+        if stoppedReason and AUTO_SELL.enabled then
+            AUTO_SELL.enabled = false
+            if SETTINGS.save then SETTINGS.save("auto_sell_safety_stop") end
+        end
+        if UI.autoSellStatusLabel then UI.autoSellStatusLabel.Text = AUTO_SELL.status end
+        if UI.autoSellButton then
+            UI.autoSellButton.Text = AUTO_SELL.enabled and "AUTO SELL: ON" or "AUTO SELL: OFF"
+            UI.autoSellButton.BackgroundColor3 = AUTO_SELL.enabled and COLORS.success or COLORS.panel2
+        end
+        DIAG.log(stoppedReason and "WARN" or "INFO", "AUTO_SELL", "sale_run_finished", {
+            reason = stoppedReason, soldCount = AUTO_SELL.soldCount,
+            silverEarned = AUTO_SELL.silverEarned,
+        })
+        AUTO_SELL.busy = false
+        AUTO_SELL.sellNowRequested = false
+    end)
+end
+
+local function autoSellSetPresetAllExcept1000()
+    for herbId = 1, 5 do
+        for _, age in ipairs({1, 10, 100, 1000}) do
+            local key = tostring(herbId) .. "_" .. tostring(age)
+            local config = AUTO_SELL.config[key]
+            config.enabled = age ~= 1000
+            config.mode = "ALL"
+            config.amount = 0
+        end
+    end
+    if SETTINGS.save then SETTINGS.save("auto_sell_preset_all_except_1000") end
+    DIAG.log("INFO", "AUTO_SELL", "preset_applied", {preset = "ALL_EXCEPT_1000"})
+end
+
+local function autoSellUpdateButton()
+    if UI.autoSellButton then
+        UI.autoSellButton.Text = AUTO_SELL.enabled and "AUTO SELL: ON" or "AUTO SELL: OFF"
+        UI.autoSellButton.BackgroundColor3 = AUTO_SELL.enabled and COLORS.success or COLORS.panel2
+    end
+    if UI.autoSellStatusLabel then UI.autoSellStatusLabel.Text = AUTO_SELL.status end
+end
+
+local function autoSellRefreshConfig()
+    for key, controls in pairs(UI.autoSellRows) do
+        local config = AUTO_SELL.config[key]
+        if config and controls then
+            controls.enabled.Text = config.enabled and "ON" or "OFF"
+            controls.enabled.BackgroundColor3 = config.enabled and COLORS.success or COLORS.panel
+            controls.mode.Text = config.mode == "COUNT" and "QTY" or "ALL"
+            controls.mode.BackgroundColor3 = config.mode == "COUNT" and COLORS.warning or COLORS.accent
+            controls.amount.Text = tostring(config.amount or 0)
+        end
+    end
+    autoSellUpdateButton()
+end
+
 local function createGui()
     local parent = getGuiParent()
-    local old = parent:FindFirstChild("CUAutoCultivation_v08")
-        or parent:FindFirstChild("CUAutoCultivation_v09")
-        or parent:FindFirstChild("CUAutoCultivation_v091")
-        or parent:FindFirstChild("CUAutoCultivation_v10")
-        or parent:FindFirstChild("CUAutoCultivation_v101")
-        or parent:FindFirstChild("CUAutoCultivation_v102")
-        or parent:FindFirstChild("CUAutoCultivation_v105")
-    if old then pcall(function() old:Destroy() end) end
+    -- Remove every known prior suite GUI. A single chained `or` lookup only
+    -- destroys the first match and can leave stale panels intercepting clicks.
+    local oldGuiNames = {
+        "CUAutoCultivation_v08", "CUAutoCultivation_v09", "CUAutoCultivation_v091",
+        "CUAutoCultivation_v10", "CUAutoCultivation_v101", "CUAutoCultivation_v102",
+        "CUAutoCultivation_v105", "CUAutoCultivation_v107", "CUAutoCultivation_v1081",
+        "CUAutoCultivation_v1082", "CUAutoCultivation_v1083", "CUAutoCultivation_v10831"
+    }
+    for _, oldName in ipairs(oldGuiNames) do
+        local old = parent:FindFirstChild(oldName)
+        if old then pcall(function() old:Destroy() end) end
+    end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v107",
+        Name = "CUAutoCultivation_v10831",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4104,7 +4479,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.3.1",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4188,6 +4563,8 @@ local function createGui()
             if herbFilterPicker then herbFilterPicker.Visible = false end
             if UI.herbAgeFilterPicker then UI.herbAgeFilterPicker.Visible = false end
             if brewRecipePicker then brewRecipePicker.Visible = false end
+            if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
+            if UI.autoSellPicker then UI.autoSellPicker.Visible = false end
         end)
     end
 
@@ -4283,6 +4660,75 @@ local function createGui()
     UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 113, 560, 45, 9, COLORS.muted, Enum.Font.Code)
     UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 246, 598, COLORS.panel2, 27)
     UI.autoHopNo1kButton = makeButton(farmingPage, "AUTO HOP: NO 1K HERBS OFF", 16, 280, 598, COLORS.panel2, 27)
+    local autoSellCard = makeCard(farmingPage, 16, 316, 598, 78, "MERCHANT GAO | AUTO SELL HERBS", COLORS.warning)
+    UI.autoSellButton = makeButton(autoSellCard, "AUTO SELL: OFF", 12, 28, 180, COLORS.panel2, 27)
+    UI.autoSellConfigButton = makeButton(autoSellCard, "SELL CONFIGURATION", 202, 28, 220, COLORS.accent, 27)
+    UI.autoSellNowButton = makeButton(autoSellCard, "SELL NOW", 432, 28, 142, COLORS.warning, 27)
+    UI.autoSellStatusLabel = makeLabel(autoSellCard, "Waiting for Merchant Gao's Herbs window.", 12, 56, 560, 16, 8, COLORS.muted)
+
+    UI.autoSellPicker = make("Frame", {
+        Name = "AutoSellConfiguration",
+        Position = UDim2.fromOffset(300, 8),
+        Size = UDim2.fromOffset(300, 380),
+        BackgroundColor3 = COLORS.bg,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 30,
+    }, farmingPage)
+    round(UI.autoSellPicker, 8)
+    make("UIStroke", {Color = COLORS.warning, Thickness = 1.2}, UI.autoSellPicker)
+    makeLabel(UI.autoSellPicker, "MERCHANT GAO | SELL CONFIG", 10, 5, 280, 20, 10, COLORS.text, Enum.Font.GothamBold)
+    UI.autoSellPresetButton = makeButton(UI.autoSellPicker, "SELL ALL EXCEPT 1,000-YEAR", 8, 29, 284, COLORS.warning, 24)
+    UI.autoSellScroll = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(8, 59), Size = UDim2.fromOffset(284, 265),
+        BackgroundColor3 = COLORS.panel, BorderSizePixel = 0, ScrollBarThickness = 5,
+        CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ZIndex = 31,
+    }, UI.autoSellPicker)
+    make("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, UI.autoSellScroll)
+    for herbId = 1, 5 do
+        for _, age in ipairs({1, 10, 100, 1000}) do
+            local key = tostring(herbId) .. "_" .. tostring(age)
+            local row = make("Frame", {
+                Size = UDim2.new(1, -8, 0, 42), BackgroundColor3 = COLORS.panel2,
+                BorderSizePixel = 0, ZIndex = 32,
+            }, UI.autoSellScroll)
+            round(row, 5)
+            local speciesLabel = makeLabel(row, AUTO_SELL_SPECIES[herbId] .. " | " .. tostring(age) .. "y", 6, 2, 115, 16, 9, COLORS.text, Enum.Font.GothamBold)
+            local enabledButton = makeButton(row, "OFF", 124, 7, 42, COLORS.panel, 25)
+            local modeButton = makeButton(row, "ALL", 171, 7, 45, COLORS.accent, 25)
+            local amountBox = make("TextBox", {
+                Position = UDim2.fromOffset(222, 7), Size = UDim2.fromOffset(54, 25),
+                BackgroundColor3 = COLORS.bg, BorderSizePixel = 0, ClearTextOnFocus = false,
+                Font = Enum.Font.Gotham, Text = "0", TextColor3 = COLORS.text,
+                TextSize = 10, PlaceholderText = "Qty", ZIndex = 34,
+            }, row)
+            round(amountBox, 4)
+            UI.autoSellRows[key] = {enabled = enabledButton, mode = modeButton, amount = amountBox, label = speciesLabel}
+            addConnection(enabledButton.MouseButton1Click, function()
+                AUTO_SELL.config[key].enabled = not AUTO_SELL.config[key].enabled
+                if SETTINGS.save then SETTINGS.save("auto_sell_stack_enabled") end
+                autoSellRefreshConfig()
+            end)
+            addConnection(modeButton.MouseButton1Click, function()
+                AUTO_SELL.config[key].mode = AUTO_SELL.config[key].mode == "ALL" and "COUNT" or "ALL"
+                if SETTINGS.save then SETTINGS.save("auto_sell_stack_mode") end
+                autoSellRefreshConfig()
+            end)
+            addConnection(amountBox.FocusLost, function()
+                local value = math.max(0, math.floor(tonumber(amountBox.Text) or 0))
+                AUTO_SELL.config[key].amount = value
+                AUTO_SELL.config[key].mode = "COUNT"
+                if value > 0 then AUTO_SELL.config[key].enabled = true end
+                if SETTINGS.save then SETTINGS.save("auto_sell_stack_quantity") end
+                autoSellRefreshConfig()
+            end)
+        end
+    end
+    UI.autoSellDoneButton = makeButton(UI.autoSellPicker, "DONE", 8, 332, 284, COLORS.accent, 25)
+    for _, descendant in ipairs(UI.autoSellPicker:GetDescendants()) do
+        if descendant:IsA("GuiObject") then descendant.ZIndex = 33 end
+    end
     addConnection(UI.autoHopNo1kButton.MouseButton1Click, function()
         HERB_HOP.enabled = not HERB_HOP.enabled
         HERB_HOP.resetEmptyTimer(HERB_HOP.enabled and "enabled; waiting for empty-server scan" or "OFF")
@@ -4291,6 +4737,34 @@ local function createGui()
         DIAG.log("INFO", "HERB_HOP", "toggle_changed", {enabled = HERB_HOP.enabled, graceSeconds = HERB_HOP.graceSeconds})
         setStatus(HERB_HOP.enabled and "Auto Hop enabled. It only works with Auto Herbs ON and 1,000 YEARS ONLY selected; waits 60 seconds after a confirmed empty scan." or "Auto Hop disabled.", HERB_HOP.enabled and COLORS.success or COLORS.warning)
     end)
+    addConnection(UI.autoSellButton.MouseButton1Click, function()
+        AUTO_SELL.enabled = not AUTO_SELL.enabled
+        AUTO_SELL.status = AUTO_SELL.enabled and "Enabled; open Merchant Gao's Herbs window to sell." or "OFF"
+        if SETTINGS.save then SETTINGS.save("auto_sell_toggled") end
+        autoSellRefreshConfig()
+        DIAG.log("INFO", "AUTO_SELL", "toggle_changed", {enabled = AUTO_SELL.enabled})
+        if AUTO_SELL.enabled then autoSellRun() end
+    end)
+    addConnection(UI.autoSellNowButton.MouseButton1Click, function()
+        AUTO_SELL.sellNowRequested = true
+        autoSellRun()
+    end)
+    addConnection(UI.autoSellConfigButton.MouseButton1Click, function()
+        UI.autoSellPicker.Visible = not UI.autoSellPicker.Visible
+        herbFilterPicker.Visible = false
+        UI.herbAgeFilterPicker.Visible = false
+        autoSellRefreshConfig()
+    end)
+    addConnection(UI.autoSellPresetButton.MouseButton1Click, function()
+        autoSellSetPresetAllExcept1000()
+        autoSellRefreshConfig()
+        setStatus("Preset applied: sell all 1/10/100-year herbs; all 1,000-year stacks are protected.", COLORS.success)
+    end)
+    addConnection(UI.autoSellDoneButton.MouseButton1Click, function()
+        UI.autoSellPicker.Visible = false
+    end)
+    autoSellRefreshConfig()
+
     addConnection(UI.quickInteractButton.MouseButton1Click, function()
         QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
         if SETTINGS.save then SETTINGS.save("quick_interact_toggled") end
@@ -4306,8 +4780,14 @@ local function createGui()
     local brewCard = makeCard(alchemyPage, 16, 44, 598, 220, "AUTO BREW", COLORS.warning)
     brewButton = makeButton(brewCard, "BREW: OFF", 12, 31, 170, COLORS.panel2, 32)
     brewRecipeButton = makeButton(brewCard, BREW.getSummary(), 194, 31, 380, COLORS.panel2, 32)
-    makeLabel(brewCard, "Select multiple recipes. The queue checks ingredients, uses the oldest available herbs, Stoke timing, and verifies Claim before moving to the next pill.", 12, 82, 570, 55, 10, COLORS.text)
-    makeLabel(brewCard, "Auto Brew starts only while the Alchemy Cauldron is open. It will not spend the Robux Finish Now option.", 12, 146, 570, 42, 9, COLORS.muted)
+    makeLabel(brewCard, "Auto Brew checks the selected recipes and ingredient ages before choosing anything.", 12, 82, 570, 30, 10, COLORS.text)
+    makeLabel(brewCard, "If selected-age ingredients are unavailable, brewing waits. Disabled ages are never substituted. The Robux Finish Now option is never used.", 12, 126, 570, 42, 9, COLORS.muted)
+
+    -- Dedicated card keeps the age control visible and independent from the
+    -- Pills popup. The picker itself opens only when this button is clicked.
+    local brewAgeCard = makeCard(alchemyPage, 16, 278, 598, 88, "BREW INGREDIENT AGE FILTER", COLORS.accent)
+    UI.brewAgeFilterButton = makeButton(brewAgeCard, BREW.getAgeFilterSummary(), 12, 29, 574, COLORS.panel2, 28)
+    makeLabel(brewAgeCard, "Only checked ages can be consumed. Choose 1, 10, 100 and/or 1,000 years.", 12, 60, 570, 18, 9, COLORS.muted)
 
     -- ECONOMY PAGE
     local economyPage = pageFrames.Economy
@@ -4486,7 +4966,42 @@ local function createGui()
     local recipeDone = makeButton(brewRecipePicker, "DONE", 8, 145, 194, COLORS.accent, 22)
     addConnection(recipeDone.MouseButton1Click, function() brewRecipePicker.Visible = false end)
 
-    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker}) do
+    UI.brewAgeFilterPicker = make("Frame", {
+        Name = "BrewAgeFilterPicker",
+        Position = UDim2.fromOffset(390, 205),
+        Size = UDim2.fromOffset(210, 166),
+        BackgroundColor3 = COLORS.bg,
+        BackgroundTransparency = 0.02,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 22,
+    }, alchemyPage)
+    round(UI.brewAgeFilterPicker, 8)
+    make("UIStroke", {Color = Color3.fromRGB(80, 96, 124), Thickness = 1}, UI.brewAgeFilterPicker)
+    makeLabel(UI.brewAgeFilterPicker, "ALLOWED BREW HERB AGES", 9, 5, 190, 18, 10, COLORS.text, Enum.Font.GothamBold)
+    addConnection(makeButton(UI.brewAgeFilterPicker, "SELECT ALL AGES", 8, 27, 194, COLORS.accent, 22).MouseButton1Click, function()
+        for _, age in ipairs(BREW_AGE_OPTIONS) do brewAgeSelection[age] = true end
+        if SETTINGS.save then SETTINGS.save("brew_age_select_all") end
+        updateModeButtons()
+        setStatus("Alchemy may use all four selected herb ages, preferring the oldest available selected age.", COLORS.success)
+    end)
+    for index, age in ipairs(BREW_AGE_OPTIONS) do
+        local ageText = age == 1000 and "1,000 years" or (tostring(age) .. " years")
+        local toggle = makeButton(UI.brewAgeFilterPicker, ageText, 8, 53 + (index - 1) * 24, 194, COLORS.success, 21)
+        UI.brewAgeFilterToggleButtons[age] = toggle
+        addConnection(toggle.MouseButton1Click, function()
+            brewAgeSelection[age] = not brewAgeSelection[age]
+            if SETTINGS.save then SETTINGS.save("brew_age_filter_changed") end
+            updateModeButtons()
+            DIAG.log("INFO", "ALCHEMY", "brew_age_filter_changed", {age = age, enabled = brewAgeSelection[age]})
+            setStatus("Brew age " .. tostring(age) .. " years " .. (brewAgeSelection[age] and "enabled." or "disabled. Disabled ages will never be substituted."), COLORS.success)
+        end)
+    end
+    addConnection(makeButton(UI.brewAgeFilterPicker, "DONE", 8, 151, 194, COLORS.accent, 18).MouseButton1Click, function()
+        UI.brewAgeFilterPicker.Visible = false
+    end)
+
+    for _, picker in ipairs({herbFilterPicker, UI.herbAgeFilterPicker, brewRecipePicker, UI.brewAgeFilterPicker}) do
         for _, descendant in ipairs(picker:GetDescendants()) do
             if descendant:IsA("GuiObject") then descendant.ZIndex = 23 end
         end
@@ -4563,6 +5078,7 @@ local function createGui()
         herbFilterPicker.Visible = not herbFilterPicker.Visible
         UI.herbAgeFilterPicker.Visible = false
         brewRecipePicker.Visible = false
+        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Choose which herb species Auto Herbs may collect. Oldest HerbYear is prioritized.", COLORS.success)
     end)
@@ -4571,6 +5087,7 @@ local function createGui()
         UI.herbAgeFilterPicker.Visible = not UI.herbAgeFilterPicker.Visible
         herbFilterPicker.Visible = false
         brewRecipePicker.Visible = false
+        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Choose herb ages. Use 1,000 YEARS ONLY to ignore every lower or unknown age and resume cultivation between spawns.", COLORS.success)
     end)
@@ -4582,7 +5099,7 @@ local function createGui()
         if SETTINGS.save then SETTINGS.save("auto_brew_toggled") end
         updateModeButtons()
         if autoBrewEnabled then
-            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; oldest available herbs will be selected.", COLORS.success)
+            setStatus("Auto Brew enabled. Open the Alchemy Cauldron; only selected herb ages are eligible, preferring the oldest selected age.", COLORS.success)
             BREW.run()
         else
             setStatus("Auto Brew disabled. Current in-progress brew will be left untouched.", COLORS.warning)
@@ -4593,8 +5110,17 @@ local function createGui()
         brewRecipePicker.Visible = not brewRecipePicker.Visible
         herbFilterPicker.Visible = false
         UI.herbAgeFilterPicker.Visible = false
+        if UI.brewAgeFilterPicker then UI.brewAgeFilterPicker.Visible = false end
         updateModeButtons()
         setStatus("Select any combination of Qi, Body, Bloodfury, and Vitality pills. Auto Brew rotates through selected recipes.", COLORS.success)
+    end)
+    addConnection(UI.brewAgeFilterButton.MouseButton1Click, function()
+        UI.brewAgeFilterPicker.Visible = not UI.brewAgeFilterPicker.Visible
+        herbFilterPicker.Visible = false
+        UI.herbAgeFilterPicker.Visible = false
+        brewRecipePicker.Visible = false
+        updateModeButtons()
+        setStatus("Choose exactly which herb ages Alchemy may consume. If ingredients at selected ages are unavailable, brewing waits without using other ages.", COLORS.success)
     end)
 
     -- No Auto Silver or sword auto-carry controls in v1.0.6.
@@ -4631,8 +5157,14 @@ local function createGui()
     addConnection(stopButton.MouseButton1Click, function() stop("stop button") end)
 
     updateModeButtons()
+    DIAG.log("INFO", "ALCHEMY", "brew_age_filter_ui_created", {
+        button = UI.brewAgeFilterButton and UI.brewAgeFilterButton:GetFullName() or "missing",
+        picker = UI.brewAgeFilterPicker and UI.brewAgeFilterPicker:GetFullName() or "missing",
+        layout = "dedicated card below Auto Brew"
+    })
     ECONOMY.updateUI()
     SILVER.setStatus("idle")
+    autoSellRefreshConfig()
 end
 
 -- Read replicated game state. These are inbound listeners only.
@@ -4966,7 +5498,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.3.1", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -5017,6 +5549,25 @@ task.spawn(function()
         task.wait(2)
         if running then
             HERB_MONITOR.update(true)
+        end
+    end
+end)
+
+-- Auto Sell watcher: never opens Merchant Gao or travels to him. It only acts
+-- while the player's normal Merchant Gao Herbs window is already open.
+task.spawn(function()
+    while running do
+        task.wait(0.75)
+        if running and AUTO_SELL.enabled and not AUTO_SELL.busy and not paused
+            and not UI.heavenly.active and not herbCollectorBusy and not autoBrewBusy
+            and not cauldronPanelIsOpen() then
+            local merchantRoot = autoSellFindMerchantRoot()
+            if merchantRoot then
+                autoSellRun()
+            else
+                AUTO_SELL.status = "Auto Sell ON | waiting for Merchant Gao's Herbs window"
+                if UI.autoSellStatusLabel then UI.autoSellStatusLabel.Text = AUTO_SELL.status end
+            end
         end
     end
 end)
@@ -5099,10 +5650,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.8 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.8.3.1 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8"})
-setStatus("Loaded v1.0.8. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.3.1"})
+setStatus("Loaded v1.0.8.3.1. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
