@@ -58,6 +58,8 @@ local CONFIG = {
 	ReactionStdSec = 0.050,
 	ReactionMinSec = 0.050,
 
+	ShowOverlay = true,        -- floating debug panel above the NPC (visible to all players)
+
 	MinStateDwell = 1.0,       -- seconds; prevents state flapping
 	HysteresisBonus = 0.08,    -- current state gets a small utility bonus
 	WaypointTimeout = 4,
@@ -396,6 +398,68 @@ local function chooseState()
 end
 
 ---------------------------------------------------------------------
+-- DEBUG OVERLAY (BillboardGui created on the server; replicates to every client)
+---------------------------------------------------------------------
+local overlayLabel: TextLabel? = nil
+
+if CONFIG.ShowOverlay then
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "CompanionDebug"
+	gui.Adornee = rootPart
+	gui.Size = UDim2.fromOffset(230, 130)
+	gui.StudsOffset = Vector3.new(0, 5, 0)
+	gui.AlwaysOnTop = true
+	gui.MaxDistance = 120
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+	label.BackgroundTransparency = 0.25
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.Font = Enum.Font.Code
+	label.TextSize = 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.Text = "starting..."
+	label.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = label
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 8)
+	pad.PaddingTop = UDim.new(0, 6)
+	pad.Parent = label
+
+	gui.Parent = rootPart
+	overlayLabel = label
+end
+
+local STATE_ORDER = { "DEFENDING", "REPAIRING", "RETURNING", "SCAVENGING", "IDLE" }
+
+local function updateOverlay(u: { [string]: number })
+	if not overlayLabel then return end
+	local targetText = "none"
+	if lockedTarget and bestThreat then
+		targetText = string.format("%s (%.0f studs)", lockedTarget.Name, bestThreat.dist)
+	end
+	local lines = {
+		"STATE: " .. state,
+		"Target: " .. targetText,
+		string.format("Bus: %d%%   Phase: %s", math.floor(vehicleRatio * 100),
+			tostring(workspace:GetAttribute("WavePhase") or "n/a")),
+		"Carrying: " .. tostring(carrying),
+		"-- utilities --",
+	}
+	for _, name in ipairs(STATE_ORDER) do
+		local marker = (name == state) and ">" or " "
+		table.insert(lines, string.format("%s %-10s %.2f", marker, name, u[name] or 0))
+	end
+	overlayLabel.Text = table.concat(lines, "\n")
+end
+
+---------------------------------------------------------------------
 -- MAIN LOOP
 ---------------------------------------------------------------------
 task.spawn(pollVehicle)
@@ -404,6 +468,7 @@ npc:SetAttribute("AIState", state)
 while npc.Parent and humanoid.Health > 0 do
 	scanThreats()
 	chooseState()
+	updateOverlay(computeUtilities())
 
 	-- Long actions abort when a higher-priority state clearly takes over.
 	local function shouldAbort(): boolean
